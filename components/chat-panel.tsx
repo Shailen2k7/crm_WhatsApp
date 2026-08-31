@@ -6,20 +6,20 @@ import {
   Search, Star, PanelRight, MoreHorizontal, Paperclip, Smile, Image as ImageIcon,
   FileText, Mic, Send, MessageSquare, ArrowLeft, AlertCircle, Loader2, RotateCw,
 } from 'lucide-react';
-import type { Lead } from '@/lib/types';
-import { initialsOf, avatarTint, formatPhone, toE164 } from '@/lib/phone';
+import { initialsOf, avatarTint, formatPhone } from '@/lib/phone';
+import type { Contact } from '@/lib/contacts';
 import { windowState, formatWindow } from '@/lib/interakt';
 import type { RelayMessage } from '@/lib/messages';
 
 export function ChatPanel({
-  lead,
+  contact,
   workspaceId,
   crmOpen,
   onToggleCrm,
   onBack,
   isMobile,
 }: {
-  lead: Lead | null;
+  contact: Contact | null;
   workspaceId: string;
   crmOpen: boolean;
   onToggleCrm: () => void;
@@ -41,11 +41,14 @@ export function ChatPanel({
   const bottomRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
-  const phoneE164 = lead ? toE164(lead.phone) : null;
+  const phoneE164 = contact?.phoneE164 ?? null;
+  const displayName = contact ? (contact.unknown ? formatPhone(contact.phoneE164) : contact.name) : '';
+  const firstName = contact && !contact.unknown ? contact.name.split(' ')[0] : 'them';
+  const avatarSeed = contact?.key ?? '';
 
   // ---- load the conversation and its history -------------------------------
   useEffect(() => {
-    if (!lead || !phoneE164) {
+    if (!contact || !phoneE164) {
       setConversationId(null);
       setMessages([]);
       setLastInboundAt(null);
@@ -96,7 +99,7 @@ export function ChatPanel({
     return () => {
       cancelled = true;
     };
-  }, [supabase, lead, phoneE164, workspaceId]);
+  }, [supabase, contact, phoneE164, workspaceId]);
 
   // ---- realtime: new messages and status changes ---------------------------
   useEffect(() => {
@@ -139,7 +142,7 @@ export function ChatPanel({
 
   const send = useCallback(async () => {
     const text = draft.trim();
-    if (!text || !lead || sending) return;
+    if (!text || !contact || sending) return;
     setSending(true);
     setError(null);
 
@@ -148,8 +151,8 @@ export function ChatPanel({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          phone: lead.phone,
-          leadId: lead.id,
+          phone: contact.phoneRaw,
+          leadId: contact.leadId,
           conversationId: conversationId || undefined,
           message: text,
         }),
@@ -182,9 +185,9 @@ export function ChatPanel({
       setSending(false);
       taRef.current?.focus();
     }
-  }, [draft, lead, sending, conversationId, supabase]);
+  }, [draft, contact, sending, conversationId, supabase]);
 
-  if (!lead) return <EmptyState />;
+  if (!contact) return <EmptyState />;
 
   const canType = win.open;
 
@@ -197,22 +200,28 @@ export function ChatPanel({
             <ArrowLeft size={18} />
           </button>
         )}
-        <div style={{ width: 38, height: 38, borderRadius: 99, background: avatarTint(lead.id), color: '#fff', fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
-          {initialsOf(lead.full_name)}
+        <div style={{ width: 38, height: 38, borderRadius: 99, background: contact.unknown ? 'var(--surface-3)' : avatarTint(avatarSeed), color: contact.unknown ? 'var(--muted)' : '#fff', fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
+          {contact.unknown ? '?' : initialsOf(contact.name)}
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ fontSize: 14.5, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {lead.full_name}
+              {displayName}
             </span>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 10.5, fontWeight: 700, padding: '2px 7px', borderRadius: 99, background: 'var(--teal-bg)', color: 'var(--teal-ink)', flex: 'none' }}>
-              <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M20 6L9 17l-5-5" />
-              </svg>
-              CRM linked
-            </span>
+            {contact.unknown ? (
+              <span style={{ fontSize: 10.5, fontWeight: 700, padding: '2px 7px', borderRadius: 99, background: 'var(--amber-bg)', color: 'var(--amber)', flex: 'none' }}>
+                Not in CRM
+              </span>
+            ) : (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 10.5, fontWeight: 700, padding: '2px 7px', borderRadius: 99, background: 'var(--teal-bg)', color: 'var(--teal-ink)', flex: 'none' }}>
+                <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M20 6L9 17l-5-5" />
+                </svg>
+                CRM linked
+              </span>
+            )}
           </div>
-          <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 1 }}>{formatPhone(lead.phone)}</div>
+          <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 1 }}>{formatPhone(contact.phoneE164)}</div>
         </div>
         <button aria-label="Search in conversation" style={iconBtn}><Search size={17} /></button>
         <button aria-label="Star" style={iconBtn}><Star size={17} /></button>
@@ -239,8 +248,8 @@ export function ChatPanel({
               <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>No messages yet</div>
               <p style={{ fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.6, margin: 0 }}>
                 {win.open
-                  ? `Send the first message to ${lead.full_name.split(' ')[0]}.`
-                  : `${lead.full_name.split(' ')[0]} has not messaged you, so WhatsApp only allows an approved template to start this conversation.`}
+                  ? `Send the first message to ${firstName}.`
+                  : `${firstName === 'them' ? 'They have' : firstName + ' has'} not messaged you, so WhatsApp only allows an approved template to start this conversation.`}
               </p>
             </div>
           </div>
@@ -293,7 +302,7 @@ export function ChatPanel({
             }}
             disabled={!canType || sending}
             rows={1}
-            placeholder={canType ? `Message ${lead.full_name.split(' ')[0]}…    ⏎ send · ⇧⏎ new line` : 'Window closed — an approved template is required'}
+            placeholder={canType ? `Message ${firstName}…    ⏎ send · ⇧⏎ new line` : 'Window closed — an approved template is required'}
             style={{
               width: '100%',
               border: 0,

@@ -1,8 +1,8 @@
 'use client';
 
 import { ExternalLink, FileDown, Mail, Phone, Calendar, Tag, Briefcase, UserCircle, X } from 'lucide-react';
-import type { Lead } from '@/lib/types';
 import { getStageMeta, getVisaMeta } from '@/lib/types';
+import type { Contact } from '@/lib/contacts';
 import { initialsOf, avatarTint, formatPhone } from '@/lib/phone';
 
 const CRM_URL = 'https://crm.migrizo.com';
@@ -15,14 +15,20 @@ function fmtDate(iso: string | null): string {
 }
 
 export function CrmPanel({
-  lead,
+  contact,
   memberName,
   onClose,
 }: {
-  lead: Lead;
+  contact: Contact;
   memberName: (id: string | null) => string;
   onClose?: () => void;
 }) {
+  const lead = contact.lead;
+
+  // A thread from someone the CRM has never seen. Saying so plainly — and
+  // pointing at where to fix it — beats rendering a panel full of dashes.
+  if (!lead) return <UnknownPanel contact={contact} onClose={onClose} />;
+
   const stage = getStageMeta(lead.stage);
   const visa = getVisaMeta(lead.visa_type);
 
@@ -211,4 +217,86 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 function titleise(s: string): string {
   const cleaned = s.replace(/[_\-+]+/g, ' ').trim();
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+}
+
+
+/** Shown when a conversation has no CRM record behind it. */
+function UnknownPanel({ contact, onClose }: { contact: Contact; onClose?: () => void }) {
+  return (
+    <aside
+      style={{
+        width: 300,
+        maxWidth: '86vw',
+        flex: 'none',
+        borderLeft: '1px solid var(--line)',
+        background: 'var(--surface)',
+        overflowY: 'auto',
+        minHeight: 0,
+      }}
+    >
+      {onClose && (
+        <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '10px 12px 0' }}>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            style={{ width: 30, height: 30, borderRadius: 8, border: 0, background: 'var(--surface-2)', color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
+      <div style={{ padding: '22px 18px 16px', textAlign: 'center', borderBottom: '1px solid var(--line-2)' }}>
+        <div
+          style={{
+            width: 62,
+            height: 62,
+            borderRadius: 99,
+            background: 'var(--surface-3)',
+            border: '1px dashed var(--line)',
+            color: 'var(--muted)',
+            fontSize: 24,
+            fontWeight: 700,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            margin: '0 auto 11px',
+          }}
+        >
+          ?
+        </div>
+        <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 3 }}>{formatPhone(contact.phoneE164)}</div>
+        <span style={{ display: 'inline-block', fontSize: 10.5, fontWeight: 700, padding: '3px 9px', borderRadius: 99, background: 'var(--amber-bg)', color: 'var(--amber)', marginTop: 8 }}>
+          Not in CRM
+        </span>
+      </div>
+
+      <div style={{ padding: '16px 18px' }}>
+        <p style={{ fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.6, margin: '0 0 14px' }}>
+          This number messaged you but has no lead record. The conversation is saved
+          and will link itself automatically once a lead with this number exists.
+        </p>
+        <a
+          href={`${CRM_URL}/leads`}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 7,
+            padding: '9px 14px',
+            borderRadius: 9,
+            border: '1px solid var(--line)',
+            background: 'var(--surface-2)',
+            fontSize: 12.5,
+            fontWeight: 600,
+            color: 'var(--ink-2)',
+          }}
+        >
+          Add as a lead in CRM <ExternalLink size={13} />
+        </a>
+      </div>
+    </aside>
+  );
 }
