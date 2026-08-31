@@ -21,27 +21,65 @@ function LoginForm() {
 
   const supabase = createClient();
 
+  /**
+   * Turns a provider error into something a human can act on.
+   *
+   * The one that matters: when the browser cannot REACH Supabase at all, the
+   * failure surfaces as a bare TypeError — "Failed to fetch" in Chrome, and
+   * the famously unhelpful "Type error" in Safari. Passing that through tells
+   * the user nothing. It almost always means the Supabase URL is missing or
+   * wrong, so say exactly that.
+   */
+  function explain(raw: string): string {
+    const msg = (raw || '').toLowerCase();
+
+    if (
+      msg.includes('failed to fetch') ||
+      msg.includes('type error') ||
+      msg.includes('typeerror') ||
+      msg.includes('networkerror') ||
+      msg.includes('load failed')
+    ) {
+      const url = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+      if (!url || url.includes('placeholder')) {
+        return 'Cannot reach the database: NEXT_PUBLIC_SUPABASE_URL is not set on this deployment.';
+      }
+      if (!/\.supabase\.co($|\/)/.test(url)) {
+        return `Cannot reach the database. The configured URL looks wrong (${url}) — it should end in .supabase.co`;
+      }
+      return 'Cannot reach the database. Check your connection, or that the Supabase URL and key are set correctly.';
+    }
+
+    if (msg.includes('invalid login')) return 'Wrong email or password.';
+    if (msg.includes('email not confirmed')) return 'Confirm your email first — check your inbox.';
+    return raw;
+  }
+
   async function signInWithEmail(e: React.FormEvent) {
     e.preventDefault();
     if (!email.trim() || !password) return;
     setLoading('email');
     setError(null);
 
-    const { error } = await supabase.auth.signInWithPassword({
-      email: email.trim(),
-      password,
-    });
+    // signInWithPassword can also THROW (rather than return an error) when the
+    // network leg fails, so the call itself is wrapped.
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password,
+      });
 
-    if (error) {
-      const msg = error.message.toLowerCase();
-      if (msg.includes('invalid login')) setError('Wrong email or password.');
-      else if (msg.includes('email not confirmed')) setError('Confirm your email first — check your inbox.');
-      else setError(error.message);
+      if (error) {
+        setError(explain(error.message));
+        setLoading(null);
+        return;
+      }
+      router.push(next);
+      router.refresh();
+    } catch (err) {
+      setError(explain(err instanceof Error ? err.message : String(err)));
       setLoading(null);
-      return;
     }
-    router.push(next);
-    router.refresh();
   }
 
   async function signInWithGoogle() {
@@ -52,7 +90,7 @@ function LoginForm() {
       options: { redirectTo: `${window.location.origin}/auth/callback?next=${encodeURIComponent(next)}` },
     });
     if (error) {
-      setError(error.message);
+      setError(explain(error.message));
       setLoading(null);
     }
   }
