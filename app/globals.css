@@ -1,0 +1,120 @@
+/* ==========================================================================
+   RELAY — design tokens
+   Ported verbatim from the Relay design canvas (Project_Design.zip).
+   Every colour in the app resolves through these variables, so switching
+   theme is one attribute on <html>, never a re-render.
+   ========================================================================== */
+@import url('https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #eef3f1;
+  --surface: #ffffff;
+  --surface-2: #f6faf8;
+  --surface-3: #e9f1ee;
+  --ink: #0e1c1a;
+  --ink-2: #33453f;
+  --muted: #6b7c77;
+  --line: rgba(14, 28, 26, 0.09);
+  --line-2: rgba(14, 28, 26, 0.05);
+  --teal: #0d8c7c;
+  --teal-2: #0a6e62;
+  --teal-ink: #0a5b51;
+  --teal-bg: #dcece8;
+  --amber: #b3841c;
+  --amber-bg: #f8efd5;
+  --red: #c4573f;
+  --red-bg: #f8e5e0;
+  --chat: #f3f7f5;
+  --in-bg: #ffffff;
+  --in-fg: #12211e;
+  --out-bg: #0d8c7c;
+  --out-fg: #ffffff;
+  --shadow: 0 1px 2px rgba(13, 80, 72, 0.06), 0 6px 20px -12px rgba(13, 80, 72, 0.22);
+  --rail: #0e1c1a;
+  --rail-fg: rgba(255, 255, 255, 0.55);
+  --rail-fg-on: #ffffff;
+  --rail-on: rgba(255, 255, 255, 0.1);
+}
+
+[data-theme='dark'] {
+  --bg: #070f0e;
+  --surface: #0f1c19;
+  --surface-2: #13241f;
+  --surface-3: #1a2d27;
+  --ink: #e9f4f0;
+  --ink-2: #b3c5bf;
+  --muted: #7d918b;
+  --line: rgba(255, 255, 255, 0.1);
+  --line-2: rgba(255, 255, 255, 0.055);
+  --teal: #2bbda6;
+  --teal-2: #5fe6d0;
+  --teal-ink: #85e7d4;
+  --teal-bg: rgba(43, 189, 166, 0.14);
+  --amber: #e3b75c;
+  --amber-bg: rgba(227, 183, 92, 0.14);
+  --red: #e07e65;
+  --red-bg: rgba(224, 126, 101, 0.14);
+  --chat: #0b1614;
+  --in-bg: #15251f;
+  --in-fg: #e4efeb;
+  --out-bg: #17685c;
+  --out-fg: #eafaf6;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -14px rgba(0, 0, 0, 0.7);
+  --rail: #0b1513;
+  --rail-fg: rgba(255, 255, 255, 0.5);
+  --rail-fg-on: #eafaf6;
+  --rail-on: rgba(255, 255, 255, 0.08);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  font-size: 14px;
+}
+
+a { color: var(--teal); text-decoration: none; }
+a:hover { color: var(--teal-2); }
+button { font: inherit; color: inherit; }
+input, textarea { font: inherit; color: inherit; }
+
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-thumb {
+  background: rgba(120, 140, 135, 0.32);
+  border-radius: 99px;
+  border: 3.5px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(120, 140, 135, 0.5); background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+@keyframes msgIn { from { opacity: 0; transform: translateY(7px) scale(0.99); } to { opacity: 1; transform: none; } }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes popIn { from { opacity: 0; transform: translateY(8px) scale(0.985); } to { opacity: 1; transform: none; } }
+@keyframes shimmer { from { background-position: -420px 0; } to { background-position: 420px 0; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulseDot { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+
+.animate-msg-in { animation: msgIn 0.22s ease both; }
+.animate-fade-in { animation: fadeIn 0.2s ease both; }
+.animate-pop-in { animation: popIn 0.18s ease both; }
+
+/* Skeleton shimmer used while leads load. */
+.skeleton {
+  background: linear-gradient(90deg, var(--surface-3) 0%, var(--surface-2) 50%, var(--surface-3) 100%);
+  background-size: 420px 100%;
+  animation: shimmer 1.3s linear infinite;
+}

@@ -1,0 +1,39 @@
+// Shape of a row in public.relay_messages (migration 100).
+export interface RelayMessage {
+  id: string;
+  workspace_id: string;
+  conversation_id: string;
+  direction: 'in' | 'out';
+  body: string;
+  template_name: string | null;
+  template_language: string | null;
+  template_values: Record<string, unknown> | null;
+  provider_msg_id: string | null;
+  status: 'queued' | 'sent' | 'delivered' | 'read' | 'failed' | 'received';
+  error_code: string | null;
+  error_detail: string | null;
+  media_url: string | null;
+  media_type: 'image' | 'document' | 'audio' | 'video' | 'sticker' | null;
+  media_name: string | null;
+  media_mime: string | null;
+  sent_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Shape of a row in public.relay_conversations. */
+export interface RelayConversation {
+  id: string;
+  workspace_id: string;
+  lead_id: string | null;
+  phone_e164: string;
+  status: 'open' | 'closed';
+  unread_count: number;
+  last_inbound_at: string | null;
+  last_outbound_at: string | null;
+  last_message_at: string | null;
+  last_preview: string | null;
+  last_direction: 'in' | 'out' | null;
+  created_at: string;
+  updated_at: string;
+}
