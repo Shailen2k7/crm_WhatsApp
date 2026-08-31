@@ -2,8 +2,8 @@
 
 import { useState, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { createClient } from '@/lib/supabase/client';
-import { Loader2, Eye, EyeOff } from 'lucide-react';
+import { createClient, configProblem } from '@/lib/supabase/client';
+import { Loader2, Eye, EyeOff, AlertTriangle } from 'lucide-react';
 
 // Relay signs in against the CRM's own Supabase project, so these are the same
 // credentials the team already uses for crm.migrizo.com. No new accounts.
@@ -20,6 +20,7 @@ function LoginForm() {
   const [error, setError] = useState<string | null>(null);
 
   const supabase = createClient();
+  const problem = configProblem();
 
   /**
    * Turns a provider error into something a human can act on.
@@ -140,6 +141,31 @@ function LoginForm() {
             <div style={{ fontSize: 12, color: 'var(--muted)' }}>Migrizo WhatsApp</div>
           </div>
         </div>
+
+        {/* A broken config is shown BEFORE anyone types a password, because no
+            password will ever work until it is fixed. */}
+        {problem && (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: 9,
+              background: 'var(--amber-bg)',
+              color: 'var(--ink)',
+              padding: '11px 13px',
+              borderRadius: 10,
+              fontSize: 12.3,
+              lineHeight: 1.55,
+              marginBottom: 18,
+            }}
+          >
+            <AlertTriangle size={15} style={{ flex: 'none', marginTop: 1, color: 'var(--amber)' }} />
+            <div>
+              <strong style={{ display: 'block', marginBottom: 3 }}>Not connected to the database</strong>
+              {problem.message}
+            </div>
+          </div>
+        )}
 
         <form onSubmit={signInWithEmail}>
           <label style={{ display: 'block', fontSize: 12.5, fontWeight: 600, marginBottom: 6, color: 'var(--ink-2)' }}>
