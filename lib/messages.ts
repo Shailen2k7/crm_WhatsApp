@@ -16,6 +16,9 @@ export interface RelayMessage {
   media_type: 'image' | 'document' | 'audio' | 'video' | 'sticker' | null;
   media_name: string | null;
   media_mime: string | null;
+  media_path: string | null;
+  media_size: number | null;
+  is_internal: boolean;
   sent_by: string | null;
   created_at: string;
   updated_at: string;
@@ -34,6 +37,21 @@ export interface RelayConversation {
   last_message_at: string | null;
   last_preview: string | null;
   last_direction: 'in' | 'out' | null;
+  spotlight: boolean;
+  tags: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+/** A saved quick reply, optionally with files that go out with it. */
+export interface QuickReply {
+  id: string;
+  workspace_id: string;
+  shortcut: string;
+  title: string;
+  body: string;
+  attachments: { path: string; name: string; mime: string; size: number }[];
+  sort_order: number;
   created_at: string;
   updated_at: string;
 }

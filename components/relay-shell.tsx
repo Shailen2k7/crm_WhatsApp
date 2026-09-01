@@ -3,14 +3,19 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import type { Lead, RelayUser, Workspace } from '@/lib/types';
-import type { RelayConversation } from '@/lib/messages';
+import type { RelayConversation, RelayMessage } from '@/lib/messages';
 import { mergeContacts, type Contact } from '@/lib/contacts';
+import { playRingtone, unlockAudio } from '@/lib/chime';
+import { enablePush, registerServiceWorker } from '@/lib/push-client';
 import { Rail, type RailKey } from './rail';
 import { ConversationList } from './conversation-list';
 import { ChatPanel } from './chat-panel';
 import { CrmPanel } from './crm-panel';
 import { SettingsPanel } from './settings-panel';
+import { QuickRepliesManager } from './quick-replies';
+import { FilesPanel } from './files-panel';
 import { Placeholder } from './placeholder';
+import { BellRing, X } from 'lucide-react';
 
 interface Member {
   user_id: string;
@@ -41,6 +46,8 @@ export function RelayShell({
   const [crmOpen, setCrmOpen] = useState(true);
   const [isMobile, setIsMobile] = useState(false);
   const [live, setLive] = useState(false);
+  const [railExpanded, setRailExpanded] = useState(false);
+  const [pushBanner, setPushBanner] = useState(false);
 
   // ---- theme ---------------------------------------------------------------
   useEffect(() => {
@@ -48,19 +55,38 @@ export function RelayShell({
       (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     setTheme(stored);
     document.documentElement.setAttribute('data-theme', stored);
+    try {
+      setRailExpanded(localStorage.getItem('relay-rail') === 'wide');
+    } catch { /* fine */ }
   }, []);
 
   const toggleTheme = useCallback(() => {
     setTheme((prev) => {
       const next = prev === 'dark' ? 'light' : 'dark';
       document.documentElement.setAttribute('data-theme', next);
-      try {
-        localStorage.setItem('relay-theme', next);
-      } catch {
-        /* private mode — the theme just won't persist */
-      }
+      try { localStorage.setItem('relay-theme', next); } catch { /* private mode */ }
       return next;
     });
+  }, []);
+
+  const toggleRail = useCallback(() => {
+    setRailExpanded((v) => {
+      try { localStorage.setItem('relay-rail', v ? 'narrow' : 'wide'); } catch { /* fine */ }
+      return !v;
+    });
+  }, []);
+
+  // ---- PWA + notifications -------------------------------------------------
+  useEffect(() => {
+    registerServiceWorker();
+    // Browsers refuse audio until the user touches the page once.
+    const unlock = () => { unlockAudio(); window.removeEventListener('pointerdown', unlock); window.removeEventListener('keydown', unlock); };
+    window.addEventListener('pointerdown', unlock);
+    window.addEventListener('keydown', unlock);
+    // Offer push once, politely, when it has neither been granted nor refused.
+    if ('Notification' in window && Notification.permission === 'default') setPushBanner(true);
+    if ('Notification' in window && Notification.permission === 'granted') enablePush(); // refresh the subscription silently
+    return () => { window.removeEventListener('pointerdown', unlock); window.removeEventListener('keydown', unlock); };
   }, []);
 
   // ---- responsive ----------------------------------------------------------
@@ -82,9 +108,7 @@ export function RelayShell({
       const { data } = await supabase.rpc('list_workspace_members', { p_workspace_id: workspace.id });
       if (!cancelled && Array.isArray(data)) setMembers(data as Member[]);
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [supabase, workspace.id]);
 
   const memberName = useCallback(
@@ -97,9 +121,7 @@ export function RelayShell({
     [members, user.id, user.name]
   );
 
-  // ---- conversations: the OTHER half of the list. A thread can exist without
-  // a lead (a stranger messaged us), so these are loaded independently and
-  // fused with leads in mergeContacts.
+  // ---- conversations + live updates ----------------------------------------
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -136,14 +158,37 @@ export function RelayShell({
       )
       .subscribe();
 
-    return () => {
-      cancelled = true;
-      supabase.removeChannel(channel);
-    };
+    return () => { cancelled = true; supabase.removeChannel(channel); };
   }, [supabase, workspace.id]);
 
-  // ---- realtime: the CRM and Relay share one database, so a lead edited in
-  // the CRM must move here without a refresh. This is the proof of that.
+  // ---- THE RINGTONE: any inbound message, any conversation -----------------
+  // The chat panel has its own per-thread subscription for rendering; this one
+  // exists solely so a message in a thread you are NOT looking at still rings.
+  useEffect(() => {
+    const channel = supabase
+      .channel('relay-inbound-' + workspace.id)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'relay_messages', filter: `workspace_id=eq.${workspace.id}` },
+        (payload) => {
+          const row = payload.new as RelayMessage;
+          if (row?.direction === 'in') {
+            playRingtone();
+            // Title flash so a background tab shows it too.
+            if (document.hidden) {
+              const original = document.title;
+              document.title = '🟢 New message — Relay';
+              const back = () => { document.title = original; document.removeEventListener('visibilitychange', back); };
+              document.addEventListener('visibilitychange', back);
+            }
+          }
+        }
+      )
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [supabase, workspace.id]);
+
+  // ---- leads live ----------------------------------------------------------
   useEffect(() => {
     const channel = supabase
       .channel('relay-leads-' + workspace.id)
@@ -158,7 +203,6 @@ export function RelayShell({
             }
             const row = payload.new as Lead;
             if (!row?.id) return prev;
-            // A lead with no phone cannot be a WhatsApp conversation.
             if (!row.phone) return prev.filter((l) => l.id !== row.id);
             const idx = prev.findIndex((l) => l.id === row.id);
             if (idx === -1) return [row, ...prev];
@@ -169,14 +213,16 @@ export function RelayShell({
         }
       )
       .subscribe((status) => setLive(status === 'SUBSCRIBED'));
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    return () => { supabase.removeChannel(channel); };
   }, [supabase, workspace.id]);
 
-  // ---- the list --------------------------------------------------------------
+  // ---- the lists -----------------------------------------------------------
   const contacts = useMemo(() => mergeContacts(leads, conversations), [leads, conversations]);
+
+  // Chats nav shows ONLY real conversations — the inbox, not the database.
+  const chatContacts = useMemo(() => contacts.filter((c) => c.lastMessageAt || c.conversationId), [contacts]);
+  const starredContacts = useMemo(() => chatContacts.filter((c) => c.spotlight), [chatContacts]);
+
   const selected: Contact | null = useMemo(
     () => contacts.find((c) => c.key === selectedKey) ?? null,
     [contacts, selectedKey]
@@ -186,74 +232,93 @@ export function RelayShell({
   const showList = !isMobile || !selected;
   const showChat = !isMobile || !!selected;
 
+  const isChatNav = nav === 'chat' || nav === 'contacts' || nav === 'starred';
+  const listForNav = nav === 'contacts' ? contacts : nav === 'starred' ? starredContacts : chatContacts;
+
+  async function turnOnPush() {
+    setPushBanner(false);
+    const r = await enablePush();
+    if (r === 'denied') alert('Notifications were blocked. Enable them for chat.migrizo.com in your browser settings.');
+  }
+
   return (
-    <div style={{ height: '100dvh', display: 'flex', overflow: 'hidden', background: 'var(--bg)' }}>
-      <Rail
-        active={nav}
-        onSelect={(k) => {
-          setNav(k);
-          if (isMobile) setSelectedKey(null);
-        }}
-        theme={theme}
-        onToggleTheme={toggleTheme}
-        userName={user.name}
-        unread={totalUnread}
-      />
+    <div style={{ height: '100dvh', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg)' }}>
+      {pushBanner && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 14px', background: 'var(--teal)', color: '#fff', fontSize: 12.5, fontWeight: 600, flex: 'none' }}>
+          <BellRing size={15} style={{ flex: 'none' }} />
+          <span style={{ flex: 1 }}>Turn on notifications so a client message rings on this device — even when Relay is in the background.</span>
+          <button onClick={turnOnPush} style={{ background: '#fff', color: 'var(--teal-2)', border: 0, borderRadius: 8, padding: '5px 13px', fontSize: 12, fontWeight: 700, cursor: 'pointer', flex: 'none' }}>
+            Turn on
+          </button>
+          <button onClick={() => setPushBanner(false)} aria-label="Dismiss" style={{ background: 'transparent', border: 0, color: '#fff', cursor: 'pointer', display: 'flex', flex: 'none' }}>
+            <X size={15} />
+          </button>
+        </div>
+      )}
 
-      {nav === 'chat' || nav === 'contacts' ? (
-        <>
-          {showList && (
-            <ConversationList
-              contacts={contacts}
-              selectedKey={selectedKey}
-              onSelect={(c) => setSelectedKey(c.key)}
-              isMobile={isMobile}
-            />
-          )}
-          {showChat && (
-            <ChatPanel
-              contact={selected}
-              workspaceId={workspace.id}
-              crmOpen={crmOpen}
-              onToggleCrm={() => setCrmOpen((v) => !v)}
-              onBack={() => setSelectedKey(null)}
-              isMobile={isMobile}
-            />
-          )}
-
-          {/* Desktop: the CRM record sits beside the chat.
-              Mobile: there is no room for a third column, so it slides over the
-              chat as a sheet — the lead's details must stay reachable on a
-              phone, which is where the team will actually use this. */}
-          {selected && crmOpen && !isMobile && <CrmPanel contact={selected} memberName={memberName} />}
-          {selected && crmOpen && isMobile && (
-            <div
-              onClick={() => setCrmOpen(false)}
-              style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.4)', zIndex: 40 }}
-            >
-              <div
-                onClick={(e) => e.stopPropagation()}
-                className="animate-fade-in"
-                style={{ position: 'absolute', top: 0, right: 0, bottom: 0, display: 'flex' }}
-              >
-                <CrmPanel contact={selected} memberName={memberName} onClose={() => setCrmOpen(false)} />
-              </div>
-            </div>
-          )}
-        </>
-      ) : nav === 'settings' ? (
-        <SettingsPanel
-          user={user}
-          workspace={workspace}
-          role={role}
-          leadCount={leads.length}
-          live={live}
+      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+        <Rail
+          active={nav}
+          onSelect={(k) => { setNav(k); if (isMobile) setSelectedKey(null); }}
           theme={theme}
           onToggleTheme={toggleTheme}
+          userName={user.name}
+          unread={totalUnread}
+          expanded={railExpanded}
+          onToggleExpanded={toggleRail}
+          isMobile={isMobile}
         />
-      ) : (
-        <Placeholder nav={nav} />
-      )}
+
+        {isChatNav ? (
+          <>
+            {showList && (
+              <ConversationList
+                contacts={listForNav}
+                mode={nav === 'contacts' ? 'contacts' : 'chats'}
+                selectedKey={selectedKey}
+                onSelect={(c) => setSelectedKey(c.key)}
+                isMobile={isMobile}
+              />
+            )}
+            {showChat && (
+              <ChatPanel
+                contact={selected}
+                workspaceId={workspace.id}
+                role={role}
+                crmOpen={crmOpen}
+                onToggleCrm={() => setCrmOpen((v) => !v)}
+                onBack={() => setSelectedKey(null)}
+                onDeleted={() => setSelectedKey(null)}
+                isMobile={isMobile}
+              />
+            )}
+            {selected && crmOpen && !isMobile && <CrmPanel contact={selected} memberName={memberName} />}
+            {selected && crmOpen && isMobile && (
+              <div onClick={() => setCrmOpen(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.4)', zIndex: 40 }}>
+                <div onClick={(e) => e.stopPropagation()} className="animate-fade-in" style={{ position: 'absolute', top: 0, right: 0, bottom: 0, display: 'flex' }}>
+                  <CrmPanel contact={selected} memberName={memberName} onClose={() => setCrmOpen(false)} />
+                </div>
+              </div>
+            )}
+          </>
+        ) : nav === 'quickreplies' ? (
+          <QuickRepliesManager workspaceId={workspace.id} />
+        ) : nav === 'files' ? (
+          <FilesPanel workspaceId={workspace.id} contacts={contacts} onOpenChat={(key) => { setNav('chat'); setSelectedKey(key); }} />
+        ) : nav === 'settings' ? (
+          <SettingsPanel
+            user={user}
+            workspace={workspace}
+            role={role}
+            leadCount={leads.length}
+            live={live}
+            theme={theme}
+            onToggleTheme={toggleTheme}
+          />
+        ) : (
+          <Placeholder nav={nav} />
+        )}
+      </div>
     </div>
   );
 }

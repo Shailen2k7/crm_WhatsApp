@@ -163,6 +163,39 @@ export async function sendText(opts: {
   });
 }
 
+/**
+ * Media message — image, document, audio or video, inside the 24-hour window.
+ * Interakt fetches the file itself from `mediaUrl`, so the URL must be
+ * reachable from their servers: we hand them a time-limited SIGNED url to our
+ * private bucket, never a permanent public one.
+ */
+export async function sendMedia(opts: {
+  phoneE164: string;
+  mediaUrl: string;
+  mediaType: 'image' | 'document' | 'audio' | 'video';
+  fileName?: string;
+  caption?: string;
+  callbackData?: string;
+}): Promise<SendResult> {
+  const split = splitE164(opts.phoneE164);
+  if (!split) return { ok: false, code: 'bad_phone', detail: `Not a usable number: ${opts.phoneE164}` };
+
+  const TYPE: Record<string, string> = { image: 'Image', document: 'Document', audio: 'Audio', video: 'Video' };
+
+  return post('/message/', {
+    countryCode: split.countryCode,
+    phoneNumber: split.phoneNumber,
+    type: TYPE[opts.mediaType] || 'Document',
+    callbackData: opts.callbackData,
+    data: {
+      message: opts.caption || '',
+      mediaUrl: opts.mediaUrl,
+      // Documents keep the human's filename; other types ignore it harmlessly.
+      fileName: opts.fileName,
+    },
+  });
+}
+
 // --- the 24-hour window ------------------------------------------------------
 
 export const WINDOW_MS = 24 * 60 * 60 * 1000;

@@ -1,18 +1,26 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { Search, X, Check, CheckCheck } from 'lucide-react';
+import { Search, X, CheckCheck, Star } from 'lucide-react';
 import { getStageMeta, getVisaMeta } from '@/lib/types';
 import { initialsOf, avatarTint, formatPhone, matchKey } from '@/lib/phone';
 import type { Contact } from '@/lib/contacts';
 
-type Filter = 'all' | 'threads' | 'unread' | 'hot' | 'won';
+type Filter = 'all' | 'unread' | 'hot' | 'cold' | 'spotlight' | 'won';
 
-const FILTERS: { key: Filter; label: string }[] = [
+// Chats mode is the inbox: smart tags, exactly as requested.
+const CHAT_FILTERS: { key: Filter; label: string }[] = [
   { key: 'all', label: 'All' },
-  { key: 'threads', label: 'Chats' },
   { key: 'unread', label: 'Unread' },
   { key: 'hot', label: 'Hot' },
+  { key: 'cold', label: 'Cold' },
+  { key: 'spotlight', label: '★ Spotlight' },
+];
+// Contacts mode is the phonebook for STARTING a chat with any lead.
+const CONTACT_FILTERS: { key: Filter; label: string }[] = [
+  { key: 'all', label: 'All' },
+  { key: 'hot', label: 'Hot' },
+  { key: 'cold', label: 'Cold' },
   { key: 'won', label: 'Won' },
 ];
 
@@ -34,12 +42,14 @@ function ago(iso: string | null): string {
 
 export function ConversationList({
   contacts,
+  mode,
   selectedKey,
   onSelect,
   loading,
   isMobile,
 }: {
   contacts: Contact[];
+  mode: 'chats' | 'contacts';
   selectedKey: string | null;
   onSelect: (c: Contact) => void;
   loading?: boolean;
@@ -48,17 +58,18 @@ export function ConversationList({
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
 
-  const threadCount = useMemo(() => contacts.filter((c) => c.lastMessageAt).length, [contacts]);
+  const FILTERS = mode === 'chats' ? CHAT_FILTERS : CONTACT_FILTERS;
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     const qDigits = matchKey(query);
 
     return contacts.filter((c) => {
-      if (filter === 'threads' && !c.lastMessageAt) return false;
       if (filter === 'unread' && c.unread === 0) return false;
       if (filter === 'hot' && c.lead?.stage !== 'hot') return false;
+      if (filter === 'cold' && c.lead?.stage !== 'cold') return false;
       if (filter === 'won' && c.lead?.stage !== 'won') return false;
+      if (filter === 'spotlight' && !c.spotlight) return false;
 
       if (!q) return true;
       if (qDigits && matchKey(c.phoneE164) === qDigits) return true;
@@ -69,6 +80,9 @@ export function ConversationList({
       );
     });
   }, [contacts, query, filter]);
+
+  // Switching between Chats and Contacts resets a filter the other mode lacks.
+  useMemo(() => { if (!FILTERS.some((f) => f.key === filter)) setFilter('all'); }, [FILTERS, filter]);
 
   return (
     <div
@@ -89,7 +103,7 @@ export function ConversationList({
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search name, phone or email"
+            placeholder={mode === 'chats' ? 'Search chats' : 'Search name, phone or email'}
             style={{
               width: '100%',
               padding: '9px 30px 9px 33px',
@@ -132,9 +146,6 @@ export function ConversationList({
                 }}
               >
                 {f.label}
-                {f.key === 'threads' && threadCount > 0 && (
-                  <span style={{ marginLeft: 5, opacity: 0.75 }}>{threadCount}</span>
-                )}
               </button>
             );
           })}
@@ -142,7 +153,7 @@ export function ConversationList({
       </div>
 
       <div style={{ padding: '8px 15px', fontSize: 11.5, color: 'var(--muted)', fontWeight: 600 }}>
-        {loading ? 'Loading…' : `${visible.length.toLocaleString('en-IN')} ${visible.length === 1 ? 'contact' : 'contacts'}`}
+        {loading ? 'Loading…' : `${visible.length.toLocaleString('en-IN')} ${mode === 'chats' ? (visible.length === 1 ? 'chat' : 'chats') : (visible.length === 1 ? 'contact' : 'contacts')}`}
         {!loading && visible.length !== contacts.length && (
           <span style={{ fontWeight: 500 }}> of {contacts.length.toLocaleString('en-IN')}</span>
         )}
@@ -151,9 +162,15 @@ export function ConversationList({
       <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
         {!loading && visible.length === 0 && (
           <div style={{ padding: '38px 24px', textAlign: 'center', color: 'var(--muted)' }}>
-            <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 5 }}>Nothing matches</div>
+            <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 5 }}>
+              {mode === 'chats' && !query && filter === 'all' ? 'No conversations yet' : 'Nothing matches'}
+            </div>
             <div style={{ fontSize: 12.5, lineHeight: 1.5 }}>
-              {query ? <>No contact matches “{query}”.</> : 'Nothing in this filter yet.'}
+              {query
+                ? <>Nothing matches “{query}”.</>
+                : mode === 'chats' && filter === 'all'
+                ? 'Start one from the Contacts tab, or wait for a client to message you.'
+                : 'Nothing in this filter yet.'}
             </div>
           </div>
         )}
@@ -242,6 +259,9 @@ export function ConversationList({
                     {hasThread ? c.lastPreview || '[media]' : formatPhone(c.phoneE164)}
                   </span>
 
+                  {c.spotlight && (
+                    <Star size={12} style={{ color: 'var(--amber)', fill: 'var(--amber)', flex: 'none' }} />
+                  )}
                   {c.unread > 0 && (
                     <span
                       style={{

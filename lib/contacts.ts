@@ -38,6 +38,7 @@ export interface Contact {
   lastDirection: 'in' | 'out' | null;
   /** True when a thread exists but no CRM record does. */
   unknown: boolean;
+  spotlight: boolean;
 }
 
 /**
@@ -81,6 +82,7 @@ export function mergeContacts(leads: Lead[], conversations: RelayConversation[])
       lastPreview: conv?.last_preview ?? null,
       lastDirection: conv?.last_direction ?? null,
       unknown: false,
+      spotlight: conv?.spotlight ?? false,
     });
   }
 
@@ -102,6 +104,7 @@ export function mergeContacts(leads: Lead[], conversations: RelayConversation[])
       lastPreview: conv.last_preview,
       lastDirection: conv.last_direction,
       unknown: true,
+      spotlight: conv.spotlight ?? false,
     });
   }
 

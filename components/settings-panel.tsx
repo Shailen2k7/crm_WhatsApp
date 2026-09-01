@@ -29,6 +29,8 @@ export function SettingsPanel({
 }) {
   const [signingOut, setSigningOut] = useState(false);
   const [log, setLog] = useState<WebhookLogRow[] | null>(null);
+  const [interakt, setInterakt] = useState<InteraktState | null>(null);
+  const [testing, setTesting] = useState(false);
   const [logErr, setLogErr] = useState<string | null>(null);
   const supabaseRef = useMemo(() => createClient(), []);
 
@@ -50,6 +52,20 @@ export function SettingsPanel({
 
   useEffect(() => { loadLog(); }, [loadLog]);
 
+  // Proves the API key works without messaging anybody — see the route.
+  async function testInterakt() {
+    setTesting(true);
+    try {
+      const r = await fetch('/api/whatsapp/test-connection');
+      setInterakt(await r.json());
+    } catch {
+      setInterakt({ ok: false, state: 'unreachable', detail: 'Could not run the test.' });
+    } finally {
+      setTesting(false);
+    }
+  }
+  useEffect(() => { testInterakt(); }, []);
+
   async function signOut() {
     setSigningOut(true);
     const supabase = createClient();
@@ -58,19 +74,49 @@ export function SettingsPanel({
   }
 
   const projectRef = (process.env.NEXT_PUBLIC_SUPABASE_URL || '').replace('https://', '').split('.')[0];
+  const wabaNumber = process.env.NEXT_PUBLIC_WABA_NUMBER || '';
 
   return (
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg)' }}>
       <div style={{ maxWidth: 620, margin: '0 auto', padding: '32px 24px 60px' }}>
         <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 4px' }}>Settings</h1>
-        <p style={{ fontSize: 13, color: 'var(--muted)', margin: '0 0 26px' }}>Relay · Phase 1</p>
+        <p style={{ fontSize: 13, color: 'var(--muted)', margin: '0 0 26px' }}>Relay · Phase 2</p>
 
         <Card title="Connection">
           <Row label="Database" value={<Status ok={true} text="Connected" />} />
           <Row label="Live updates" value={<Status ok={live} text={live ? 'Subscribed' : 'Connecting…'} />} />
           <Row label="Supabase project" value={<Mono>{projectRef || 'not set'}</Mono>} />
           <Row label="Leads loaded" value={<strong>{leadCount.toLocaleString('en-IN')}</strong>} />
-          <Row label="WhatsApp (Interakt)" value={<Status ok={false} text="Phase 2" />} />
+          <Row
+            label="WhatsApp number"
+            value={wabaNumber ? <strong>{wabaNumber}</strong> : <span style={{ color: 'var(--muted)' }}>set NEXT_PUBLIC_WABA_NUMBER</span>}
+          />
+          <Row
+            label="Interakt API"
+            value={
+              interakt
+                ? <Status ok={!!interakt.ok} text={interakt.ok ? 'Connected' : interakt.state === 'unauthorized' ? 'Bad API key' : interakt.state} />
+                : <Status ok={false} text={testing ? 'Testing…' : '—'} />
+            }
+          />
+          <Row
+            label="Webhook URL"
+            value={<Mono>chat.migrizo.com/api/whatsapp/webhook</Mono>}
+          />
+          {interakt && !interakt.ok && (
+            <div style={{ fontSize: 11.5, color: 'var(--amber)', lineHeight: 1.5, paddingTop: 6 }}>
+              {interakt.detail}
+            </div>
+          )}
+          <div style={{ paddingTop: 9 }}>
+            <button
+              onClick={testInterakt}
+              disabled={testing}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 12px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface-2)', fontSize: 11.5, fontWeight: 600, cursor: 'pointer' }}
+            >
+              <RefreshCw size={12} /> {testing ? 'Testing…' : 'Test Interakt connection'}
+            </button>
+          </div>
         </Card>
 
         <Card title="Webhook activity">
@@ -174,6 +220,13 @@ export function SettingsPanel({
       </div>
     </div>
   );
+}
+
+interface InteraktState {
+  ok: boolean;
+  state: string;
+  detail?: string;
+  httpStatus?: number;
 }
 
 interface WebhookLogRow {

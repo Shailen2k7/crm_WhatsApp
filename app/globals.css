@@ -118,3 +118,24 @@ input, textarea { font: inherit; color: inherit; }
   background-size: 420px 100%;
   animation: shimmer 1.3s linear infinite;
 }
+
+/* ==========================================================================
+   Mobile polish — 80% of use is on a phone, so the phone is the first-class
+   surface: bigger touch targets, safe-area padding, no accidental zoom.
+   ========================================================================== */
+@media (max-width: 900px) {
+  /* iOS zooms any input under 16px on focus — this kills that forever. */
+  input, textarea, select { font-size: 16px !important; }
+  button { min-height: 40px; min-width: 40px; }
+  /* Filter chips stay one comfortable thumb-row. */
+  ::-webkit-scrollbar { width: 0; height: 0; }
+}
+
+/* Momentum scrolling + overscroll containment everywhere lists live. */
+* { overscroll-behavior: contain; }
+
+/* Never let a long word or URL break the layout. */
+body { word-break: normal; overflow-wrap: anywhere; }
+
+/* Tap highlight looks broken on dark surfaces — replace with nothing. */
+* { -webkit-tap-highlight-color: transparent; }

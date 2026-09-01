@@ -1,43 +1,53 @@
 // =============================================================================
-// SEND — the agent presses Send in the composer and lands here.
+// SEND — the agent presses Send and lands here.
 // -----------------------------------------------------------------------------
-// Order of operations matters, and it is deliberate:
+// V2 accepts three kinds of payload:
 //
-//   1. Authenticate the USER (session), not a secret. Only a signed-in member
-//      of the workspace may message a lead.
-//   2. Resolve the conversation, creating it if this is the first message.
-//   3. Enforce the 24-hour window BEFORE calling Interakt. A free-form message
-//      outside the window is not a provider error to recover from, it is a
-//      thing we must not attempt.
-//   4. Write the message row as 'queued' FIRST, then send. If the process dies
-//      mid-send, an agent sees a queued message rather than a reply that
-//      silently never existed.
-//   5. Record the outcome — provider id on success, error code and detail on
-//      failure — so a failed send is visible in the thread, not swallowed.
+//   text          {message}                       -> WhatsApp free-form
+//   media         {attachments:[{path,...}]}      -> one WhatsApp media message
+//                                                    per file, caption on first
+//   internal note {message, internal:true}        -> stored in the thread,
+//                                                    NEVER sent to WhatsApp
+//
+// The 24-hour rule is enforced BEFORE Interakt is called — for text AND media.
+// Internal notes are exempt: they never leave the building, so the window is
+// irrelevant to them. That asymmetry is the whole point of the feature.
+//
+// Media travels as a time-limited SIGNED url into our private bucket. Interakt
+// fetches it within seconds; the link dies within the hour; the file itself
+// stays private forever.
 // =============================================================================
 import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { sendText, sendTemplate, windowState, isConfigured } from '@/lib/interakt';
+import { sendText, sendTemplate, sendMedia, windowState, isConfigured } from '@/lib/interakt';
 import { toE164 } from '@/lib/phone';
+import { RELAY_BUCKET } from '@/lib/files';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+interface Attachment { path: string; name: string; mime: string; size: number }
+
+function mediaTypeOf(mime: string): 'image' | 'document' | 'audio' | 'video' {
+  const m = (mime || '').toLowerCase();
+  if (m.startsWith('image/')) return 'image';
+  if (m.startsWith('audio/')) return 'audio';
+  if (m.startsWith('video/')) return 'video';
+  return 'document';
+}
+
 export async function POST(req: Request) {
-  // ---- 1. who is calling ---------------------------------------------------
+  // ---- who is calling ------------------------------------------------------
   const supabase = await createClient();
   const { data: { user }, error: authErr } = await supabase.auth.getUser();
-  if (authErr || !user) {
-    return NextResponse.json({ ok: false, error: 'Not signed in.' }, { status: 401 });
-  }
+  if (authErr || !user) return NextResponse.json({ ok: false, error: 'Not signed in.' }, { status: 401 });
 
   const { data: member } = await supabase
     .from('workspace_members')
     .select('workspace_id, status')
     .eq('user_id', user.id)
     .maybeSingle();
-
   if (!member || member.status !== 'active') {
     return NextResponse.json({ ok: false, error: 'No active workspace membership.' }, { status: 403 });
   }
@@ -46,9 +56,10 @@ export async function POST(req: Request) {
   // ---- parse ---------------------------------------------------------------
   let body: {
     phone?: string;
-    leadId?: string;
     conversationId?: string;
     message?: string;
+    internal?: boolean;
+    attachments?: Attachment[];
     templateName?: string;
     templateLanguage?: string;
     templateValues?: string[];
@@ -59,9 +70,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: 'Bad JSON.' }, { status: 400 });
   }
 
-  const isTemplate = !!body.templateName;
   const text = (body.message || '').trim();
-  if (!isTemplate && !text) {
+  const attachments = Array.isArray(body.attachments) ? body.attachments.slice(0, 10) : [];
+  const isTemplate = !!body.templateName;
+  const isInternal = !!body.internal;
+
+  if (!text && attachments.length === 0 && !isTemplate) {
     return NextResponse.json({ ok: false, error: 'Message is empty.' }, { status: 400 });
   }
   if (text.length > 4096) {
@@ -69,32 +83,19 @@ export async function POST(req: Request) {
   }
 
   const phoneE164 = toE164(body.phone);
-  if (!phoneE164) {
-    return NextResponse.json({ ok: false, error: 'That contact has no usable phone number.' }, { status: 400 });
-  }
-
-  if (!isConfigured()) {
-    return NextResponse.json(
-      { ok: false, error: 'WhatsApp is not connected — INTERAKT_API_KEY is not set.' },
-      { status: 503 }
-    );
-  }
+  if (!phoneE164) return NextResponse.json({ ok: false, error: 'That contact has no usable phone number.' }, { status: 400 });
 
   const admin = createAdminClient();
-  if (!admin) {
-    return NextResponse.json({ ok: false, error: 'Server is not configured.' }, { status: 500 });
-  }
+  if (!admin) return NextResponse.json({ ok: false, error: 'Server is not configured.' }, { status: 500 });
 
-  // ---- 2. conversation -----------------------------------------------------
+  // ---- conversation --------------------------------------------------------
   let conversationId = body.conversationId;
   if (!conversationId) {
     const { data, error } = await admin.rpc('relay_get_or_create_conversation', {
       p_workspace_id: workspaceId,
       p_phone_e164: phoneE164,
     });
-    if (error || !data) {
-      return NextResponse.json({ ok: false, error: error?.message || 'Could not open conversation.' }, { status: 500 });
-    }
+    if (error || !data) return NextResponse.json({ ok: false, error: error?.message || 'Could not open conversation.' }, { status: 500 });
     conversationId = data as string;
   }
 
@@ -103,80 +104,148 @@ export async function POST(req: Request) {
     .select('id, workspace_id, last_inbound_at')
     .eq('id', conversationId)
     .maybeSingle();
-
   if (!conv || conv.workspace_id !== workspaceId) {
     return NextResponse.json({ ok: false, error: 'Conversation not found.' }, { status: 404 });
   }
 
-  // ---- 3. the 24-hour rule -------------------------------------------------
+  // ---- INTERNAL NOTE: store and stop. Never touches WhatsApp. --------------
+  if (isInternal) {
+    const { data: note, error: noteErr } = await admin
+      .from('relay_messages')
+      .insert({
+        workspace_id: workspaceId,
+        conversation_id: conversationId,
+        direction: 'out',
+        body: text,
+        is_internal: true,
+        status: 'sent', // there is no delivery pipeline for a note
+        sent_by: user.id,
+      })
+      .select('id')
+      .single();
+    if (noteErr || !note) return NextResponse.json({ ok: false, error: noteErr?.message || 'Could not save note.' }, { status: 500 });
+    return NextResponse.json({ ok: true, messageId: note.id, conversationId, internal: true });
+  }
+
+  if (!isConfigured()) {
+    return NextResponse.json({ ok: false, error: 'WhatsApp is not connected — INTERAKT_API_KEY is not set.' }, { status: 503 });
+  }
+
+  // ---- the 24-hour rule (text AND media, templates exempt) -----------------
   const win = windowState(conv.last_inbound_at);
   if (!isTemplate && !win.open) {
     return NextResponse.json(
-      {
-        ok: false,
-        error:
-          'The 24-hour window is closed. WhatsApp only allows an approved template until they message you again.',
-        code: 'window_closed',
-        windowOpen: false,
-      },
+      { ok: false, error: 'The 24-hour window is closed. WhatsApp only allows an approved template until they message you again.', code: 'window_closed' },
       { status: 409 }
     );
   }
 
-  // ---- 4. optimistic row ---------------------------------------------------
-  const { data: msg, error: insErr } = await admin
-    .from('relay_messages')
-    .insert({
-      workspace_id: workspaceId,
-      conversation_id: conversationId,
-      direction: 'out',
-      body: isTemplate ? text || `[template: ${body.templateName}]` : text,
-      template_name: body.templateName || null,
-      template_language: body.templateLanguage || null,
-      template_values: body.templateValues ? { bodyValues: body.templateValues } : null,
-      status: 'queued',
-      sent_by: user.id,
-    })
-    .select('id')
-    .single();
-
-  if (insErr || !msg) {
-    return NextResponse.json({ ok: false, error: insErr?.message || 'Could not save message.' }, { status: 500 });
-  }
-
-  // ---- 5. send and record the outcome --------------------------------------
-  const result = isTemplate
-    ? await sendTemplate({
-        phoneE164,
-        templateName: body.templateName as string,
-        languageCode: body.templateLanguage,
-        bodyValues: body.templateValues,
-        callbackData: msg.id,
+  // ---- template ------------------------------------------------------------
+  if (isTemplate) {
+    const { data: msg } = await admin
+      .from('relay_messages')
+      .insert({
+        workspace_id: workspaceId, conversation_id: conversationId, direction: 'out',
+        body: text || `[template: ${body.templateName}]`,
+        template_name: body.templateName, template_language: body.templateLanguage || null,
+        template_values: body.templateValues ? { bodyValues: body.templateValues } : null,
+        status: 'queued', sent_by: user.id,
       })
-    : await sendText({ phoneE164, message: text, callbackData: msg.id });
+      .select('id').single();
+    if (!msg) return NextResponse.json({ ok: false, error: 'Could not save message.' }, { status: 500 });
 
-  await admin
-    .from('relay_messages')
-    .update({
+    const result = await sendTemplate({
+      phoneE164, templateName: body.templateName as string,
+      languageCode: body.templateLanguage, bodyValues: body.templateValues, callbackData: msg.id,
+    });
+    await admin.from('relay_messages').update({
       status: result.ok ? 'sent' : 'failed',
       provider_msg_id: result.providerMsgId || null,
       error_code: result.ok ? null : result.code || 'unknown',
       error_detail: result.ok ? null : (result.detail || '').slice(0, 500),
       updated_at: new Date().toISOString(),
-    })
-    .eq('id', msg.id);
+    }).eq('id', msg.id);
 
-  if (!result.ok) {
-    return NextResponse.json(
-      { ok: false, messageId: msg.id, error: result.detail || 'Interakt rejected the message.', code: result.code, raw: result.raw },
-      { status: 502 }
-    );
+    if (!result.ok) return NextResponse.json({ ok: false, messageId: msg.id, error: result.detail, code: result.code }, { status: 502 });
+    return NextResponse.json({ ok: true, messageId: msg.id, conversationId });
   }
 
-  return NextResponse.json({
-    ok: true,
-    messageId: msg.id,
-    conversationId,
-    providerMsgId: result.providerMsgId,
-  });
+  // ---- media (one WhatsApp message per file, caption rides on the first) ---
+  if (attachments.length > 0) {
+    const results: { id: string; ok: boolean; error?: string }[] = [];
+
+    for (let i = 0; i < attachments.length; i++) {
+      const att = attachments[i];
+      const caption = i === 0 ? text : '';
+      const mType = mediaTypeOf(att.mime);
+
+      const { data: msg } = await admin
+        .from('relay_messages')
+        .insert({
+          workspace_id: workspaceId, conversation_id: conversationId, direction: 'out',
+          body: caption,
+          media_path: att.path, media_name: att.name, media_mime: att.mime,
+          media_size: att.size, media_type: mType === 'document' ? 'document' : mType,
+          status: 'queued', sent_by: user.id,
+        })
+        .select('id').single();
+      if (!msg) { results.push({ id: '', ok: false, error: 'db_insert_failed' }); continue; }
+
+      // Signed URL: Interakt fetches within seconds; the link expires in an hour.
+      const { data: signed, error: signErr } = await admin.storage
+        .from(RELAY_BUCKET)
+        .createSignedUrl(att.path, 3600);
+
+      let result;
+      if (signErr || !signed?.signedUrl) {
+        result = { ok: false, code: 'sign_failed', detail: 'Could not create a link for the file.' };
+      } else {
+        result = await sendMedia({
+          phoneE164, mediaUrl: signed.signedUrl, mediaType: mType,
+          fileName: att.name, caption, callbackData: msg.id,
+        });
+      }
+
+      await admin.from('relay_messages').update({
+        status: result.ok ? 'sent' : 'failed',
+        provider_msg_id: ('providerMsgId' in result ? result.providerMsgId : null) || null,
+        error_code: result.ok ? null : result.code || 'unknown',
+        error_detail: result.ok ? null : (result.detail || '').slice(0, 500),
+        updated_at: new Date().toISOString(),
+      }).eq('id', msg.id);
+
+      results.push({ id: msg.id, ok: result.ok, error: result.ok ? undefined : result.detail });
+    }
+
+    const failed = results.filter((r) => !r.ok);
+    if (failed.length === results.length) {
+      return NextResponse.json({ ok: false, error: failed[0]?.error || 'All files failed to send.', results }, { status: 502 });
+    }
+    return NextResponse.json({ ok: true, conversationId, results, partialFailures: failed.length });
+  }
+
+  // ---- plain text ----------------------------------------------------------
+  const { data: msg } = await admin
+    .from('relay_messages')
+    .insert({
+      workspace_id: workspaceId, conversation_id: conversationId, direction: 'out',
+      body: text, status: 'queued', sent_by: user.id,
+    })
+    .select('id').single();
+  if (!msg) return NextResponse.json({ ok: false, error: 'Could not save message.' }, { status: 500 });
+
+  const result = await sendText({ phoneE164, message: text, callbackData: msg.id });
+
+  await admin.from('relay_messages').update({
+    status: result.ok ? 'sent' : 'failed',
+    provider_msg_id: result.providerMsgId || null,
+    error_code: result.ok ? null : result.code || 'unknown',
+    error_detail: result.ok ? null : (result.detail || '').slice(0, 500),
+    updated_at: new Date().toISOString(),
+  }).eq('id', msg.id);
+
+  if (!result.ok) {
+    return NextResponse.json({ ok: false, messageId: msg.id, error: result.detail || 'Interakt rejected the message.', code: result.code }, { status: 502 });
+  }
+  return NextResponse.json({ ok: true, messageId: msg.id, conversationId, providerMsgId: result.providerMsgId });
 }

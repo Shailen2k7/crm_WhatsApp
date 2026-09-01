@@ -3,85 +3,95 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import {
-  Search, Star, PanelRight, MoreHorizontal, Paperclip, Smile, Image as ImageIcon,
-  FileText, Mic, Send, MessageSquare, ArrowLeft, AlertCircle, Loader2, RotateCw,
+  Search, Star, PanelRight, Paperclip, Send, MessageSquare, ArrowLeft,
+  AlertCircle, Loader2, RotateCw, Lock, FileText, Download, X, Trash2,
+  MoreHorizontal, Zap, Image as ImageIcon,
 } from 'lucide-react';
 import { initialsOf, avatarTint, formatPhone } from '@/lib/phone';
 import type { Contact } from '@/lib/contacts';
 import { windowState, formatWindow } from '@/lib/interakt';
-import type { RelayMessage } from '@/lib/messages';
+import type { RelayMessage, QuickReply } from '@/lib/messages';
+
+interface PendingFile { path: string; name: string; mime: string; size: number }
+
+function fmtBytes(n: number | null): string {
+  if (!n) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 export function ChatPanel({
   contact,
   workspaceId,
+  role,
   crmOpen,
   onToggleCrm,
   onBack,
+  onDeleted,
   isMobile,
 }: {
   contact: Contact | null;
   workspaceId: string;
+  role: 'admin' | 'member';
   crmOpen: boolean;
   onToggleCrm: () => void;
   onBack: () => void;
+  onDeleted: () => void;
   isMobile: boolean;
 }) {
   const supabase = useMemo(() => createClient(), []);
 
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [lastInboundAt, setLastInboundAt] = useState<string | null>(null);
+  const [spotlight, setSpotlight] = useState(false);
   const [messages, setMessages] = useState<RelayMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [draft, setDraft] = useState('');
+  const [internal, setInternal] = useState(false);
+  const [pending, setPending] = useState<PendingFile[]>([]);
+  const [uploading, setUploading] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Recomputed every 30s so the window countdown stays honest without a reload.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [quickReplies, setQuickReplies] = useState<QuickReply[]>([]);
+  const [qrOpen, setQrOpen] = useState(false);
   const [, setTick] = useState(0);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   const phoneE164 = contact?.phoneE164 ?? null;
   const displayName = contact ? (contact.unknown ? formatPhone(contact.phoneE164) : contact.name) : '';
   const firstName = contact && !contact.unknown ? contact.name.split(' ')[0] : 'them';
   const avatarSeed = contact?.key ?? '';
 
-  // ---- load the conversation and its history -------------------------------
+  // ---- conversation + history ---------------------------------------------
   useEffect(() => {
     if (!contact || !phoneE164) {
-      setConversationId(null);
-      setMessages([]);
-      setLastInboundAt(null);
+      setConversationId(null); setMessages([]); setLastInboundAt(null); setSpotlight(false);
       return;
     }
     let cancelled = false;
-    setLoading(true);
-    setError(null);
-    setDraft('');
+    setLoading(true); setError(null); setDraft(''); setPending([]); setInternal(false);
 
     (async () => {
-      // Selecting a lead must NOT create a conversation row — that would litter
-      // the table with empty threads for every contact anyone clicked. The row
-      // is created on the first actual send, by the send route.
       const { data: conv } = await supabase
         .from('relay_conversations')
-        .select('id, last_inbound_at')
+        .select('id, last_inbound_at, spotlight')
         .eq('workspace_id', workspaceId)
         .eq('phone_e164', phoneE164)
         .maybeSingle();
 
       if (cancelled) return;
-
       if (!conv) {
-        setConversationId(null);
-        setLastInboundAt(null);
-        setMessages([]);
-        setLoading(false);
+        setConversationId(null); setLastInboundAt(null); setSpotlight(false); setMessages([]); setLoading(false);
         return;
       }
-
       setConversationId(conv.id);
       setLastInboundAt(conv.last_inbound_at);
+      setSpotlight(!!conv.spotlight);
 
       const { data: msgs } = await supabase
         .from('relay_messages')
@@ -96,12 +106,10 @@ export function ChatPanel({
       supabase.rpc('relay_mark_read', { p_conversation_id: conv.id });
     })();
 
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [supabase, contact, phoneE164, workspaceId]);
 
-  // ---- realtime: new messages and status changes ---------------------------
+  // ---- realtime ------------------------------------------------------------
   useEffect(() => {
     if (!conversationId) return;
     const channel = supabase
@@ -110,6 +118,11 @@ export function ChatPanel({
         'postgres_changes',
         { event: '*', schema: 'public', table: 'relay_messages', filter: `conversation_id=eq.${conversationId}` },
         (payload) => {
+          if (payload.eventType === 'DELETE') {
+            const gone = (payload.old as { id?: string })?.id;
+            if (gone) setMessages((prev) => prev.filter((m) => m.id !== gone));
+            return;
+          }
           const row = payload.new as RelayMessage;
           if (!row?.id) return;
           setMessages((prev) => {
@@ -119,16 +132,31 @@ export function ChatPanel({
             copy[i] = row;
             return copy;
           });
-          if (row.direction === 'in') setLastInboundAt(row.created_at);
+          if (row.direction === 'in') {
+            setLastInboundAt(row.created_at);
+            supabase.rpc('relay_mark_read', { p_conversation_id: conversationId });
+          }
         }
       )
       .subscribe();
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    return () => { supabase.removeChannel(channel); };
   }, [supabase, conversationId]);
 
-  // ---- keep the countdown live ---------------------------------------------
+  // ---- quick replies -------------------------------------------------------
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase
+        .from('relay_quick_replies')
+        .select('*')
+        .eq('workspace_id', workspaceId)
+        .order('sort_order')
+        .order('title');
+      if (!cancelled && data) setQuickReplies(data as QuickReply[]);
+    })();
+    return () => { cancelled = true; };
+  }, [supabase, workspaceId]);
+
   useEffect(() => {
     const t = setInterval(() => setTick((n) => n + 1), 30_000);
     return () => clearInterval(t);
@@ -138,13 +166,42 @@ export function ChatPanel({
     bottomRef.current?.scrollIntoView({ behavior: messages.length > 30 ? 'auto' : 'smooth' });
   }, [messages.length]);
 
-  const win = windowState(lastInboundAt);
+  // "/" at the start of an empty composer opens quick replies — muscle memory
+  // from every serious support tool.
+  useEffect(() => {
+    setQrOpen(draft === '/' || (draft.startsWith('/') && draft.length <= 20 && !draft.includes(' ')));
+  }, [draft]);
 
+  const win = windowState(lastInboundAt);
+  // Internal notes bypass the window entirely — they never reach WhatsApp.
+  const canType = win.open || internal;
+  const canSend = (draft.trim().length > 0 || pending.length > 0) && !sending && !uploading && (internal ? draft.trim().length > 0 : canType);
+
+  // ---- attach --------------------------------------------------------------
+  async function attachFiles(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    setUploading(true); setError(null);
+    for (const f of Array.from(files).slice(0, 10 - pending.length)) {
+      const fd = new FormData();
+      fd.append('file', f);
+      try {
+        const res = await fetch('/api/whatsapp/upload', { method: 'POST', body: fd });
+        const json = await res.json();
+        if (json.ok) setPending((prev) => [...prev, json.attachment]);
+        else setError(json.error || `Could not upload ${f.name}`);
+      } catch {
+        setError(`Could not upload ${f.name}`);
+      }
+    }
+    setUploading(false);
+    if (fileRef.current) fileRef.current.value = '';
+  }
+
+  // ---- send ----------------------------------------------------------------
   const send = useCallback(async () => {
     const text = draft.trim();
-    if (!text || !contact || sending) return;
-    setSending(true);
-    setError(null);
+    if ((!text && pending.length === 0) || !contact || sending) return;
+    setSending(true); setError(null);
 
     try {
       const res = await fetch('/api/whatsapp/send', {
@@ -152,24 +209,23 @@ export function ChatPanel({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           phone: contact.phoneRaw,
-          leadId: contact.leadId,
           conversationId: conversationId || undefined,
           message: text,
+          internal,
+          attachments: internal ? [] : pending,
         }),
       });
       const json = await res.json();
 
       if (!res.ok || !json.ok) {
         setError(json.error || 'Could not send.');
-        // The draft is NOT cleared on failure — losing what someone typed
-        // because a provider hiccuped is unforgivable in a chat app.
         setSending(false);
-        return;
+        return; // draft and files kept — never throw away what someone typed
       }
 
-      setDraft('');
+      setDraft(''); setPending([]); setInternal(false);
       if (!conversationId && json.conversationId) setConversationId(json.conversationId);
-      // Realtime delivers the row; if the socket is down, pull it once.
+      if (json.partialFailures > 0) setError(`${json.partialFailures} file(s) failed to send — they stay in the thread marked failed.`);
       if (json.conversationId) {
         const { data } = await supabase
           .from('relay_messages')
@@ -180,59 +236,118 @@ export function ChatPanel({
         if (data) setMessages(data as RelayMessage[]);
       }
     } catch {
-      setError('Network error — the message was not sent.');
+      setError('Network error — nothing was sent.');
     } finally {
       setSending(false);
       taRef.current?.focus();
     }
-  }, [draft, contact, sending, conversationId, supabase]);
+  }, [draft, pending, internal, contact, sending, conversationId, supabase]);
+
+  // ---- quick reply insert --------------------------------------------------
+  function applyQuickReply(q: QuickReply) {
+    setDraft(q.body);
+    if (q.attachments?.length) setPending((prev) => [...prev, ...q.attachments].slice(0, 10));
+    setQrOpen(false);
+    taRef.current?.focus();
+  }
+
+  // ---- spotlight + delete --------------------------------------------------
+  async function toggleSpotlight() {
+    if (!conversationId) return;
+    const next = !spotlight;
+    setSpotlight(next);
+    await supabase.from('relay_conversations').update({ spotlight: next }).eq('id', conversationId);
+  }
+
+  async function deleteConversation() {
+    if (!conversationId) return;
+    if (!confirm(`Delete this entire chat with ${displayName}?\n\nEvery message and every file in it is removed permanently. The CRM lead is not touched.`)) return;
+    const res = await fetch(`/api/whatsapp/conversation/${conversationId}`, { method: 'DELETE' });
+    const json = await res.json();
+    if (json.ok) onDeleted();
+    else setError(json.error || 'Could not delete.');
+    setMenuOpen(false);
+  }
+
+  async function deleteMessage(id: string) {
+    if (!conversationId) return;
+    if (!confirm('Delete this message (and its file, if any) permanently?')) return;
+    const res = await fetch(`/api/whatsapp/conversation/${conversationId}?messageId=${id}`, { method: 'DELETE' });
+    const json = await res.json();
+    if (!json.ok) setError(json.error || 'Could not delete.');
+  }
 
   if (!contact) return <EmptyState />;
 
-  const canType = win.open;
+  const qrMatches = qrOpen
+    ? quickReplies.filter((q) => draft.length <= 1 || q.shortcut.toLowerCase().startsWith(draft.slice(1).toLowerCase()))
+    : [];
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, background: 'var(--chat)' }}>
       {/* Header */}
-      <header style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '10px 14px', background: 'var(--surface)', borderBottom: '1px solid var(--line)', flex: 'none' }}>
+      <header style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '10px 14px', paddingTop: 'calc(10px + env(safe-area-inset-top))', background: 'var(--surface)', borderBottom: '1px solid var(--line)', flex: 'none' }}>
         {isMobile && (
-          <button onClick={onBack} aria-label="Back" style={iconBtn}>
-            <ArrowLeft size={18} />
-          </button>
+          <button onClick={onBack} aria-label="Back" style={iconBtn}><ArrowLeft size={19} /></button>
         )}
         <div style={{ width: 38, height: 38, borderRadius: 99, background: contact.unknown ? 'var(--surface-3)' : avatarTint(avatarSeed), color: contact.unknown ? 'var(--muted)' : '#fff', fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
           {contact.unknown ? '?' : initialsOf(contact.name)}
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 14.5, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {displayName}
-            </span>
+            <span style={{ fontSize: 14.5, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</span>
             {contact.unknown ? (
-              <span style={{ fontSize: 10.5, fontWeight: 700, padding: '2px 7px', borderRadius: 99, background: 'var(--amber-bg)', color: 'var(--amber)', flex: 'none' }}>
-                Not in CRM
-              </span>
+              <span style={{ fontSize: 10.5, fontWeight: 700, padding: '2px 7px', borderRadius: 99, background: 'var(--amber-bg)', color: 'var(--amber)', flex: 'none' }}>Not in CRM</span>
             ) : (
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 10.5, fontWeight: 700, padding: '2px 7px', borderRadius: 99, background: 'var(--teal-bg)', color: 'var(--teal-ink)', flex: 'none' }}>
-                <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M20 6L9 17l-5-5" />
-                </svg>
-                CRM linked
-              </span>
+              !isMobile && (
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 10.5, fontWeight: 700, padding: '2px 7px', borderRadius: 99, background: 'var(--teal-bg)', color: 'var(--teal-ink)', flex: 'none' }}>
+                  <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>
+                  CRM linked
+                </span>
+              )
             )}
           </div>
           <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 1 }}>{formatPhone(contact.phoneE164)}</div>
         </div>
-        <button aria-label="Search in conversation" style={iconBtn}><Search size={17} /></button>
-        <button aria-label="Star" style={iconBtn}><Star size={17} /></button>
+
+        {!isMobile && <button aria-label="Search in conversation" style={iconBtn}><Search size={17} /></button>}
+        <button
+          onClick={toggleSpotlight}
+          aria-label={spotlight ? 'Remove spotlight' : 'Spotlight this chat'}
+          title={conversationId ? 'Spotlight' : 'Spotlight is available once the chat has messages'}
+          disabled={!conversationId}
+          style={{ ...iconBtn, color: spotlight ? 'var(--amber)' : 'var(--muted)', opacity: conversationId ? 1 : 0.4 }}
+        >
+          <Star size={17} fill={spotlight ? 'var(--amber)' : 'none'} />
+        </button>
         <button onClick={onToggleCrm} aria-label="Toggle CRM panel" style={{ ...iconBtn, background: crmOpen ? 'var(--surface-3)' : 'transparent', color: crmOpen ? 'var(--teal-ink)' : 'var(--muted)' }}>
           <PanelRight size={17} />
         </button>
-        <button aria-label="More" style={iconBtn}><MoreHorizontal size={17} /></button>
+        <div style={{ position: 'relative' }}>
+          <button onClick={() => setMenuOpen((v) => !v)} aria-label="More" style={iconBtn}><MoreHorizontal size={17} /></button>
+          {menuOpen && (
+            <>
+              <div onClick={() => setMenuOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 30 }} />
+              <div className="animate-pop-in" style={{ position: 'absolute', right: 0, top: 38, zIndex: 31, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 11, boxShadow: 'var(--shadow)', minWidth: 200, overflow: 'hidden' }}>
+                {role === 'admin' ? (
+                  <button
+                    onClick={deleteConversation}
+                    disabled={!conversationId}
+                    style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', padding: '11px 14px', border: 0, background: 'transparent', color: 'var(--red)', fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: conversationId ? 1 : 0.4 }}
+                  >
+                    <Trash2 size={15} /> Delete entire chat
+                  </button>
+                ) : (
+                  <div style={{ padding: '11px 14px', fontSize: 12, color: 'var(--muted)' }}>Only an admin can delete chats.</div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
       </header>
 
       {/* Thread */}
-      <div style={{ flex: 1, overflowY: 'auto', minHeight: 0, padding: '16px 18px 6px' }}>
+      <div style={{ flex: 1, overflowY: 'auto', WebkitOverflowScrolling: 'touch', minHeight: 0, padding: '16px 14px 6px' }}>
         {loading && (
           <div style={{ display: 'flex', justifyContent: 'center', padding: 24, color: 'var(--muted)' }}>
             <Loader2 size={18} style={{ animation: 'spin .8s linear infinite' }} />
@@ -262,7 +377,7 @@ export function ChatPanel({
             return (
               <div key={m.id}>
                 {showDate && <DateSeparator iso={m.created_at} />}
-                <Bubble message={m} />
+                <Bubble message={m} isAdmin={role === 'admin'} onDelete={() => deleteMessage(m.id)} />
               </div>
             );
           })}
@@ -270,7 +385,28 @@ export function ChatPanel({
       </div>
 
       {/* Composer */}
-      <div style={{ padding: '8px 14px 14px', flex: 'none' }}>
+      <div style={{ padding: '8px 12px', paddingBottom: 'calc(12px + env(safe-area-inset-bottom))', flex: 'none', position: 'relative' }}>
+        {/* Quick replies popover */}
+        {qrOpen && qrMatches.length > 0 && (
+          <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 280, overflowY: 'auto', zIndex: 20 }}>
+            <div style={{ padding: '9px 14px 5px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>Quick replies</div>
+            {qrMatches.map((q) => (
+              <button key={q.id} onClick={() => applyQuickReply(q)} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 14px', border: 0, borderTop: '1px solid var(--line-2)', background: 'transparent', cursor: 'pointer' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--teal-ink)' }}>/{q.shortcut}</span>
+                  <span style={{ fontSize: 12.5, fontWeight: 600 }}>{q.title}</span>
+                  {q.attachments?.length > 0 && (
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontSize: 10.5, color: 'var(--muted)' }}>
+                      <Paperclip size={11} /> {q.attachments.length}
+                    </span>
+                  )}
+                </div>
+                <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{q.body}</div>
+              </button>
+            ))}
+          </div>
+        )}
+
         {error && (
           <div className="animate-fade-in" style={{ display: 'flex', alignItems: 'flex-start', gap: 8, background: 'var(--red-bg)', color: 'var(--red)', padding: '9px 12px', borderRadius: 10, fontSize: 12.3, fontWeight: 500, marginBottom: 8, lineHeight: 1.5 }}>
             <AlertCircle size={14} style={{ flex: 'none', marginTop: 1 }} />
@@ -279,73 +415,113 @@ export function ChatPanel({
           </div>
         )}
 
-        {!canType && (
+        {!win.open && !internal && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'var(--amber-bg)', color: 'var(--ink-2)', padding: '9px 12px', borderRadius: 10, fontSize: 12.3, marginBottom: 8, lineHeight: 1.5 }}>
             <AlertCircle size={14} style={{ flex: 'none', color: 'var(--amber)' }} />
-            <span>
-              <strong>24-hour window closed.</strong> WhatsApp only allows an approved template until they reply.
-              Templates arrive next — for now, ask them to message you first.
-            </span>
+            <span><strong>24-hour window closed.</strong> Only an approved template can reach {firstName} — or switch to an internal note (🔒).</span>
           </div>
         )}
 
-        <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', opacity: canType ? 1 : 0.6 }}>
+        {/* Pending attachments */}
+        {pending.length > 0 && (
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
+            {pending.map((f, i) => (
+              <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 9px', borderRadius: 9, background: 'var(--surface)', border: '1px solid var(--line)', fontSize: 11.5, fontWeight: 600 }}>
+                <FileText size={12} style={{ color: 'var(--teal)' }} />
+                <span style={{ maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                <span style={{ color: 'var(--muted)', fontWeight: 400 }}>{fmtBytes(f.size)}</span>
+                <button onClick={() => setPending((prev) => prev.filter((_, j) => j !== i))} aria-label="Remove" style={{ background: 'transparent', border: 0, cursor: 'pointer', color: 'var(--muted)', display: 'flex', padding: 0 }}>
+                  <X size={13} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        <div
+          style={{
+            background: internal ? 'var(--amber-bg)' : 'var(--surface)',
+            border: internal ? '1px solid var(--amber)' : '1px solid var(--line)',
+            borderRadius: 14,
+            boxShadow: 'var(--shadow)',
+            transition: 'background .15s ease, border-color .15s ease',
+          }}
+        >
+          {internal && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 14px 0', fontSize: 11, fontWeight: 700, color: 'var(--amber)' }}>
+              <Lock size={11} /> INTERNAL NOTE — the client never sees this
+            </div>
+          )}
           <textarea
             ref={taRef}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                send();
-              }
+              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+              if (e.key === 'Escape') setQrOpen(false);
             }}
-            disabled={!canType || sending}
+            disabled={(!canType && !internal) || sending}
             rows={1}
-            placeholder={canType ? `Message ${firstName}…    ⏎ send · ⇧⏎ new line` : 'Window closed — an approved template is required'}
+            placeholder={
+              internal
+                ? 'Note for the team — never sent to the client'
+                : canType
+                ? `Message ${firstName}…   ⏎ send · / quick replies`
+                : 'Window closed — template required, or write an internal note'
+            }
             style={{
-              width: '100%',
-              border: 0,
-              outline: 0,
-              resize: 'none',
-              background: 'transparent',
-              padding: '14px 16px 4px',
-              fontSize: 14,
-              lineHeight: 1.5,
-              maxHeight: 140,
-              minHeight: 46,
-              cursor: canType ? 'text' : 'not-allowed',
+              width: '100%', border: 0, outline: 0, resize: 'none', background: 'transparent',
+              padding: '13px 16px 4px', fontSize: 15, lineHeight: 1.5, maxHeight: 140, minHeight: 48,
+              cursor: canType || internal ? 'text' : 'not-allowed',
             }}
           />
-          <div style={{ display: 'flex', alignItems: 'center', gap: 3, padding: '4px 10px 9px' }}>
-            {[Smile, Paperclip, ImageIcon, FileText, Mic].map((Icon, i) => (
-              <span key={i} title="Attachments arrive in Phase 4" style={{ width: 30, height: 30, borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)', opacity: 0.5 }}>
-                <Icon size={16} />
-              </span>
-            ))}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 2, padding: '4px 8px 9px' }}>
+            <input ref={fileRef} type="file" multiple hidden onChange={(e) => attachFiles(e.target.files)} accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.txt,.rtf" />
+            <button
+              onClick={() => fileRef.current?.click()}
+              disabled={internal || uploading || !win.open}
+              title={internal ? 'Notes cannot carry files (yet)' : win.open ? 'Attach files' : 'Window closed'}
+              aria-label="Attach files"
+              style={{ ...composerBtn, opacity: internal || !win.open ? 0.35 : 1 }}
+            >
+              {uploading ? <Loader2 size={17} style={{ animation: 'spin .8s linear infinite' }} /> : <Paperclip size={17} />}
+            </button>
+            <button
+              onClick={() => { setDraft((d) => (d.startsWith('/') ? d : '/')); taRef.current?.focus(); }}
+              title="Quick replies ( / )"
+              aria-label="Quick replies"
+              style={composerBtn}
+            >
+              <Zap size={17} />
+            </button>
+            <button
+              onClick={() => setInternal((v) => !v)}
+              title={internal ? 'Back to WhatsApp message' : 'Internal note — team only'}
+              aria-label="Toggle internal note"
+              style={{ ...composerBtn, background: internal ? 'var(--amber)' : 'transparent', color: internal ? '#fff' : 'var(--muted)' }}
+            >
+              <Lock size={16} />
+            </button>
+
             <div style={{ flex: 1 }} />
-            <span style={{ fontSize: 11, color: win.open ? 'var(--muted)' : 'var(--amber)', marginRight: 9, fontWeight: win.open ? 400 : 600 }}>
-              24h window · {formatWindow(win.msLeft)}
-            </span>
+            {!internal && (
+              <span style={{ fontSize: 11, color: win.open ? 'var(--muted)' : 'var(--amber)', marginRight: 8, fontWeight: win.open ? 400 : 600, whiteSpace: 'nowrap' }}>
+                24h · {formatWindow(win.msLeft)}
+              </span>
+            )}
             <button
               onClick={send}
-              disabled={!canType || sending || !draft.trim()}
+              disabled={!canSend}
+              aria-label="Send"
               style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 6,
-                padding: '7px 14px',
-                borderRadius: 9,
-                border: 0,
-                background: canType && draft.trim() ? 'var(--teal)' : 'var(--surface-3)',
-                color: canType && draft.trim() ? '#fff' : 'var(--muted)',
-                fontSize: 13,
-                fontWeight: 600,
-                cursor: canType && draft.trim() && !sending ? 'pointer' : 'not-allowed',
+                display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 15px', borderRadius: 10, border: 0,
+                background: canSend ? (internal ? 'var(--amber)' : 'var(--teal)') : 'var(--surface-3)',
+                color: canSend ? '#fff' : 'var(--muted)',
+                fontSize: 13, fontWeight: 700, cursor: canSend ? 'pointer' : 'not-allowed',
               }}
             >
-              {sending ? <Loader2 size={13} style={{ animation: 'spin .8s linear infinite' }} /> : <Send size={13} />}
-              {sending ? 'Sending' : 'Send'}
+              {sending ? <Loader2 size={13} style={{ animation: 'spin .8s linear infinite' }} /> : internal ? <Lock size={13} /> : <Send size={13} />}
+              {sending ? 'Sending' : internal ? 'Save note' : 'Send'}
             </button>
           </div>
         </div>
@@ -363,46 +539,99 @@ function DateSeparator({ iso }: { iso: string }) {
   let label = d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
   if (d.toDateString() === today.toDateString()) label = 'Today';
   else if (d.toDateString() === yesterday.toDateString()) label = 'Yesterday';
-
   return (
     <div style={{ textAlign: 'center', margin: '14px 0 10px' }}>
-      <span style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--muted)' }}>
-        {label}
-      </span>
+      <span style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--muted)' }}>{label}</span>
     </div>
   );
 }
 
-function Bubble({ message: m }: { message: RelayMessage }) {
+function Bubble({ message: m, isAdmin, onDelete }: { message: RelayMessage; isAdmin: boolean; onDelete: () => void }) {
   const out = m.direction === 'out';
   const failed = m.status === 'failed';
+  const internal = m.is_internal;
+  const hasFile = !!(m.media_path || m.media_url);
+  const isImage = m.media_type === 'image';
+  const [hover, setHover] = useState(false);
 
   return (
-    <div className="animate-msg-in" style={{ display: 'flex', justifyContent: out ? 'flex-end' : 'flex-start', marginBottom: 7 }}>
-      <div style={{ maxWidth: '68%', minWidth: 90 }}>
+    <div
+      className="animate-msg-in"
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{ display: 'flex', justifyContent: out ? 'flex-end' : 'flex-start', marginBottom: 7, gap: 6, alignItems: 'center', flexDirection: out ? 'row-reverse' : 'row' }}
+    >
+      <div style={{ maxWidth: 'min(78%, 480px)', minWidth: 90 }}>
         <div
           style={{
-            background: failed ? 'var(--red-bg)' : out ? 'var(--out-bg)' : 'var(--in-bg)',
-            color: failed ? 'var(--ink)' : out ? 'var(--out-fg)' : 'var(--in-fg)',
-            border: out || failed ? 'none' : '1px solid var(--line-2)',
-            borderRadius: out ? '13px 13px 4px 13px' : '13px 13px 13px 4px',
-            padding: '9px 13px 7px',
+            background: internal ? 'var(--amber-bg)' : failed ? 'var(--red-bg)' : out ? 'var(--out-bg)' : 'var(--in-bg)',
+            color: internal ? 'var(--ink)' : failed ? 'var(--ink)' : out ? 'var(--out-fg)' : 'var(--in-fg)',
+            border: internal ? '1px dashed var(--amber)' : out || failed ? 'none' : '1px solid var(--line-2)',
+            borderRadius: out ? '14px 14px 5px 14px' : '14px 14px 14px 5px',
+            padding: hasFile && isImage ? 5 : '9px 13px 7px',
             boxShadow: 'var(--shadow)',
+            overflow: 'hidden',
           }}
         >
+          {internal && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, fontWeight: 800, color: 'var(--amber)', margin: hasFile && isImage ? '5px 9px 3px' : '0 0 4px', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+              <Lock size={10} /> Internal
+            </div>
+          )}
           {m.template_name && (
             <div style={{ fontSize: 10, fontWeight: 700, opacity: 0.75, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '.04em' }}>
               Template · {m.template_name}
             </div>
           )}
-          <div style={{ fontSize: 13.6, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-            {m.body || (m.media_url ? '[attachment]' : '')}
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 5, marginTop: 3 }}>
+
+          {/* Image: inline preview, tap to open full-size. */}
+          {hasFile && isImage && (
+            <a href={`/api/whatsapp/media/${m.id}`} target="_blank" rel="noopener noreferrer" style={{ display: 'block' }}>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={`/api/whatsapp/media/${m.id}`}
+                alt={m.media_name || 'photo'}
+                style={{ display: 'block', width: '100%', maxHeight: 340, objectFit: 'cover', borderRadius: 10 }}
+                loading="lazy"
+              />
+            </a>
+          )}
+
+          {/* Document / audio / video: a card with the real filename + download. */}
+          {hasFile && !isImage && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '4px 2px', minWidth: 200 }}>
+              <div style={{ width: 38, height: 38, borderRadius: 9, background: out ? 'rgba(255,255,255,.16)' : 'var(--surface-3)', display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
+                {m.media_type === 'audio' || m.media_type === 'video' ? <ImageIcon size={17} /> : <FileText size={17} />}
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 12.8, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {m.media_name || 'Attachment'}
+                </div>
+                <div style={{ fontSize: 10.5, opacity: 0.75 }}>
+                  {(m.media_name || '').split('.').pop()?.toUpperCase() || m.media_type?.toUpperCase()} {m.media_size ? '· ' + fmtBytes(m.media_size) : ''}
+                </div>
+              </div>
+              <a
+                href={`/api/whatsapp/media/${m.id}?download`}
+                aria-label="Download"
+                style={{ width: 32, height: 32, borderRadius: 99, background: out ? 'rgba(255,255,255,.2)' : 'var(--teal-bg)', color: out ? '#fff' : 'var(--teal-ink)', display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}
+              >
+                <Download size={15} />
+              </a>
+            </div>
+          )}
+
+          {(m.body || (!hasFile && !m.template_name)) && (
+            <div style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: hasFile && isImage ? '6px 9px 2px' : 0 }}>
+              {m.body}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 5, marginTop: 3, padding: hasFile && isImage ? '0 9px 4px' : 0 }}>
             <span style={{ fontSize: 10, opacity: 0.7 }}>
               {new Date(m.created_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })}
             </span>
-            {out && <Ticks status={m.status} />}
+            {out && !internal && <Ticks status={m.status} />}
           </div>
         </div>
 
@@ -413,24 +642,26 @@ function Bubble({ message: m }: { message: RelayMessage }) {
           </div>
         )}
       </div>
+
+      {isAdmin && hover && (
+        <button onClick={onDelete} aria-label="Delete message" title="Delete message" style={{ width: 26, height: 26, borderRadius: 8, border: 0, background: 'var(--surface)', color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', boxShadow: 'var(--shadow)', flex: 'none' }}>
+          <Trash2 size={13} />
+        </button>
+      )}
     </div>
   );
 }
 
-/** One tick sent, two delivered, two filled read — the convention people know. */
+/** One tick sent, two delivered, both bright teal when read. */
 function Ticks({ status }: { status: RelayMessage['status'] }) {
   if (status === 'queued') return <Loader2 size={11} style={{ opacity: 0.7, animation: 'spin .8s linear infinite' }} />;
   if (status === 'failed') return <AlertCircle size={11} style={{ color: 'var(--red)' }} />;
-
   const read = status === 'read';
   const two = status === 'delivered' || read;
-
   return (
     <svg width="15" height="11" viewBox="0 0 18 12" fill="none" style={{ opacity: read ? 1 : 0.75 }}>
       <path d="M1 6.5L4.5 10L11 2" stroke={read ? '#7DF3DA' : 'currentColor'} strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-      {two && (
-        <path d="M7 6.5L10.5 10L17 2" stroke={read ? '#7DF3DA' : 'currentColor'} strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-      )}
+      {two && <path d="M7 6.5L10.5 10L17 2" stroke={read ? '#7DF3DA' : 'currentColor'} strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />}
     </svg>
   );
 }
@@ -445,16 +676,20 @@ function EmptyState() {
           </svg>
         </div>
         <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 7 }}>Relay</div>
-        <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, margin: 0 }}>
-          Pick a contact on the left to open their conversation.
-        </p>
+        <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, margin: 0 }}>Pick a chat on the left, or find someone in Contacts.</p>
       </div>
     </div>
   );
 }
 
 const iconBtn: React.CSSProperties = {
-  width: 32, height: 32, borderRadius: 9, border: 0, background: 'transparent',
+  width: 36, height: 36, borderRadius: 10, border: 0, background: 'transparent',
+  color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+  cursor: 'pointer', flex: 'none',
+};
+
+const composerBtn: React.CSSProperties = {
+  width: 34, height: 34, borderRadius: 9, border: 0, background: 'transparent',
   color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center',
   cursor: 'pointer', flex: 'none',
 };
