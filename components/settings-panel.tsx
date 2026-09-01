@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { LogOut, Moon, Sun, RefreshCw } from 'lucide-react';
 import type { RelayUser, Workspace } from '@/lib/types';
+import { NotificationPanel } from './notification-panel';
 
 /**
  * Phase 1 settings double as a diagnostics page: whether the shared database is
@@ -121,6 +122,8 @@ export function SettingsPanel({
 
         {/* Answers "why are my ticks not blue?" without anyone reading logs:
             if Interakt never sends a read event, no UI can show a read tick. */}
+        <NotificationPanel />
+
         <Card title="Delivery receipts">
           {(() => {
             const rows = log || [];

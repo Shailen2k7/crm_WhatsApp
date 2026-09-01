@@ -120,7 +120,7 @@ export function ConversationList({
         minHeight: 0,
       }}
     >
-      <div style={{ padding: '13px 14px 10px', borderBottom: '1px solid var(--line-2)' }}>
+      <div style={{ padding: isMobile ? '10px 14px 10px' : '13px 14px 10px', borderBottom: '1px solid var(--line-2)' }}>
         <div style={{ position: 'relative' }}>
           <Search size={15} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--muted)' }} />
           <input
@@ -148,7 +148,7 @@ export function ConversationList({
           )}
         </div>
 
-        <div style={{ display: 'flex', gap: 5, marginTop: 10, overflowX: 'auto' }}>
+        <div style={{ display: 'flex', gap: 6, marginTop: 10, overflowX: 'auto', paddingBottom: 2, scrollbarWidth: 'none' }}>
           {FILTERS.map((f) => {
             const on = filter === f.key;
             return (
@@ -156,7 +156,7 @@ export function ConversationList({
                 key={f.key}
                 onClick={() => setFilter(f.key)}
                 style={{
-                  padding: '4px 11px',
+                  padding: isMobile ? '7px 14px' : '4px 11px',
                   borderRadius: 99,
                   border: '1px solid ' + (on ? 'transparent' : 'var(--line)'),
                   background: on ? 'var(--teal)' : 'transparent',
@@ -211,8 +211,8 @@ export function ConversationList({
               style={{
                 width: '100%',
                 display: 'flex',
-                gap: 11,
-                padding: '11px 15px',
+                gap: 12,
+                padding: isMobile ? '13px 15px' : '11px 15px',
                 alignItems: 'center',
                 border: 0,
                 borderBottom: '1px solid var(--line-2)',
@@ -223,8 +223,8 @@ export function ConversationList({
             >
               <div
                 style={{
-                  width: 40,
-                  height: 40,
+                  width: isMobile ? 46 : 40,
+                  height: isMobile ? 46 : 40,
                   borderRadius: 99,
                   background: c.unknown ? 'var(--surface-3)' : avatarTint(c.key),
                   color: c.unknown ? 'var(--muted)' : '#fff',
@@ -244,7 +244,7 @@ export function ConversationList({
                 <div style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
                   <span
                     style={{
-                      fontSize: 13.5,
+                      fontSize: isMobile ? 15 : 13.5,
                       fontWeight: c.unread > 0 ? 700 : 600,
                       color: 'var(--ink)',
                       overflow: 'hidden',
@@ -264,7 +264,7 @@ export function ConversationList({
                   {/* A thread shows its last message; everyone else shows their number. */}
                   <span
                     style={{
-                      fontSize: 12,
+                      fontSize: isMobile ? 13 : 12,
                       color: c.unread > 0 ? 'var(--ink-2)' : 'var(--muted)',
                       fontWeight: c.unread > 0 ? 600 : 400,
                       overflow: 'hidden',

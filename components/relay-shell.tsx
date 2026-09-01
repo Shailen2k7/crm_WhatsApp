@@ -15,6 +15,7 @@ import { SettingsPanel } from './settings-panel';
 import { QuickRepliesManager } from './quick-replies';
 import { FilesPanel } from './files-panel';
 import { Placeholder } from './placeholder';
+import { MobileTabs, MobileHeader } from './mobile-tabs';
 import { BellRing, X } from 'lucide-react';
 
 interface Member {
@@ -85,14 +86,41 @@ export function RelayShell({
   // ---- PWA + notifications -------------------------------------------------
   useEffect(() => {
     registerServiceWorker();
-    // Browsers refuse audio until the user touches the page once.
-    const unlock = () => { unlockAudio(); window.removeEventListener('pointerdown', unlock); window.removeEventListener('keydown', unlock); };
-    window.addEventListener('pointerdown', unlock);
+
+    // Audio needs a user gesture to start. It ALSO gets suspended by iOS every
+    // time the app goes to the background, so unlocking once is not enough —
+    // it is re-armed on every interaction and every return to the foreground.
+    const unlock = () => unlockAudio();
+    window.addEventListener('pointerdown', unlock, { passive: true });
     window.addEventListener('keydown', unlock);
-    // Offer push once, politely, when it has neither been granted nor refused.
+    window.addEventListener('focus', unlock);
+    const onVis = () => { if (!document.hidden) unlockAudio(); };
+    document.addEventListener('visibilitychange', onVis);
+
+    // The service worker asks the page to play the call when a push lands while
+    // Relay is backgrounded-but-alive — the common case on a phone. Without
+    // this listener that push would be silent except for the OS sound.
+    const onSwMessage = (e: MessageEvent) => {
+      if (e.data?.type === 'relay-push' && e.data?.play) {
+        unlockAudio();
+        playRingtone();
+      }
+    };
+    navigator.serviceWorker?.addEventListener('message', onSwMessage);
+
     if ('Notification' in window && Notification.permission === 'default') setPushBanner(true);
-    if ('Notification' in window && Notification.permission === 'granted') enablePush(); // refresh the subscription silently
-    return () => { window.removeEventListener('pointerdown', unlock); window.removeEventListener('keydown', unlock); };
+    // Already granted: silently refresh the subscription. Push endpoints expire,
+    // and an expired one fails silently — which reads as "notifications stopped
+    // working for no reason".
+    if ('Notification' in window && Notification.permission === 'granted') enablePush();
+
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+      window.removeEventListener('focus', unlock);
+      document.removeEventListener('visibilitychange', onVis);
+      navigator.serviceWorker?.removeEventListener('message', onSwMessage);
+    };
   }, []);
 
   // ---- responsive ----------------------------------------------------------
@@ -178,7 +206,8 @@ export function RelayShell({
         { event: 'INSERT', schema: 'public', table: 'relay_messages', filter: `workspace_id=eq.${workspace.id}` },
         (payload) => {
           const row = payload.new as RelayMessage;
-          if (row?.direction === 'in') {
+          // Internal notes are ours; they must never ring.
+          if (row?.direction === 'in' && !row.is_internal) {
             playRingtone();
             // Already looking at this thread? Then it is read on arrival.
             if (openConvRef.current && row.conversation_id === openConvRef.current) {
@@ -328,24 +357,39 @@ export function RelayShell({
         </div>
       )}
 
-      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-        {/* The rail floats over the list while merely hovered, so this spacer
-            holds its 62px of layout and nothing lurches sideways. */}
-        <div style={{ position: 'relative', width: isMobile ? 62 : railExpanded ? 196 : 62, flex: 'none', transition: 'width .16s ease' }}>
-          <Rail
-            active={nav}
-            onSelect={(k) => { setNav(k); if (isMobile) setSelectedKey(null); }}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        {/* On a phone the list needs its own title bar, or the status bar
+            (clock, battery) renders straight on top of the search field. */}
+        {isMobile && showList && (
+          <MobileHeader
+            title={NAV_TITLES[nav] || 'Relay'}
             theme={theme}
             onToggleTheme={toggleTheme}
             userName={user.name}
-            unread={totalUnread}
-            expanded={railExpanded}
-            onToggleExpanded={toggleRail}
-            isMobile={isMobile}
-            onHoverChange={setRailHover}
-            hovering={railHover}
           />
-        </div>
+        )}
+
+      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+        {/* Desktop only. The rail floats over the list while merely hovered, so
+            this spacer holds its 62px of layout and nothing lurches sideways.
+            A phone gets a bottom tab bar instead — see below. */}
+        {!isMobile && (
+          <div style={{ position: 'relative', width: railExpanded ? 196 : 62, flex: 'none', transition: 'width .16s ease' }}>
+            <Rail
+              active={nav}
+              onSelect={setNav}
+              theme={theme}
+              onToggleTheme={toggleTheme}
+              userName={user.name}
+              unread={totalUnread}
+              expanded={railExpanded}
+              onToggleExpanded={toggleRail}
+              isMobile={false}
+              onHoverChange={setRailHover}
+              hovering={railHover}
+            />
+          </div>
+        )}
 
         {isChatNav ? (
           <>
@@ -397,6 +441,23 @@ export function RelayShell({
           <Placeholder nav={nav} />
         )}
       </div>
+
+        {/* Bottom tabs: thumb-reachable, and hidden while a chat is open so the
+            conversation owns the whole screen. */}
+        {isMobile && !selected && (
+          <MobileTabs active={nav} onSelect={(k) => { setNav(k); setSelectedKey(null); }} unread={totalUnread} />
+        )}
+      </div>
     </div>
   );
 }
+
+const NAV_TITLES: Partial<Record<RailKey, string>> = {
+  chat: 'Chats',
+  contacts: 'Contacts',
+  starred: 'Spotlight',
+  files: 'Files',
+  quickreplies: 'Quick replies',
+  team: 'Team',
+  settings: 'Settings',
+};
