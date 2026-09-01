@@ -2,6 +2,7 @@ import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
 import { RelayShell } from '@/components/relay-shell';
 import type { Lead, Workspace } from '@/lib/types';
+import { LEAD_COLUMNS } from '@/lib/types';
 
 // The real auth gate. Middleware fails soft by design, so this server-side
 // getUser() is what actually protects the app — same discipline as the CRM.
@@ -41,36 +42,26 @@ export default async function AppLayout({ children }: { children: React.ReactNod
 
   const workspace = (member.workspaces as unknown as Workspace) || { id: member.workspace_id, name: 'Migrizo' };
 
-  // EVERY lead with a phone number — paginated, because a single query is
-  // capped (PostgREST returns at most 1000 rows by default) and a truncated
-  // list is not a smaller list, it is a WRONG one: a conversation whose lead
-  // fell past the cut-off renders as "Not in CRM" even though the CRM knows
-  // exactly who they are. That bug is why this loop exists.
-  const COLUMNS =
-    'id, workspace_id, full_name, phone, email, visa_type, stage, source, owner_id, industry, tags, next_follow_up, last_note, last_note_at, first_response_at, cv_path, cv_name, created_at, updated_at, is_sample';
-
-  const PAGE = 1000;
-  const MAX_PAGES = 30; // 30k leads — far beyond today, and a hard stop either way
-  const leads: Lead[] = [];
-  let leadsError: { message: string } | null = null;
-
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const { data, error } = await supabase
-      .from('leads')
-      .select(COLUMNS)
-      .not('phone', 'is', null)
-      .order('updated_at', { ascending: false })
-      .range(page * PAGE, page * PAGE + PAGE - 1);
-
-    if (error) { leadsError = error; break; }
-    if (!data || data.length === 0) break;
-    leads.push(...(data as Lead[]));
-    if (data.length < PAGE) break;
-  }
+  // ONE page of leads, server-side. The rest are fetched by the browser after
+  // the app is on screen (see RelayShell).
+  //
+  // This used to be a loop of up to 30 sequential queries here. That is what
+  // crashed the deploy with a 502: a serverless function has a hard time limit,
+  // and thirty round-trips to Postgres blew straight through it. The first page
+  // renders the app instantly; the remainder streams in behind it, and a
+  // conversation whose lead has not arrived yet still resolves, because the CRM
+  // panel looks that lead up directly.
+  const { data: firstPage, error: leadsError } = await supabase
+    .from('leads')
+    .select(LEAD_COLUMNS)
+    .not('phone', 'is', null)
+    .order('updated_at', { ascending: false })
+    .range(0, 999);
 
   if (leadsError) {
     return <Notice title="Could not load leads" body={leadsError.message} />;
   }
+  const leads = (firstPage || []) as Lead[];
 
   return (
     <RelayShell
