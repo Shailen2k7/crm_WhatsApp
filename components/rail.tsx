@@ -27,6 +27,8 @@ export function Rail({
   expanded,
   onToggleExpanded,
   isMobile,
+  onHoverChange,
+  hovering,
 }: {
   active: RailKey;
   onSelect: (k: RailKey) => void;
@@ -37,15 +39,26 @@ export function Rail({
   expanded: boolean;
   onToggleExpanded: () => void;
   isMobile: boolean;
+  onHoverChange: (v: boolean) => void;
+  hovering: boolean;
 }) {
-  // On a phone the expanded rail would eat the screen; it stays icon-only there.
-  const wide = expanded && !isMobile;
+  // Wide when PINNED (the button) or while the cursor is over it. On a phone
+  // there is no cursor and no room, so it stays icon-only there.
+  const wide = (expanded || hovering) && !isMobile;
 
   return (
     <nav
+      onMouseEnter={() => !isMobile && onHoverChange(true)}
+      onMouseLeave={() => !isMobile && onHoverChange(false)}
       style={{
         width: wide ? 196 : 62,
         flex: 'none',
+        // While merely hovering (not pinned) the rail floats OVER the list, so
+        // the whole app does not lurch sideways every time the cursor passes.
+        position: !isMobile && hovering && !expanded ? 'absolute' : 'relative',
+        zIndex: 25,
+        height: '100%',
+        boxShadow: !isMobile && hovering && !expanded ? '4px 0 24px -8px rgba(0,0,0,.45)' : 'none',
         background: 'var(--rail)',
         display: 'flex',
         flexDirection: 'column',
@@ -126,12 +139,12 @@ export function Rail({
       {!isMobile && (
         <button
           onClick={onToggleExpanded}
-          title={wide ? 'Collapse menu' : 'Expand menu'}
-          aria-label={wide ? 'Collapse menu' : 'Expand menu'}
-          style={railBtn(wide)}
+          title={expanded ? 'Unpin menu (hover to peek)' : 'Keep menu open'}
+          aria-label={expanded ? 'Unpin menu' : 'Pin menu open'}
+          style={{ ...railBtn(wide), color: expanded ? 'var(--rail-fg-on)' : 'var(--rail-fg)' }}
         >
-          {wide ? <PanelLeftClose size={17} strokeWidth={1.8} /> : <PanelLeftOpen size={17} strokeWidth={1.8} />}
-          {wide && 'Collapse'}
+          {expanded ? <PanelLeftClose size={17} strokeWidth={1.8} /> : <PanelLeftOpen size={17} strokeWidth={1.8} />}
+          {wide && (expanded ? 'Unpin menu' : 'Keep open')}
         </button>
       )}
 

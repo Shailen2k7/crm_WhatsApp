@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import type { Lead, RelayUser, Workspace } from '@/lib/types';
 import type { RelayConversation, RelayMessage } from '@/lib/messages';
@@ -37,6 +37,11 @@ export function RelayShell({
 }) {
   const supabase = useMemo(() => createClient(), []);
 
+  // Refs so the long-lived realtime subscription always sees current values
+  // without being torn down and rebuilt on every render.
+  const openConvRef = useRef<string | null>(null);
+  const markReadRef = useRef<((id: string) => void) | null>(null);
+
   const [leads, setLeads] = useState<Lead[]>(initialLeads);
   const [conversations, setConversations] = useState<RelayConversation[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
@@ -47,6 +52,7 @@ export function RelayShell({
   const [isMobile, setIsMobile] = useState(false);
   const [live, setLive] = useState(false);
   const [railExpanded, setRailExpanded] = useState(false);
+  const [railHover, setRailHover] = useState(false);
   const [pushBanner, setPushBanner] = useState(false);
 
   // ---- theme ---------------------------------------------------------------
@@ -174,6 +180,10 @@ export function RelayShell({
           const row = payload.new as RelayMessage;
           if (row?.direction === 'in') {
             playRingtone();
+            // Already looking at this thread? Then it is read on arrival.
+            if (openConvRef.current && row.conversation_id === openConvRef.current) {
+              markReadRef.current?.(row.conversation_id);
+            }
             // Title flash so a background tab shows it too.
             if (document.hidden) {
               const original = document.title;
@@ -227,7 +237,49 @@ export function RelayShell({
     () => contacts.find((c) => c.key === selectedKey) ?? null,
     [contacts, selectedKey]
   );
+
+  /**
+   * Clearing the unread badge.
+   *
+   * Two things happen, deliberately, and in this order:
+   *   1. the local conversation row is zeroed IMMEDIATELY, so the badge in the
+   *      list and on the rail disappears the moment you open the chat rather
+   *      than after a database round-trip;
+   *   2. the write goes to Postgres, and realtime confirms it for every other
+   *      device the team has open.
+   *
+   * The write is a plain UPDATE rather than the RPC: it runs under the same RLS
+   * policy as everything else here, so there is one permission path to reason
+   * about instead of two.
+   */
+  const markRead = useCallback(
+    async (conversationId: string) => {
+      setConversations((prev) =>
+        prev.map((c) => (c.id === conversationId && c.unread_count !== 0 ? { ...c, unread_count: 0 } : c))
+      );
+      const { error } = await supabase
+        .from('relay_conversations')
+        .update({ unread_count: 0 })
+        .eq('id', conversationId);
+      if (error) console.error('[relay] could not mark read', error.message);
+    },
+    [supabase]
+  );
+
+  // Opening a chat reads it. So does coming back to the tab with one open.
+  useEffect(() => {
+    if (selected?.conversationId && selected.unread > 0) markRead(selected.conversationId);
+  }, [selected?.conversationId, selected?.unread, markRead]);
+
+  useEffect(() => {
+    const onFocus = () => { if (selected?.conversationId) markRead(selected.conversationId); };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [selected?.conversationId, markRead]);
   const totalUnread = useMemo(() => contacts.reduce((n, c) => n + c.unread, 0), [contacts]);
+
+  useEffect(() => { openConvRef.current = selected?.conversationId ?? null; }, [selected?.conversationId]);
+  useEffect(() => { markReadRef.current = markRead; }, [markRead]);
 
   const showList = !isMobile || !selected;
   const showChat = !isMobile || !!selected;
@@ -257,17 +309,23 @@ export function RelayShell({
       )}
 
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-        <Rail
-          active={nav}
-          onSelect={(k) => { setNav(k); if (isMobile) setSelectedKey(null); }}
-          theme={theme}
-          onToggleTheme={toggleTheme}
-          userName={user.name}
-          unread={totalUnread}
-          expanded={railExpanded}
-          onToggleExpanded={toggleRail}
-          isMobile={isMobile}
-        />
+        {/* The rail floats over the list while merely hovered, so this spacer
+            holds its 62px of layout and nothing lurches sideways. */}
+        <div style={{ position: 'relative', width: isMobile ? 62 : railExpanded ? 196 : 62, flex: 'none', transition: 'width .16s ease' }}>
+          <Rail
+            active={nav}
+            onSelect={(k) => { setNav(k); if (isMobile) setSelectedKey(null); }}
+            theme={theme}
+            onToggleTheme={toggleTheme}
+            userName={user.name}
+            unread={totalUnread}
+            expanded={railExpanded}
+            onToggleExpanded={toggleRail}
+            isMobile={isMobile}
+            onHoverChange={setRailHover}
+            hovering={railHover}
+          />
+        </div>
 
         {isChatNav ? (
           <>

@@ -53,9 +53,17 @@ export interface Contact {
  * arrived as "+919812345678", "919812345678" and "p:+91 98123 45678".
  */
 export function mergeContacts(leads: Lead[], conversations: RelayConversation[]): Contact[] {
-  // Index conversations by their match key so each lead can find its thread.
+  // TWO ways a conversation finds its lead, checked in this order:
+  //
+  //   1. conversation.lead_id — the link the DATABASE already resolved and
+  //      stored. Authoritative, and immune to a lead whose number was later
+  //      edited into a different format.
+  //   2. last-10-digits of the phone — the fallback for rows linked before
+  //      lead_id existed, or where the lead arrived after the conversation.
+  const convByLeadId = new Map<string, RelayConversation>();
   const convByKey = new Map<string, RelayConversation>();
   for (const c of conversations) {
+    if (c.lead_id) convByLeadId.set(c.lead_id, c);
     const k = matchKey(c.phone_e164);
     if (k) convByKey.set(k, c);
   }
@@ -65,7 +73,7 @@ export function mergeContacts(leads: Lead[], conversations: RelayConversation[])
 
   for (const lead of leads) {
     const k = matchKey(lead.phone);
-    const conv = k ? convByKey.get(k) ?? null : null;
+    const conv = convByLeadId.get(lead.id) ?? (k ? convByKey.get(k) ?? null : null);
     if (conv) usedConvIds.add(conv.id);
 
     out.push({

@@ -41,17 +41,32 @@ export default async function AppLayout({ children }: { children: React.ReactNod
 
   const workspace = (member.workspaces as unknown as Workspace) || { id: member.workspace_id, name: 'Migrizo' };
 
-  // PHASE 1: every lead with a phone number becomes a conversation row. Leads
-  // without a phone cannot be messaged on WhatsApp, so they are filtered out
-  // here rather than rendered as unusable rows.
-  const { data: leads, error: leadsError } = await supabase
-    .from('leads')
-    .select(
-      'id, workspace_id, full_name, phone, email, visa_type, stage, source, owner_id, industry, tags, next_follow_up, last_note, last_note_at, first_response_at, cv_path, cv_name, created_at, updated_at, is_sample'
-    )
-    .not('phone', 'is', null)
-    .order('updated_at', { ascending: false })
-    .limit(2000);
+  // EVERY lead with a phone number — paginated, because a single query is
+  // capped (PostgREST returns at most 1000 rows by default) and a truncated
+  // list is not a smaller list, it is a WRONG one: a conversation whose lead
+  // fell past the cut-off renders as "Not in CRM" even though the CRM knows
+  // exactly who they are. That bug is why this loop exists.
+  const COLUMNS =
+    'id, workspace_id, full_name, phone, email, visa_type, stage, source, owner_id, industry, tags, next_follow_up, last_note, last_note_at, first_response_at, cv_path, cv_name, created_at, updated_at, is_sample';
+
+  const PAGE = 1000;
+  const MAX_PAGES = 30; // 30k leads — far beyond today, and a hard stop either way
+  const leads: Lead[] = [];
+  let leadsError: { message: string } | null = null;
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const { data, error } = await supabase
+      .from('leads')
+      .select(COLUMNS)
+      .not('phone', 'is', null)
+      .order('updated_at', { ascending: false })
+      .range(page * PAGE, page * PAGE + PAGE - 1);
+
+    if (error) { leadsError = error; break; }
+    if (!data || data.length === 0) break;
+    leads.push(...(data as Lead[]));
+    if (data.length < PAGE) break;
+  }
 
   if (leadsError) {
     return <Notice title="Could not load leads" body={leadsError.message} />;
@@ -62,7 +77,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
       user={{ id: user.id, email: user.email || '', name: displayName }}
       workspace={workspace}
       role={(member.role as 'admin' | 'member') || 'member'}
-      initialLeads={(leads || []) as Lead[]}
+      initialLeads={leads}
     >
       {children}
     </RelayShell>

@@ -139,3 +139,12 @@ body { word-break: normal; overflow-wrap: anywhere; }
 
 /* Tap highlight looks broken on dark surfaces — replace with nothing. */
 * { -webkit-tap-highlight-color: transparent; }
+
+/* Message action button: invisible until the row is hovered on a mouse device,
+   permanently visible on touch devices where hover does not exist. */
+.bubble-actions { opacity: 0; transition: opacity .12s ease; }
+div:hover > .bubble-actions { opacity: .75; }
+.bubble-actions:hover, .bubble-actions:focus-visible { opacity: 1 !important; }
+@media (hover: none) {
+  .bubble-actions { opacity: .55; }
+}

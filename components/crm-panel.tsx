@@ -1,6 +1,9 @@
 'use client';
 
-import { ExternalLink, FileDown, Mail, Phone, Calendar, Tag, Briefcase, UserCircle, X } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { createClient } from '@/lib/supabase/client';
+import { ExternalLink, FileDown, Mail, Phone, Calendar, Tag, Briefcase, UserCircle, X, Loader2 } from 'lucide-react';
+import type { Lead } from '@/lib/types';
 import { getStageMeta, getVisaMeta } from '@/lib/types';
 import type { Contact } from '@/lib/contacts';
 import { initialsOf, avatarTint, formatPhone } from '@/lib/phone';
@@ -23,11 +26,50 @@ export function CrmPanel({
   memberName: (id: string | null) => string;
   onClose?: () => void;
 }) {
-  const lead = contact.lead;
+  const supabase = useMemo(() => createClient(), []);
+  // LAST-RESORT LOOKUP. contact.lead is normally already resolved. But a
+  // conversation can carry a lead_id whose lead is not in the loaded set, and
+  // showing "Not in CRM" for somebody the CRM plainly knows is the worst
+  // possible answer — so we go and fetch them by phone before saying it.
+  const [fetched, setFetched] = useState<Lead | null>(null);
+  const [looking, setLooking] = useState(false);
 
-  // A thread from someone the CRM has never seen. Saying so plainly — and
-  // pointing at where to fix it — beats rendering a panel full of dashes.
-  if (!lead) return <UnknownPanel contact={contact} onClose={onClose} />;
+  useEffect(() => {
+    setFetched(null);
+    if (contact.lead || !contact.phoneE164) return;
+
+    let cancelled = false;
+    setLooking(true);
+    (async () => {
+      const last10 = contact.phoneE164!.replace(/\D/g, '').slice(-10);
+      let row: Lead | null = null;
+
+      if (contact.conversation?.lead_id) {
+        const { data } = await supabase.from('leads').select('*').eq('id', contact.conversation.lead_id).maybeSingle();
+        row = (data as Lead) || null;
+      }
+      if (!row && last10.length === 10) {
+        // Same last-10 rule the database uses, so the UI never disagrees with it.
+        const { data } = await supabase.from('leads').select('*').ilike('phone', `%${last10}`).limit(1);
+        row = (data && data[0] as Lead) || null;
+      }
+      if (!cancelled) { setFetched(row); setLooking(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [supabase, contact]);
+
+  const lead = contact.lead ?? fetched;
+
+  if (!lead) {
+    if (looking) {
+      return (
+        <aside style={{ width: 300, maxWidth: '86vw', flex: 'none', borderLeft: '1px solid var(--line)', background: 'var(--surface)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <Loader2 size={18} style={{ animation: 'spin .8s linear infinite', color: 'var(--muted)' }} />
+        </aside>
+      );
+    }
+    return <UnknownPanel contact={contact} onClose={onClose} />;
+  }
 
   const stage = getStageMeta(lead.stage);
   const visa = getVisaMeta(lead.visa_type);
@@ -40,6 +82,7 @@ export function CrmPanel({
     { icon: UserCircle, label: 'Owner', value: memberName(lead.owner_id) },
     { icon: Calendar, label: 'Added', value: fmtDate(lead.created_at) },
     { icon: Calendar, label: 'Next follow-up', value: fmtDate(lead.next_follow_up) },
+    { icon: Calendar, label: 'First replied', value: lead.first_response_at ? fmtDate(lead.first_response_at) : 'Never replied' },
   ];
 
   return (

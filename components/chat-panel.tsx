@@ -5,7 +5,7 @@ import { createClient } from '@/lib/supabase/client';
 import {
   Search, Star, PanelRight, Paperclip, Send, MessageSquare, ArrowLeft,
   AlertCircle, Loader2, RotateCw, Lock, FileText, Download, X, Trash2,
-  MoreHorizontal, Zap, Image as ImageIcon,
+  MoreHorizontal, Zap, Image as ImageIcon, Copy,
 } from 'lucide-react';
 import { initialsOf, avatarTint, formatPhone } from '@/lib/phone';
 import type { Contact } from '@/lib/contacts';
@@ -103,7 +103,6 @@ export function ChatPanel({
       if (cancelled) return;
       setMessages((msgs || []) as RelayMessage[]);
       setLoading(false);
-      supabase.rpc('relay_mark_read', { p_conversation_id: conv.id });
     })();
 
     return () => { cancelled = true; };
@@ -132,10 +131,7 @@ export function ChatPanel({
             copy[i] = row;
             return copy;
           });
-          if (row.direction === 'in') {
-            setLastInboundAt(row.created_at);
-            supabase.rpc('relay_mark_read', { p_conversation_id: conversationId });
-          }
+          if (row.direction === 'in') setLastInboundAt(row.created_at);
         }
       )
       .subscribe();
@@ -552,16 +548,30 @@ function Bubble({ message: m, isAdmin, onDelete }: { message: RelayMessage; isAd
   const internal = m.is_internal;
   const hasFile = !!(m.media_path || m.media_url);
   const isImage = m.media_type === 'image';
-  const [hover, setHover] = useState(false);
+  // A menu, not a hover state: hover does not exist on a phone, and 80% of use
+  // is on a phone. Tap the ⋯ (or long-press the bubble) to get actions.
+  const [menu, setMenu] = useState(false);
+  const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const startPress = () => {
+    pressTimer.current = setTimeout(() => setMenu(true), 500);
+  };
+  const endPress = () => {
+    if (pressTimer.current) { clearTimeout(pressTimer.current); pressTimer.current = null; }
+  };
 
   return (
     <div
       className="animate-msg-in"
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      style={{ display: 'flex', justifyContent: out ? 'flex-end' : 'flex-start', marginBottom: 7, gap: 6, alignItems: 'center', flexDirection: out ? 'row-reverse' : 'row' }}
+      style={{ display: 'flex', justifyContent: out ? 'flex-end' : 'flex-start', marginBottom: 7, gap: 4, alignItems: 'center', flexDirection: out ? 'row-reverse' : 'row', position: 'relative' }}
     >
-      <div style={{ maxWidth: 'min(78%, 480px)', minWidth: 90 }}>
+      <div
+        style={{ maxWidth: 'min(78%, 480px)', minWidth: 90 }}
+        onTouchStart={startPress}
+        onTouchEnd={endPress}
+        onTouchMove={endPress}
+        onContextMenu={(e) => { e.preventDefault(); setMenu(true); }}
+      >
         <div
           style={{
             background: internal ? 'var(--amber-bg)' : failed ? 'var(--red-bg)' : out ? 'var(--out-bg)' : 'var(--in-bg)',
@@ -643,14 +653,63 @@ function Bubble({ message: m, isAdmin, onDelete }: { message: RelayMessage; isAd
         )}
       </div>
 
-      {isAdmin && hover && (
-        <button onClick={onDelete} aria-label="Delete message" title="Delete message" style={{ width: 26, height: 26, borderRadius: 8, border: 0, background: 'var(--surface)', color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', boxShadow: 'var(--shadow)', flex: 'none' }}>
-          <Trash2 size={13} />
-        </button>
+      {/* Always present, quiet until touched — reachable by mouse AND thumb. */}
+      <button
+        onClick={() => setMenu((v) => !v)}
+        aria-label="Message actions"
+        className="bubble-actions"
+        style={{
+          width: 28, height: 28, borderRadius: 99, border: 0, background: 'transparent',
+          color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          cursor: 'pointer', flex: 'none', opacity: menu ? 1 : undefined,
+        }}
+      >
+        <MoreHorizontal size={15} />
+      </button>
+
+      {menu && (
+        <>
+          <div onClick={() => setMenu(false)} style={{ position: 'fixed', inset: 0, zIndex: 30 }} />
+          <div
+            className="animate-pop-in"
+            style={{
+              position: 'absolute', zIndex: 31, top: '100%', marginTop: 2,
+              [out ? 'right' : 'left']: 34,
+              background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 11,
+              boxShadow: 'var(--shadow)', minWidth: 190, overflow: 'hidden',
+            } as React.CSSProperties}
+          >
+            <button
+              onClick={() => { navigator.clipboard?.writeText(m.body || ''); setMenu(false); }}
+              disabled={!m.body}
+              style={menuItem}
+            >
+              <Copy size={14} /> Copy text
+            </button>
+            {hasFile && (
+              <a href={`/api/whatsapp/media/${m.id}?download`} onClick={() => setMenu(false)} style={{ ...menuItem, textDecoration: 'none' }}>
+                <Download size={14} /> Download file
+              </a>
+            )}
+            {isAdmin ? (
+              <button onClick={() => { setMenu(false); onDelete(); }} style={{ ...menuItem, color: 'var(--red)' }}>
+                <Trash2 size={14} /> Delete {internal ? 'note' : 'message'}
+              </button>
+            ) : (
+              <div style={{ padding: '10px 14px', fontSize: 11.5, color: 'var(--muted)' }}>Only an admin can delete.</div>
+            )}
+          </div>
+        </>
       )}
     </div>
   );
 }
+
+const menuItem: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 9, width: '100%', padding: '10px 14px',
+  border: 0, borderBottom: '1px solid var(--line-2)', background: 'transparent',
+  color: 'var(--ink-2)', fontSize: 12.8, fontWeight: 600, cursor: 'pointer', textAlign: 'left',
+};
 
 /** One tick sent, two delivered, both bright teal when read. */
 function Ticks({ status }: { status: RelayMessage['status'] }) {

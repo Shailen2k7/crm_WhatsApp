@@ -51,6 +51,26 @@ function verify(rawBody: string, signature: string | null, queryKey: string | nu
   return { ok: false, how: 'no_signature' };
 }
 
+/**
+ * WHOSE MESSAGE IS THIS?
+ *
+ * Interakt fires `message_received` for traffic on a conversation — including
+ * replies YOUR OWN TEAM sends from Interakt's inbox. Storing all of them as
+ * inbound put our own replies on the left-hand side of the thread, as if the
+ * client had said them. Wrong, and confusing to read.
+ *
+ * `chat_message_type` is the discriminator: "CustomerMessage" is the client;
+ * anything else (UserMessage / AgentMessage / APIMessage …) is us.
+ * Unknown/absent falls back to inbound, because mislabelling a client message
+ * as ours would hide it from the unread count — the more damaging error.
+ */
+function directionOf(chatMessageType: string | undefined | null): 'in' | 'out' {
+  const t = (chatMessageType || '').trim().toLowerCase();
+  if (!t) return 'in';
+  if (t === 'customermessage' || t === 'customer') return 'in';
+  return 'out';
+}
+
 async function logAttempt(row: {
   ok: boolean; reason: string; eventType?: string | null; sigPresent: boolean;
   phone?: string | null; bodyPreview?: string | null; handled?: string | null;
@@ -207,16 +227,19 @@ export async function POST(req: Request) {
       }
 
       const mediaType = mediaTypeFrom(message?.message_content_type);
+      const direction = directionOf(message?.chat_message_type);
 
       const { data: inserted, error: msgErr } = await admin
         .from('relay_messages')
         .insert({
           workspace_id: ws.id,
           conversation_id: convId,
-          direction: 'in',
+          direction,
           body: message?.message || '',
           provider_msg_id: providerMsgId || null,
-          status: 'received',
+          // An agent's reply typed in Interakt is already delivered by the time
+          // we hear about it; a client's message is simply "received".
+          status: direction === 'out' ? 'delivered' : 'received',
           media_url: message?.media_url || null,
           media_type: mediaType,
           created_at: message?.received_at_utc || new Date().toISOString(),
@@ -243,6 +266,12 @@ export async function POST(req: Request) {
             media_size: stored.size,
           }).eq('id', inserted.id);
         }
+      }
+
+      // A reply we sent ourselves must not ring our own phones.
+      if (direction === 'out') {
+        await logAttempt({ ok: true, reason: auth.how, eventType, sigPresent: !!sig, phone: customer?.channel_phone_number, handled: 'agent_reply_stored' });
+        return NextResponse.json({ ok: true, handled: 'message_received', direction: 'out' });
       }
 
       // Wake the team up. Name the sender if the CRM knows them.
