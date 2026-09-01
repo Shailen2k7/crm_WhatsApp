@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import type { Lead, RelayUser, Workspace } from '@/lib/types';
+import { LEAD_COLUMNS } from '@/lib/types';
 import type { RelayConversation, RelayMessage } from '@/lib/messages';
 import { mergeContacts, type Contact } from '@/lib/contacts';
 import { playRingtone, unlockAudio } from '@/lib/chime';
@@ -154,6 +155,38 @@ export function RelayShell({
     },
     [members, user.id, user.name]
   );
+
+  // ---- the REST of the leads, fetched in the background --------------------
+  // The server sends the first 1000 so the app paints immediately; the rest
+  // arrive here, a page at a time, without blocking anything. Doing this on the
+  // server was what timed the function out and returned a 502.
+  useEffect(() => {
+    if (initialLeads.length < 1000) return; // there is no second page
+    let cancelled = false;
+
+    (async () => {
+      for (let page = 1; page < 40 && !cancelled; page++) {
+        const { data, error } = await supabase
+          .from('leads')
+          .select(LEAD_COLUMNS)
+          .not('phone', 'is', null)
+          .order('updated_at', { ascending: false })
+          .range(page * 1000, page * 1000 + 999);
+
+        if (error || !data || data.length === 0) break;
+
+        setLeads((prev) => {
+          const seen = new Set(prev.map((l) => l.id));
+          const fresh = (data as Lead[]).filter((l) => !seen.has(l.id));
+          return fresh.length ? [...prev, ...fresh] : prev;
+        });
+
+        if (data.length < 1000) break;
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [supabase, initialLeads.length]);
 
   // ---- conversations + live updates ----------------------------------------
   useEffect(() => {
