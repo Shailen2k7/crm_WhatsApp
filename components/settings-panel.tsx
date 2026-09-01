@@ -1,8 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { LogOut, Moon, Sun } from 'lucide-react';
+import { LogOut, Moon, Sun, RefreshCw } from 'lucide-react';
 import type { RelayUser, Workspace } from '@/lib/types';
 
 /**
@@ -28,6 +28,27 @@ export function SettingsPanel({
   onToggleTheme: () => void;
 }) {
   const [signingOut, setSigningOut] = useState(false);
+  const [log, setLog] = useState<WebhookLogRow[] | null>(null);
+  const [logErr, setLogErr] = useState<string | null>(null);
+  const supabaseRef = useMemo(() => createClient(), []);
+
+  // Every call Interakt makes — accepted or rejected — so "did the provider
+  // even reach us?" is answerable here instead of in hosting logs.
+  const loadLog = useMemo(
+    () => async () => {
+      const { data, error } = await supabaseRef
+        .from('relay_webhook_log')
+        .select('*')
+        .order('received_at', { ascending: false })
+        .limit(15);
+      if (error) { setLogErr(error.message); setLog([]); return; }
+      setLogErr(null);
+      setLog((data || []) as WebhookLogRow[]);
+    },
+    [supabaseRef]
+  );
+
+  useEffect(() => { loadLog(); }, [loadLog]);
 
   async function signOut() {
     setSigningOut(true);
@@ -50,6 +71,52 @@ export function SettingsPanel({
           <Row label="Supabase project" value={<Mono>{projectRef || 'not set'}</Mono>} />
           <Row label="Leads loaded" value={<strong>{leadCount.toLocaleString('en-IN')}</strong>} />
           <Row label="WhatsApp (Interakt)" value={<Status ok={false} text="Phase 2" />} />
+        </Card>
+
+        <Card title="Webhook activity">
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+            <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+              Every call Interakt makes to Relay, newest first.
+            </span>
+            <button
+              onClick={loadLog}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface-2)', fontSize: 11.5, fontWeight: 600, cursor: 'pointer' }}
+            >
+              <RefreshCw size={12} /> Refresh
+            </button>
+          </div>
+
+          {logErr && (
+            <div style={{ fontSize: 12, color: 'var(--amber)', lineHeight: 1.55, padding: '8px 0' }}>
+              Could not read the log ({logErr}). Run migration <code>101_relay_webhook_log.sql</code> in Supabase.
+            </div>
+          )}
+
+          {log && log.length === 0 && !logErr && (
+            <div style={{ fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.6, padding: '10px 0' }}>
+              <strong style={{ color: 'var(--ink-2)' }}>Interakt has never called this endpoint.</strong>
+              <br />
+              Not a signature problem — nothing is arriving at all. Check that the webhook URL is
+              saved in Interakt, that incoming-message events are switched on, and that your
+              Interakt plan includes webhooks (Growth or Advanced — Starter does not).
+            </div>
+          )}
+
+          {log && log.map((r) => (
+            <div key={r.id} style={{ display: 'flex', gap: 9, alignItems: 'flex-start', padding: '7px 0', borderTop: '1px solid var(--line-2)' }}>
+              <span style={{ width: 7, height: 7, borderRadius: 99, background: r.ok ? 'var(--teal)' : 'var(--red)', marginTop: 5, flex: 'none' }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink-2)' }}>
+                  {r.event_type || r.reason}
+                  {r.phone && <span style={{ fontWeight: 400, color: 'var(--muted)' }}> · {r.phone}</span>}
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 1 }}>
+                  {new Date(r.received_at).toLocaleString('en-IN')} · {r.ok ? (r.handled || r.reason) : r.reason}
+                  {!r.sig_present && ' · no signature header'}
+                </div>
+              </div>
+            </div>
+          ))}
         </Card>
 
         <Card title="Account">
@@ -107,6 +174,17 @@ export function SettingsPanel({
       </div>
     </div>
   );
+}
+
+interface WebhookLogRow {
+  id: string;
+  received_at: string;
+  ok: boolean;
+  reason: string;
+  event_type: string | null;
+  sig_present: boolean;
+  phone: string | null;
+  handled: string | null;
 }
 
 function Card({ title, children }: { title: string; children: React.ReactNode }) {

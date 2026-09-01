@@ -64,6 +64,31 @@ function verify(rawBody: string, signature: string | null, queryKey: string | nu
   return { ok: false, how: 'no_signature' };
 }
 
+/**
+ * Records the attempt. Never throws and never blocks the response — a logging
+ * failure must not turn a delivered message into a rejected one.
+ */
+async function logAttempt(row: {
+  ok: boolean; reason: string; eventType?: string | null; sigPresent: boolean;
+  phone?: string | null; bodyPreview?: string | null; handled?: string | null;
+}) {
+  try {
+    const admin = createAdminClient();
+    if (!admin) return;
+    await admin.from('relay_webhook_log').insert({
+      ok: row.ok,
+      reason: row.reason,
+      event_type: row.eventType ?? null,
+      sig_present: row.sigPresent,
+      phone: row.phone ?? null,
+      body_preview: (row.bodyPreview || '').slice(0, 200) || null,
+      handled: row.handled ?? null,
+    });
+  } catch {
+    /* logging is best-effort by design */
+  }
+}
+
 export async function POST(req: Request) {
   const url = new URL(req.url);
 
@@ -83,6 +108,9 @@ export async function POST(req: Request) {
   const auth = verify(rawBody, sig, url.searchParams.get('key'));
   if (!auth.ok) {
     console.error('[relay webhook] rejected:', auth.how, 'sigPresent=', !!sig);
+    // Logged even though rejected — "the provider called and we said no" is a
+    // completely different problem from "the provider never called".
+    await logAttempt({ ok: false, reason: auth.how, sigPresent: !!sig, bodyPreview: rawBody });
     return NextResponse.json({ ok: false, error: auth.how }, { status: 401 });
   }
 
@@ -115,6 +143,7 @@ export async function POST(req: Request) {
         })
         .eq('provider_msg_id', providerMsgId);
 
+      await logAttempt({ ok: true, reason: auth.how, eventType, sigPresent: !!sig, phone: customer?.channel_phone_number, handled: 'status:' + status });
       return NextResponse.json({ ok: true, handled: eventType, auth: auth.how });
     }
 
@@ -164,9 +193,11 @@ export async function POST(req: Request) {
       });
       if (msgErr) console.error('[relay webhook] insert failed', msgErr);
 
+      await logAttempt({ ok: true, reason: auth.how, eventType, sigPresent: !!sig, phone: customer?.channel_phone_number, handled: msgErr ? 'insert_failed' : 'message_stored' });
       return NextResponse.json({ ok: true, handled: 'message_received', auth: auth.how });
     }
 
+    await logAttempt({ ok: true, reason: auth.how, eventType, sigPresent: !!sig, phone: customer?.channel_phone_number, handled: 'ignored' });
     return NextResponse.json({ ok: true, ignored: eventType || 'unknown_type' });
   } catch (e) {
     console.error('[relay webhook] unhandled', e);
