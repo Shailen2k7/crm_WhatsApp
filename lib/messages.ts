@@ -37,6 +37,7 @@ export interface RelayConversation {
   last_message_at: string | null;
   last_preview: string | null;
   last_direction: 'in' | 'out' | null;
+  last_status: RelayMessage['status'] | null;
   spotlight: boolean;
   tags: string[];
   created_at: string;

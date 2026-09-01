@@ -1,7 +1,7 @@
 'use client';
 
-import { useMemo, useState } from 'react';
-import { Search, X, CheckCheck, Star } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Search, X, Check, CheckCheck, Star, Clock, AlertCircle } from 'lucide-react';
 import { getStageMeta, getVisaMeta } from '@/lib/types';
 import { initialsOf, avatarTint, formatPhone, matchKey } from '@/lib/phone';
 import type { Contact } from '@/lib/contacts';
@@ -23,6 +23,25 @@ const CONTACT_FILTERS: { key: Filter; label: string }[] = [
   { key: 'cold', label: 'Cold' },
   { key: 'won', label: 'Won' },
 ];
+
+/**
+ * The real delivery state of the last message, not decoration.
+ *
+ * WhatsApp blue (#34B7F1) for read is deliberate: everyone already knows what
+ * it means, so no one has to learn a new colour. Grey single = sent, grey
+ * double = delivered, blue double = they read it.
+ */
+function RowTicks({ status }: { status: string | null }) {
+  if (status === 'queued') return <Clock size={12} style={{ flex: 'none', opacity: 0.6 }} />;
+  if (status === 'failed') return <AlertCircle size={12} style={{ flex: 'none', color: 'var(--red)' }} />;
+  if (status === 'read') return <CheckCheck size={13} style={{ flex: 'none', color: '#34B7F1' }} />;
+  if (status === 'delivered') return <CheckCheck size={12} style={{ flex: 'none', opacity: 0.55 }} />;
+  if (status === 'sent') return <Check size={12} style={{ flex: 'none', opacity: 0.55 }} />;
+  // NULL = migration 104 has not run yet, so the column holds nothing. Showing
+  // a single tick here would be a lie (it reads as "sent, not delivered"), so
+  // fall back to the neutral double tick until real status is available.
+  return <CheckCheck size={12} style={{ flex: 'none', opacity: 0.45 }} />;
+}
 
 function ago(iso: string | null): string {
   if (!iso) return '';
@@ -82,7 +101,11 @@ export function ConversationList({
   }, [contacts, query, filter]);
 
   // Switching between Chats and Contacts resets a filter the other mode lacks.
-  useMemo(() => { if (!FILTERS.some((f) => f.key === filter)) setFilter('all'); }, [FILTERS, filter]);
+  // This MUST be an effect: setting state inside a useMemo re-renders during
+  // render, which is what made the window judder on open.
+  useEffect(() => {
+    if (!FILTERS.some((f) => f.key === filter)) setFilter('all');
+  }, [mode, filter, FILTERS]);
 
   return (
     <div
@@ -253,9 +276,7 @@ export function ConversationList({
                       gap: 4,
                     }}
                   >
-                    {hasThread && c.lastDirection === 'out' && (
-                      <CheckCheck size={12} style={{ flex: 'none', opacity: 0.7 }} />
-                    )}
+                    {hasThread && c.lastDirection === 'out' && <RowTicks status={c.lastStatus} />}
                     {hasThread ? c.lastPreview || '[media]' : formatPhone(c.phoneE164)}
                   </span>
 

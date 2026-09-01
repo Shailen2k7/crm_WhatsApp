@@ -62,6 +62,7 @@ export function ChatPanel({
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  const contactKey = contact?.key ?? null;
   const phoneE164 = contact?.phoneE164 ?? null;
   const displayName = contact ? (contact.unknown ? formatPhone(contact.phoneE164) : contact.name) : '';
   const firstName = contact && !contact.unknown ? contact.name.split(' ')[0] : 'them';
@@ -69,11 +70,12 @@ export function ChatPanel({
 
   // ---- conversation + history ---------------------------------------------
   useEffect(() => {
-    if (!contact || !phoneE164) {
+    if (!contactKey || !phoneE164) {
       setConversationId(null); setMessages([]); setLastInboundAt(null); setSpotlight(false);
       return;
     }
     let cancelled = false;
+    lastCountRef.current = 0;
     setLoading(true); setError(null); setDraft(''); setPending([]); setInternal(false);
 
     (async () => {
@@ -106,7 +108,10 @@ export function ChatPanel({
     })();
 
     return () => { cancelled = true; };
-  }, [supabase, contact, phoneE164, workspaceId]);
+    // Keyed on PRIMITIVES, never on the contact object: its identity changes on
+    // every parent render, which used to reload the thread continuously.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supabase, contactKey, phoneE164, workspaceId]);
 
   // ---- realtime ------------------------------------------------------------
   useEffect(() => {
@@ -158,8 +163,14 @@ export function ChatPanel({
     return () => clearInterval(t);
   }, []);
 
+  // Jump to the bottom when the thread CHANGES or GROWS — never on a re-render
+  // caused by a status tick, which used to yank the view around mid-read.
+  const lastCountRef = useRef(0);
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: messages.length > 30 ? 'auto' : 'smooth' });
+    if (messages.length === lastCountRef.current) return;
+    const grew = messages.length > lastCountRef.current;
+    lastCountRef.current = messages.length;
+    bottomRef.current?.scrollIntoView({ behavior: grew && messages.length < 40 ? 'smooth' : 'auto' });
   }, [messages.length]);
 
   // "/" at the start of an empty composer opens quick replies — muscle memory
@@ -361,7 +372,19 @@ export function ChatPanel({
       </header>
 
       {/* Thread */}
-      <div style={{ flex: 1, overflowY: 'auto', WebkitOverflowScrolling: 'touch', minHeight: 0, padding: '16px 14px 6px' }}>
+      {/* Breathing room at both edges. clamp() keeps it proportional on a wide
+          desktop without stealing half the screen on a phone, where every pixel
+          of message width counts. */}
+      <div
+        style={{
+          flex: 1,
+          overflowY: 'auto',
+          WebkitOverflowScrolling: 'touch',
+          minHeight: 0,
+          padding: '16px 0 6px',
+          paddingInline: 'clamp(12px, 7%, 110px)',
+        }}
+      >
         {loading && (
           <div style={{ display: 'flex', justifyContent: 'center', padding: 24, color: 'var(--muted)' }}>
             <Loader2 size={18} style={{ animation: 'spin .8s linear infinite' }} />
@@ -581,7 +604,21 @@ function Bubble({ message: m, isAdmin, onDelete, onFlip }: { message: RelayMessa
   return (
     <div
       className="animate-msg-in"
-      style={{ display: 'flex', justifyContent: out ? 'flex-end' : 'flex-start', marginBottom: 7, gap: 4, alignItems: 'center', flexDirection: out ? 'row-reverse' : 'row', position: 'relative' }}
+      style={{
+        display: 'flex',
+        // `row-reverse` REVERSES the main axis, so `flex-end` on an outbound row
+        // packed our own messages to the LEFT — the exact opposite of WhatsApp.
+        // With the axis flipped, `flex-start` IS the right-hand edge. One value
+        // therefore aligns both sides correctly: inbound hard left, outbound
+        // hard right.
+        justifyContent: 'flex-start',
+        flexDirection: out ? 'row-reverse' : 'row',
+        width: '100%',
+        marginBottom: 7,
+        gap: 4,
+        alignItems: 'center',
+        position: 'relative',
+      }}
     >
       <div
         style={{ maxWidth: 'min(78%, 480px)', minWidth: 90 }}
@@ -740,10 +777,13 @@ function Ticks({ status }: { status: RelayMessage['status'] }) {
   if (status === 'failed') return <AlertCircle size={11} style={{ color: 'var(--red)' }} />;
   const read = status === 'read';
   const two = status === 'delivered' || read;
+  // WhatsApp blue, at full opacity and slightly larger, so "they have read it"
+  // is legible at a glance rather than a subtle tint change.
+  const colour = read ? '#34B7F1' : 'currentColor';
   return (
-    <svg width="15" height="11" viewBox="0 0 18 12" fill="none" style={{ opacity: read ? 1 : 0.75 }}>
-      <path d="M1 6.5L4.5 10L11 2" stroke={read ? '#7DF3DA' : 'currentColor'} strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-      {two && <path d="M7 6.5L10.5 10L17 2" stroke={read ? '#7DF3DA' : 'currentColor'} strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />}
+    <svg width={read ? 17 : 15} height={read ? 12 : 11} viewBox="0 0 18 12" fill="none" style={{ opacity: read ? 1 : 0.7 }}>
+      <path d="M1 6.5L4.5 10L11 2" stroke={colour} strokeWidth={read ? 2.1 : 1.7} strokeLinecap="round" strokeLinejoin="round" />
+      {two && <path d="M7 6.5L10.5 10L17 2" stroke={colour} strokeWidth={read ? 2.1 : 1.7} strokeLinecap="round" strokeLinejoin="round" />}
     </svg>
   );
 }

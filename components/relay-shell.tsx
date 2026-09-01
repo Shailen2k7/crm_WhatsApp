@@ -296,14 +296,34 @@ export function RelayShell({
   return (
     <div style={{ height: '100dvh', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg)' }}>
       {pushBanner && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 14px', background: 'var(--teal)', color: '#fff', fontSize: 12.5, fontWeight: 600, flex: 'none' }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            // The notch/Dynamic Island sits ON TOP of the viewport. Without this
+            // inset the banner rendered underneath it and the "Turn on" button
+            // was physically unreachable on a Pro Max.
+            padding: '10px 14px',
+            paddingTop: 'calc(10px + env(safe-area-inset-top))',
+            background: 'var(--teal)',
+            color: '#fff',
+            fontSize: 12.5,
+            fontWeight: 600,
+            flex: 'none',
+            flexWrap: 'wrap',
+          }}
+        >
           <BellRing size={15} style={{ flex: 'none' }} />
-          <span style={{ flex: 1 }}>Turn on notifications so a client message rings on this device — even when Relay is in the background.</span>
-          <button onClick={turnOnPush} style={{ background: '#fff', color: 'var(--teal-2)', border: 0, borderRadius: 8, padding: '5px 13px', fontSize: 12, fontWeight: 700, cursor: 'pointer', flex: 'none' }}>
+          <span style={{ flex: 1, minWidth: 150, lineHeight: 1.4 }}>Turn on notifications so a client message rings on this device.</span>
+          <button
+            onClick={turnOnPush}
+            style={{ background: '#fff', color: 'var(--teal-2)', border: 0, borderRadius: 8, padding: '8px 16px', fontSize: 13, fontWeight: 700, cursor: 'pointer', flex: 'none', minHeight: 36 }}
+          >
             Turn on
           </button>
-          <button onClick={() => setPushBanner(false)} aria-label="Dismiss" style={{ background: 'transparent', border: 0, color: '#fff', cursor: 'pointer', display: 'flex', flex: 'none' }}>
-            <X size={15} />
+          <button onClick={() => setPushBanner(false)} aria-label="Dismiss" style={{ background: 'transparent', border: 0, color: '#fff', cursor: 'pointer', display: 'flex', flex: 'none', padding: 6 }}>
+            <X size={16} />
           </button>
         </div>
       )}

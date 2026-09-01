@@ -42,7 +42,7 @@ export function SettingsPanel({
         .from('relay_webhook_log')
         .select('*')
         .order('received_at', { ascending: false })
-        .limit(15);
+        .limit(200);
       if (error) { setLogErr(error.message); setLog([]); return; }
       setLogErr(null);
       setLog((data || []) as WebhookLogRow[]);
@@ -119,10 +119,43 @@ export function SettingsPanel({
           </div>
         </Card>
 
+        {/* Answers "why are my ticks not blue?" without anyone reading logs:
+            if Interakt never sends a read event, no UI can show a read tick. */}
+        <Card title="Delivery receipts">
+          {(() => {
+            const rows = log || [];
+            const count = (suffix: string) => rows.filter((r) => (r.event_type || '').endsWith(suffix)).length;
+            const sent = count('_sent'), delivered = count('_delivered'), read = count('_read'), failed = count('_failed');
+            const received = rows.filter((r) => r.event_type === 'message_received').length;
+            const anyStatus = sent + delivered + read + failed;
+            return (
+              <>
+                <Row label="Inbound messages seen" value={<strong>{received}</strong>} />
+                <Row label="Sent receipts" value={<strong>{sent}</strong>} />
+                <Row label="Delivered receipts" value={<strong>{delivered}</strong>} />
+                <Row label="Read receipts" value={<strong style={{ color: read > 0 ? '#34B7F1' : 'var(--muted)' }}>{read}</strong>} />
+                {failed > 0 && <Row label="Failed" value={<strong style={{ color: 'var(--red)' }}>{failed}</strong>} />}
+                <div style={{ fontSize: 11.8, color: 'var(--muted)', lineHeight: 1.6, paddingTop: 9 }}>
+                  {rows.length === 0
+                    ? 'No webhook traffic recorded yet.'
+                    : anyStatus === 0
+                    ? 'Interakt has sent NO delivery or read receipts — only incoming messages. Blue ticks are impossible until it does. Interakt documents receipts for template messages; ask their support to enable them for session messages on your plan.'
+                    : read === 0
+                    ? 'Delivery receipts are arriving but no READ receipts yet. Either nobody has opened a message, or their WhatsApp has read receipts switched off.'
+                    : 'Read receipts are arriving — blue ticks will show as recipients open your messages.'}
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--muted)', paddingTop: 6 }}>
+                  Based on the last {rows.length} webhook events.
+                </div>
+              </>
+            );
+          })()}
+        </Card>
+
         <Card title="Webhook activity">
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
             <span style={{ fontSize: 12, color: 'var(--muted)' }}>
-              Every call Interakt makes to Relay, newest first.
+              The 15 most recent calls Interakt made to Relay.
             </span>
             <button
               onClick={loadLog}
@@ -148,7 +181,7 @@ export function SettingsPanel({
             </div>
           )}
 
-          {log && log.map((r) => (
+          {log && log.slice(0, 15).map((r) => (
             <div key={r.id} style={{ display: 'flex', gap: 9, alignItems: 'flex-start', padding: '7px 0', borderTop: '1px solid var(--line-2)' }}>
               <span style={{ width: 7, height: 7, borderRadius: 99, background: r.ok ? 'var(--teal)' : 'var(--red)', marginTop: 5, flex: 'none' }} />
               <div style={{ flex: 1, minWidth: 0 }}>
