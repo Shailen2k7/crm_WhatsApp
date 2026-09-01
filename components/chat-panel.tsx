@@ -5,7 +5,7 @@ import { createClient } from '@/lib/supabase/client';
 import {
   Search, Star, PanelRight, Paperclip, Send, MessageSquare, ArrowLeft,
   AlertCircle, Loader2, RotateCw, Lock, FileText, Download, X, Trash2,
-  MoreHorizontal, Zap, Image as ImageIcon, Copy,
+  MoreHorizontal, Zap, Image as ImageIcon, Copy, ArrowLeftRight,
 } from 'lucide-react';
 import { initialsOf, avatarTint, formatPhone } from '@/lib/phone';
 import type { Contact } from '@/lib/contacts';
@@ -265,6 +265,24 @@ export function ChatPanel({
     setMenuOpen(false);
   }
 
+  /**
+   * Moves one message to the other side of the thread.
+   *
+   * Needed because messages stored BEFORE the direction fix are frozen on the
+   * wrong side — new code cannot retro-correct rows whose origin was never
+   * recorded. Rather than guess in a migration, the person who can actually see
+   * whose message it was gets a one-tap fix.
+   */
+  async function flipSide(m: RelayMessage) {
+    const next = m.direction === 'in' ? 'out' : 'in';
+    setMessages((prev) => prev.map((x) => (x.id === m.id ? { ...x, direction: next } : x)));
+    const { error: err } = await supabase
+      .from('relay_messages')
+      .update({ direction: next, status: next === 'out' ? 'delivered' : 'received' })
+      .eq('id', m.id);
+    if (err) setError(err.message);
+  }
+
   async function deleteMessage(id: string) {
     if (!conversationId) return;
     if (!confirm('Delete this message (and its file, if any) permanently?')) return;
@@ -373,7 +391,7 @@ export function ChatPanel({
             return (
               <div key={m.id}>
                 {showDate && <DateSeparator iso={m.created_at} />}
-                <Bubble message={m} isAdmin={role === 'admin'} onDelete={() => deleteMessage(m.id)} />
+                <Bubble message={m} isAdmin={role === 'admin'} onDelete={() => deleteMessage(m.id)} onFlip={() => flipSide(m)} />
               </div>
             );
           })}
@@ -542,7 +560,7 @@ function DateSeparator({ iso }: { iso: string }) {
   );
 }
 
-function Bubble({ message: m, isAdmin, onDelete }: { message: RelayMessage; isAdmin: boolean; onDelete: () => void }) {
+function Bubble({ message: m, isAdmin, onDelete, onFlip }: { message: RelayMessage; isAdmin: boolean; onDelete: () => void; onFlip: () => void }) {
   const out = m.direction === 'out';
   const failed = m.status === 'failed';
   const internal = m.is_internal;
@@ -690,6 +708,11 @@ function Bubble({ message: m, isAdmin, onDelete }: { message: RelayMessage; isAd
               <a href={`/api/whatsapp/media/${m.id}?download`} onClick={() => setMenu(false)} style={{ ...menuItem, textDecoration: 'none' }}>
                 <Download size={14} /> Download file
               </a>
+            )}
+            {isAdmin && !internal && (
+              <button onClick={() => { setMenu(false); onFlip(); }} style={menuItem}>
+                <ArrowLeftRight size={14} /> Move to {out ? 'their' : 'our'} side
+              </button>
             )}
             {isAdmin ? (
               <button onClick={() => { setMenu(false); onDelete(); }} style={{ ...menuItem, color: 'var(--red)' }}>

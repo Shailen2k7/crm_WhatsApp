@@ -173,7 +173,46 @@ export async function POST(req: Request) {
         .from('relay_messages')
         .update(patch)
         .eq('provider_msg_id', providerMsgId)
-        .select('id');
+        .select('id, direction');
+
+      // SELF-HEALING DIRECTION.
+      // A delivery/read receipt only ever exists for a message the BUSINESS
+      // sent — WhatsApp never tells us a customer's own message was delivered
+      // to them. So a receipt arriving for a row we filed as inbound is proof
+      // that row is on the wrong side, and we correct it without being asked.
+      const misfiled = (updated || []).filter((r) => (r as { direction?: string }).direction === 'in');
+      if (misfiled.length > 0) {
+        await admin
+          .from('relay_messages')
+          .update({ direction: 'out' })
+          .in('id', misfiled.map((r) => (r as { id: string }).id));
+        console.warn('[relay webhook] corrected', misfiled.length, 'misfiled message(s) to outbound');
+      }
+
+      // A status event for an id we have never stored means the message was
+      // sent from INTERAKT'S OWN INBOX, not from Relay. Interakt does not
+      // include the body on status events, so we record a placeholder on the
+      // correct side rather than pretending the message never happened.
+      if ((!updated || updated.length === 0) && status === 'sent' && customer?.channel_phone_number) {
+        const phoneE164 = toE164(customer.channel_phone_number);
+        const { data: ws0 } = await admin.from('workspaces').select('id').order('created_at', { ascending: true }).limit(1).maybeSingle();
+        if (phoneE164 && ws0) {
+          const { data: cid } = await admin.rpc('relay_get_or_create_conversation', { p_workspace_id: ws0.id, p_phone_e164: phoneE164 });
+          if (cid) {
+            const { data: dupe } = await admin.from('relay_messages').select('id').eq('provider_msg_id', providerMsgId).maybeSingle();
+            if (!dupe) {
+              await admin.from('relay_messages').insert({
+                workspace_id: ws0.id,
+                conversation_id: cid,
+                direction: 'out',
+                body: message?.is_template_message ? '[template sent from Interakt]' : '[sent from Interakt]',
+                provider_msg_id: providerMsgId,
+                status: 'sent',
+              });
+            }
+          }
+        }
+      }
 
       // TICK FIX: some status events echo our callbackData rather than the id
       // we stored. callbackData IS our message row's uuid (set at send), so a
@@ -270,7 +309,11 @@ export async function POST(req: Request) {
 
       // A reply we sent ourselves must not ring our own phones.
       if (direction === 'out') {
-        await logAttempt({ ok: true, reason: auth.how, eventType, sigPresent: !!sig, phone: customer?.channel_phone_number, handled: 'agent_reply_stored' });
+        await logAttempt({
+          ok: true, reason: auth.how, eventType, sigPresent: !!sig,
+          phone: customer?.channel_phone_number,
+          handled: `out · chat_message_type=${message?.chat_message_type || 'ABSENT'}`,
+        });
         return NextResponse.json({ ok: true, handled: 'message_received', direction: 'out' });
       }
 
@@ -293,7 +336,11 @@ export async function POST(req: Request) {
         tag: `wa-${convId}`,
       });
 
-      await logAttempt({ ok: true, reason: auth.how, eventType, sigPresent: !!sig, phone: customer?.channel_phone_number, handled: msgErr ? 'insert_failed' : 'message_stored' });
+      await logAttempt({
+        ok: true, reason: auth.how, eventType, sigPresent: !!sig,
+        phone: customer?.channel_phone_number,
+        handled: msgErr ? 'insert_failed' : `in · chat_message_type=${message?.chat_message_type || 'ABSENT'}`,
+      });
       return NextResponse.json({ ok: true, handled: 'message_received' });
     }
 
