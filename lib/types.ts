@@ -36,6 +36,11 @@ export interface Lead {
   is_sample: boolean | null;
 }
 
+/** The columns Relay reads from `leads`. Shared so the server's first page and
+ *  the browser's background pages can never drift apart. */
+export const LEAD_COLUMNS =
+  'id, workspace_id, full_name, phone, email, visa_type, stage, source, owner_id, industry, tags, next_follow_up, last_note, last_note_at, first_response_at, cv_path, cv_name, created_at, updated_at, is_sample';
+
 export interface RelayUser {
   id: string;
   email: string;
