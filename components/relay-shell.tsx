@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import type { Lead, RelayUser, Workspace } from '@/lib/types';
 import { LEAD_COLUMNS } from '@/lib/types';
-import type { RelayConversation, RelayMessage } from '@/lib/messages';
+import type { RelayConversation, RelayMessage, QuickReply, RelayTemplate } from '@/lib/messages';
 import { mergeContacts, type Contact } from '@/lib/contacts';
 import { playRingtone, unlockAudio } from '@/lib/chime';
 import { enablePush, registerServiceWorker } from '@/lib/push-client';
@@ -14,6 +14,7 @@ import { ChatPanel } from './chat-panel';
 import { CrmPanel } from './crm-panel';
 import { SettingsPanel } from './settings-panel';
 import { QuickRepliesManager } from './quick-replies';
+import { TemplatesPanel } from './templates-panel';
 import { FilesPanel } from './files-panel';
 import { Placeholder } from './placeholder';
 import { MobileTabs, MobileHeader } from './mobile-tabs';
@@ -46,6 +47,8 @@ export function RelayShell({
 
   const [leads, setLeads] = useState<Lead[]>(initialLeads);
   const [conversations, setConversations] = useState<RelayConversation[]>([]);
+  const [quickReplies, setQuickReplies] = useState<QuickReply[]>([]);
+  const [templates, setTemplates] = useState<RelayTemplate[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [nav, setNav] = useState<RailKey>('chat');
@@ -156,6 +159,35 @@ export function RelayShell({
     [members, user.id, user.name]
   );
 
+  // ---- quick replies + templates: loaded ONCE for the whole app ------------
+  // These used to be fetched inside the chat panel on every chat open — two
+  // needless queries per open, part of why switching chats felt slow.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [qr, tpl] = await Promise.all([
+        supabase.from('relay_quick_replies').select('*').eq('workspace_id', workspace.id).order('sort_order').order('title'),
+        supabase.from('relay_templates').select('*').eq('workspace_id', workspace.id).order('sort_order').order('name'),
+      ]);
+      if (cancelled) return;
+      if (qr.data) setQuickReplies(qr.data as QuickReply[]);
+      if (tpl.data) setTemplates(tpl.data as RelayTemplate[]);
+    })();
+
+    const ch = supabase
+      .channel('relay-qr-tpl-' + workspace.id)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'relay_quick_replies', filter: `workspace_id=eq.${workspace.id}` }, async () => {
+        const { data } = await supabase.from('relay_quick_replies').select('*').eq('workspace_id', workspace.id).order('sort_order').order('title');
+        if (data) setQuickReplies(data as QuickReply[]);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'relay_templates', filter: `workspace_id=eq.${workspace.id}` }, async () => {
+        const { data } = await supabase.from('relay_templates').select('*').eq('workspace_id', workspace.id).order('sort_order').order('name');
+        if (data) setTemplates(data as RelayTemplate[]);
+      })
+      .subscribe();
+    return () => { cancelled = true; supabase.removeChannel(ch); };
+  }, [supabase, workspace.id]);
+
   // ---- the REST of the leads, fetched in the background --------------------
   // The server sends the first 1000 so the app paints immediately; the rest
   // arrive here, a page at a time, without blocking anything. Doing this on the
@@ -249,7 +281,7 @@ export function RelayShell({
             // Title flash so a background tab shows it too.
             if (document.hidden) {
               const original = document.title;
-              document.title = '🟢 New message — Relay';
+              document.title = '🟢 New message — Migrizo';
               const back = () => { document.title = original; document.removeEventListener('visibilitychange', back); };
               document.addEventListener('visibilitychange', back);
             }
@@ -455,6 +487,8 @@ export function RelayShell({
                 contact={selected}
                 workspaceId={workspace.id}
                 role={role}
+                quickReplies={quickReplies}
+                templates={templates}
                 crmOpen={crmOpen}
                 onToggleCrm={() => setCrmOpen((v) => !v)}
                 onBack={() => setSelectedKey(null)}
@@ -473,8 +507,10 @@ export function RelayShell({
           </>
         ) : nav === 'quickreplies' ? (
           <QuickRepliesManager workspaceId={workspace.id} />
+        ) : nav === 'templates' ? (
+          <TemplatesPanel workspaceId={workspace.id} />
         ) : nav === 'files' ? (
-          <FilesPanel workspaceId={workspace.id} contacts={contacts} onOpenChat={(key) => { setNav('chat'); setSelectedKey(key); }} />
+          <FilesPanel workspaceId={workspace.id} contacts={contacts} isAdmin={role === 'admin'} onOpenChat={(key) => { setNav('chat'); setSelectedKey(key); }} />
         ) : nav === 'settings' ? (
           <SettingsPanel
             user={user}
@@ -506,6 +542,7 @@ const NAV_TITLES: Partial<Record<RailKey, string>> = {
   starred: 'Spotlight',
   files: 'Files',
   quickreplies: 'Quick replies',
+  templates: 'Templates',
   team: 'Team',
   settings: 'Settings',
 };

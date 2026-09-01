@@ -137,8 +137,8 @@ function LoginForm() {
             </svg>
           </div>
           <div>
-            <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: '-0.01em' }}>Relay</div>
-            <div style={{ fontSize: 12, color: 'var(--muted)' }}>Migrizo WhatsApp</div>
+            <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: '-0.01em' }}>Migrizo</div>
+            <div style={{ fontSize: 12, color: 'var(--muted)' }}>WhatsApp</div>
           </div>
         </div>
 
@@ -314,7 +314,7 @@ function LoginForm() {
         <p style={{ fontSize: 11.5, color: 'var(--muted)', textAlign: 'center', marginTop: 20, lineHeight: 1.5 }}>
           Use your Migrizo CRM account.
           <br />
-          Relay shares the same sign-in.
+          It is the same sign-in as the CRM.
         </p>
       </div>
     </div>

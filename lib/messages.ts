@@ -44,6 +44,20 @@ export interface RelayConversation {
   updated_at: string;
 }
 
+/** An approved WhatsApp template registered in Migrizo (migration 105). */
+export interface RelayTemplate {
+  id: string;
+  workspace_id: string;
+  name: string;
+  language: string;
+  body: string;
+  category: string | null;
+  variable_count: number;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
 /** A saved quick reply, optionally with files that go out with it. */
 export interface QuickReply {
   id: string;

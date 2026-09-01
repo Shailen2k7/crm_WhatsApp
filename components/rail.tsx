@@ -1,9 +1,9 @@
 'use client';
 
-import { MessageSquare, Users, Star, FileText, Zap, User, Settings, Moon, Sun, ExternalLink, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
+import { MessageSquare, Users, Star, FileText, Zap, LayoutTemplate, User, Settings, Moon, Sun, ExternalLink, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
 import { initialsOf, avatarTint } from '@/lib/phone';
 
-export type RailKey = 'chat' | 'contacts' | 'starred' | 'files' | 'quickreplies' | 'team' | 'settings';
+export type RailKey = 'chat' | 'contacts' | 'starred' | 'files' | 'quickreplies' | 'templates' | 'team' | 'settings';
 
 const ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
   { key: 'chat', label: 'Chats', Icon: MessageSquare },
@@ -11,6 +11,7 @@ const ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
   { key: 'starred', label: 'Spotlight', Icon: Star },
   { key: 'files', label: 'Files', Icon: FileText },
   { key: 'quickreplies', label: 'Quick replies', Icon: Zap },
+  { key: 'templates', label: 'Templates', Icon: LayoutTemplate },
   { key: 'team', label: 'Team', Icon: User },
   { key: 'settings', label: 'Settings', Icon: Settings },
 ];
@@ -80,7 +81,7 @@ export function Rail({
             <path d="M4 19V7a3 3 0 013-3h10a3 3 0 013 3v6a3 3 0 01-3 3H8z" />
           </svg>
         </a>
-        {wide && <span style={{ color: 'var(--rail-fg-on)', fontWeight: 800, fontSize: 15, letterSpacing: '-0.01em' }}>Relay</span>}
+        {wide && <span style={{ color: 'var(--rail-fg-on)', fontWeight: 800, fontSize: 15, letterSpacing: '-0.01em' }}>Migrizo</span>}
       </div>
 
       {ITEMS.map(({ key, label, Icon }) => {

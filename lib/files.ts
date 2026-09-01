@@ -113,6 +113,32 @@ export function fileResponse(
   });
 }
 
+/**
+ * A presentable name for an inbound file whose only identity is a CDN hash.
+ * "HbvMvkhxttDr.pdf" is what Interakt's storage calls it; nobody at Migrizo
+ * should have to read that. A name is kept only if it looks like one a human
+ * chose (spaces, separators, or a real word-like stem); otherwise it becomes
+ * "Migrizo Document 2026-09-01 18.09.pdf", timestamped so ten photos from one
+ * afternoon stay distinguishable.
+ */
+export function presentableName(rawName: string, mediaType: string | null, when: Date = new Date()): string {
+  const ext = (/\.(\w{2,5})$/.exec(rawName)?.[1] || 'bin').toLowerCase();
+  const stem = rawName.replace(/\.\w{2,5}$/, '');
+  const humanish =
+    /[ _\-()]/.test(stem) ||                       // separators = a chosen name
+    (stem.length <= 24 && /^[a-z0-9]+$/i.test(stem) && !/[a-z][A-Z]/.test(stem) && stem.length <= 12);
+  if (humanish && stem.length > 0) return rawName;
+
+  const kind =
+    mediaType === 'image' ? 'Photo'
+    : mediaType === 'audio' ? 'Audio'
+    : mediaType === 'video' ? 'Video'
+    : 'Document';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const stamp = `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())} ${pad(when.getHours())}.${pad(when.getMinutes())}`;
+  return `Migrizo ${kind} ${stamp}.${ext}`;
+}
+
 /** Storage path for a message's media: workspace/conversation/message-name.
  * The folder structure is what makes deleting a whole conversation's files a
  * single prefix listing later. */

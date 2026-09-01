@@ -47,7 +47,14 @@ export async function POST(req: Request) {
   if (!admin) return NextResponse.json({ ok: false, error: 'Server not configured.' }, { status: 500 });
 
   // Uploads live under an /uploads prefix until a message claims them.
-  const path = `${member.workspace_id}/uploads/${crypto.randomUUID()}-${filename.replace(/[^\w.\- ()]/g, '_').slice(0, 120)}`;
+  //
+  // THE UUID IS A FOLDER, NOT A PREFIX ON THE NAME. Interakt names the
+  // delivered file from the LAST SEGMENT of the URL it fetches (our fileName
+  // parameter is ignored), so `uploads/<uuid>-Brochure.pdf` reached customers
+  // as "3eb0b84f-...-Brochure.pdf". With the uuid as its own path segment the
+  // customer sees exactly the filename the agent attached.
+  const cleanName = filename.replace(/[^\w.\- ()]/g, '_').slice(0, 120);
+  const path = `${member.workspace_id}/uploads/${crypto.randomUUID()}/${cleanName}`;
   const { error } = await admin.storage.from(RELAY_BUCKET).upload(path, buf, { contentType: mime, upsert: false });
   if (error) return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
 

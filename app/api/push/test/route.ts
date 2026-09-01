@@ -47,7 +47,7 @@ export async function POST() {
     .eq('workspace_id', member.workspace_id);
 
   const sent = await pushToWorkspace(admin, member.workspace_id, {
-    title: 'Relay · test notification',
+    title: 'Migrizo · test notification',
     body: 'If you can see this, notifications are working on this device.',
     url: '/',
     tag: 'relay-test',

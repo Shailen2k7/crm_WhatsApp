@@ -98,10 +98,10 @@ export function NotificationPanel() {
         <div style={warn}>
           <AlertTriangle size={15} style={{ flex: 'none', marginTop: 1, color: 'var(--amber)' }} />
           <div>
-            <strong>On iPhone, add Relay to your Home Screen first.</strong>
+            <strong>On iPhone, add Migrizo to your Home Screen first.</strong>
             <br />
-            Safari → Share → <em>Add to Home Screen</em>, then open Relay from that icon. Apple does not
-            allow web notifications until you do — this is an iOS rule, not a setting in Relay.
+            Safari → Share → <em>Add to Home Screen</em>, then open Migrizo from that icon. Apple does not
+            allow web notifications until you do — this is an iOS rule, not a setting here.
           </div>
         </div>
       )}
@@ -140,8 +140,8 @@ export function NotificationPanel() {
       )}
 
       <div style={{ fontSize: 11.5, color: 'var(--muted)', lineHeight: 1.6, paddingTop: 12, borderTop: '1px solid var(--line-2)', marginTop: 12 }}>
-        <strong style={{ color: 'var(--ink-2)' }}>What you will hear.</strong> With Relay open, a new message plays
-        Relay&apos;s bird call. With Relay closed, your phone plays its own notification sound — no website can replace
+        <strong style={{ color: 'var(--ink-2)' }}>What you will hear.</strong> With Migrizo open, a new message plays
+        its bird call. With it closed, your phone plays its own notification sound — no website can replace
         the system sound on iOS or Android — so the alert is identified by its long double-buzz vibration instead.
       </div>
     </section>

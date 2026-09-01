@@ -81,7 +81,7 @@ export function SettingsPanel({
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg)' }}>
       <div style={{ maxWidth: 620, margin: '0 auto', padding: '32px 24px 60px' }}>
         <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 4px' }}>Settings</h1>
-        <p style={{ fontSize: 13, color: 'var(--muted)', margin: '0 0 26px' }}>Relay · Phase 2</p>
+        <p style={{ fontSize: 13, color: 'var(--muted)', margin: '0 0 26px' }}>Migrizo WhatsApp</p>
 
         <Card title="Connection">
           <Row label="Database" value={<Status ok={true} text="Connected" />} />
@@ -158,7 +158,7 @@ export function SettingsPanel({
         <Card title="Webhook activity">
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
             <span style={{ fontSize: 12, color: 'var(--muted)' }}>
-              The 15 most recent calls Interakt made to Relay.
+              The 15 most recent calls from Interakt.
             </span>
             <button
               onClick={loadLog}

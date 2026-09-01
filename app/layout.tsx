@@ -2,10 +2,10 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Relay — Migrizo',
+  title: 'Migrizo WhatsApp',
   description: 'WhatsApp for the Migrizo CRM',
   manifest: '/manifest.json',
-  appleWebApp: { capable: true, statusBarStyle: 'black-translucent', title: 'Relay' },
+  appleWebApp: { capable: true, statusBarStyle: 'black-translucent', title: 'Migrizo' },
 };
 
 export const viewport: Viewport = {

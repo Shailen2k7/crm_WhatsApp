@@ -7,7 +7,7 @@
 // =============================================================================
 import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { FileText, Image as ImageIcon, Download, MessageSquare, Music, Film } from 'lucide-react';
+import { FileText, Image as ImageIcon, Download, MessageSquare, Music, Film, Trash2 } from 'lucide-react';
 import type { RelayMessage } from '@/lib/messages';
 import type { Contact } from '@/lib/contacts';
 
@@ -24,15 +24,27 @@ export function FilesPanel({
   workspaceId,
   contacts,
   onOpenChat,
+  isAdmin,
 }: {
   workspaceId: string;
   contacts: Contact[];
   onOpenChat: (contactKey: string) => void;
+  isAdmin: boolean;
 }) {
   const supabase = useMemo(() => createClient(), []);
   const [files, setFiles] = useState<RelayMessage[]>([]);
   const [kind, setKind] = useState<Kind>('all');
   const [loading, setLoading] = useState(true);
+
+  // Deletes the message AND its file from storage — the same admin-only route
+  // the chat uses, so there is exactly one deletion path to trust.
+  async function removeFile(f: RelayMessage) {
+    if (!confirm(`Delete "${f.media_name || 'this file'}" permanently?\n\nIt is removed from the chat and from storage.`)) return;
+    const res = await fetch(`/api/whatsapp/conversation/${f.conversation_id}?messageId=${f.id}`, { method: 'DELETE' });
+    const json = await res.json();
+    if (json.ok) setFiles((prev) => prev.filter((x) => x.id !== f.id));
+    else alert(json.error || 'Could not delete.');
+  }
 
   const byConversation = useMemo(() => {
     const m = new Map<string, Contact>();
@@ -128,6 +140,11 @@ export function FilesPanel({
               <a href={`/api/whatsapp/media/${f.id}?download`} aria-label="Download" title="Download" style={{ width: 32, height: 32, borderRadius: 9, background: 'var(--teal-bg)', color: 'var(--teal-ink)', display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
                 <Download size={15} />
               </a>
+              {isAdmin && (
+                <button onClick={() => removeFile(f)} aria-label="Delete file" title="Delete file (permanent)" style={{ width: 32, height: 32, borderRadius: 9, border: 0, background: 'var(--red-bg)', color: 'var(--red)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flex: 'none' }}>
+                  <Trash2 size={14} />
+                </button>
+              )}
             </div>
           );
         })}

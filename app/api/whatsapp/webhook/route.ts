@@ -22,7 +22,7 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { statusFromEvent, mediaTypeFrom, type InteraktWebhook } from '@/lib/interakt';
 import { toE164 } from '@/lib/phone';
 import { pushToWorkspace } from '@/lib/push-server';
-import { RELAY_BUCKET, MAX_UPLOAD_BYTES, mediaPath, safeFilename, mimeFor } from '@/lib/files';
+import { RELAY_BUCKET, MAX_UPLOAD_BYTES, mediaPath, safeFilename, mimeFor, presentableName } from '@/lib/files';
 import { createHmac, timingSafeEqual } from 'crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
@@ -97,7 +97,7 @@ async function logAttempt(row: {
  */
 async function archiveMedia(
   admin: SupabaseClient,
-  opts: { workspaceId: string; conversationId: string; messageId: string; url: string; contentTypeHint?: string | null }
+  opts: { workspaceId: string; conversationId: string; messageId: string; url: string; contentTypeHint?: string | null; mediaType?: string | null }
 ): Promise<{ path: string; name: string; mime: string; size: number } | null> {
   try {
     const res = await fetch(opts.url, { signal: AbortSignal.timeout(30_000) });
@@ -109,7 +109,9 @@ async function archiveMedia(
     // Name: last URL segment if it looks like a filename, else sniff the bytes.
     const urlName = decodeURIComponent(opts.url.split('?')[0].split('/').pop() || '');
     const declaredMime = res.headers.get('content-type') || opts.contentTypeHint || null;
-    const { filename, ext } = safeFilename({ name: urlName, mime: declaredMime, buf, fallback: 'whatsapp-file' });
+    const { filename: rawFilename, ext } = safeFilename({ name: urlName, mime: declaredMime, buf, fallback: 'whatsapp-file' });
+    // CDN hashes ("HbvMvkhxttDr.pdf") become "Migrizo Document <date>.pdf".
+    const filename = presentableName(rawFilename, opts.mediaType ?? null, new Date());
     const mime = mimeFor(ext, declaredMime);
     const path = mediaPath(opts.workspaceId, opts.conversationId, opts.messageId, filename);
 
@@ -268,13 +270,18 @@ export async function POST(req: Request) {
       const mediaType = mediaTypeFrom(message?.message_content_type);
       const direction = directionOf(message?.chat_message_type);
 
+      // Interakt sends Python's literal "None" as the caption of caption-less
+      // media. Rendering the word "None" under a client's CV looks broken.
+      let bodyText = message?.message || '';
+      if (mediaType && (bodyText === 'None' || bodyText === 'null')) bodyText = '';
+
       const { data: inserted, error: msgErr } = await admin
         .from('relay_messages')
         .insert({
           workspace_id: ws.id,
           conversation_id: convId,
           direction,
-          body: message?.message || '',
+          body: bodyText,
           provider_msg_id: providerMsgId || null,
           // An agent's reply typed in Interakt is already delivered by the time
           // we hear about it; a client's message is simply "received".
@@ -296,6 +303,7 @@ export async function POST(req: Request) {
           conversationId: convId as string,
           messageId: inserted.id,
           url: message.media_url,
+          mediaType,
         });
         if (stored) {
           await admin.from('relay_messages').update({
@@ -330,7 +338,7 @@ export async function POST(req: Request) {
       }
       const previewText = message?.message || (mediaType ? `📎 ${mediaType === 'image' ? 'Photo' : mediaType === 'document' ? 'Document' : 'Attachment'}` : 'New message');
       await pushToWorkspace(admin, ws.id, {
-        title: `${who} · WhatsApp`,
+        title: `${who} · Migrizo WhatsApp`,
         body: previewText.slice(0, 140),
         url: '/',
         tag: `wa-${convId}`,

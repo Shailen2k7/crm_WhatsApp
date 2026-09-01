@@ -1,0 +1,275 @@
+'use client';
+
+// =============================================================================
+// APPROVED TEMPLATES — the messages Meta allows outside the 24-hour window.
+// -----------------------------------------------------------------------------
+// Interakt has no working API to LIST templates (verified: their
+// /track/templates/ endpoint returns 500 on every request shape), so each
+// approved template is registered here once — name, language, and the approved
+// body with its {{1}} {{2}} placeholders. Sending uses Interakt's documented
+// template-send API, which does work.
+// =============================================================================
+import { useEffect, useMemo, useState } from 'react';
+import { createClient } from '@/lib/supabase/client';
+import { Plus, Trash2, Pencil, Loader2, LayoutTemplate, RefreshCw, ClipboardPaste } from 'lucide-react';
+import type { RelayTemplate } from '@/lib/messages';
+
+const emptyDraft = { id: '', name: '', language: 'en', body: '', category: '' };
+
+export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
+  const supabase = useMemo(() => createClient(), []);
+  const [items, setItems] = useState<RelayTemplate[]>([]);
+  const [draft, setDraft] = useState(emptyDraft);
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncNote, setSyncNote] = useState<string | null>(null);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulk, setBulk] = useState('');
+  const [bulkNote, setBulkNote] = useState<string | null>(null);
+
+  // Tries Interakt's importer. It is broken on their side today (HTTP 500 to
+  // every request shape), but the button stays: the day they fix it this starts
+  // working with no change here, and until then it reports their real response
+  // rather than leaving you to wonder.
+  async function syncFromInterakt() {
+    setSyncing(true); setSyncNote(null);
+    try {
+      const res = await fetch('/api/whatsapp/templates/sync', { method: 'POST' });
+      const j = await res.json();
+      setSyncNote(j.ok ? j.note : j.error);
+      if (j.ok) load();
+    } catch {
+      setSyncNote('Could not reach the server.');
+    }
+    setSyncing(false);
+  }
+
+  /**
+   * Bulk paste. One template per block:
+   *
+   *   code_name | en | UTILITY
+   *   Hi {{1}}, thanks for your interest in the UK Global Talent Visa.
+   *
+   * Blocks separated by a blank line. Faster than filling the form ten times.
+   */
+  async function importBulk() {
+    const blocks = bulk.split(/\n\s*\n/).map((b) => b.trim()).filter(Boolean);
+    if (blocks.length === 0) { setBulkNote('Nothing to import.'); return; }
+
+    const rows = blocks.map((block) => {
+      const lines = block.split('\n');
+      const header = lines[0].split('|').map((x) => x.trim());
+      return {
+        workspace_id: workspaceId,
+        name: header[0] || '',
+        language: header[1] || 'en',
+        category: header[2] || null,
+        body: lines.slice(1).join('\n').trim(),
+        variable_count: countVars(lines.slice(1).join('\n')),
+      };
+    }).filter((r) => r.name && r.body);
+
+    if (rows.length === 0) {
+      setBulkNote('Could not read any template. Check the format: "code_name | en | UTILITY" then the body on the next line(s).');
+      return;
+    }
+
+    const { error: err } = await supabase
+      .from('relay_templates')
+      .upsert(rows, { onConflict: 'workspace_id,name,language' });
+    if (err) { setBulkNote(err.message); return; }
+
+    setBulk(''); setBulkOpen(false); setBulkNote(null);
+    load();
+  }
+
+  async function load() {
+    const { data } = await supabase
+      .from('relay_templates')
+      .select('*')
+      .eq('workspace_id', workspaceId)
+      .order('sort_order')
+      .order('name');
+    if (data) setItems(data as RelayTemplate[]);
+  }
+  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [workspaceId]);
+
+  function countVars(body: string): number {
+    const m = body.match(/\{\{\s*(\d+)\s*\}\}/g) || [];
+    return new Set(m.map((x) => x.replace(/\D/g, ''))).size;
+  }
+
+  async function save() {
+    const name = draft.name.trim();
+    // The BODY IS OPTIONAL. Interakt needs only the name, language and variable
+    // values to send; the body is for previewing here. Requiring it was my
+    // mistake and it blocked sending for no reason.
+    if (!name) {
+      setError('A template needs its exact code name from Interakt.');
+      return;
+    }
+    setSaving(true); setError(null);
+    const row = {
+      workspace_id: workspaceId,
+      name,
+      language: draft.language.trim() || 'en',
+      body: draft.body.trim(),
+      category: draft.category.trim() || null,
+      variable_count: countVars(draft.body),
+    };
+    const q = draft.id
+      ? supabase.from('relay_templates').update(row).eq('id', draft.id)
+      : supabase.from('relay_templates').insert(row);
+    const { error: err } = await q;
+    setSaving(false);
+    if (err) {
+      setError(err.message.includes('duplicate') ? `"${name}" (${row.language}) is already registered.` : err.message);
+      return;
+    }
+    setDraft(emptyDraft); setEditing(false);
+    load();
+  }
+
+  async function remove(id: string) {
+    if (!confirm('Remove this template from Migrizo? (It stays approved in Interakt — this only removes it here.)')) return;
+    await supabase.from('relay_templates').delete().eq('id', id);
+    load();
+  }
+
+  return (
+    <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg)' }}>
+      <div style={{ maxWidth: 680, margin: '0 auto', padding: '28px 20px 60px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+          <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>Templates</h1>
+          {!editing && (
+            <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+              <button onClick={syncFromInterakt} disabled={syncing} style={ghostBtn}>
+                {syncing ? <Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> : <RefreshCw size={14} />}
+                Sync from Interakt
+              </button>
+              <button onClick={() => { setBulkOpen((v) => !v); setBulkNote(null); }} style={ghostBtn}>
+                <ClipboardPaste size={14} /> Paste many
+              </button>
+              <button onClick={() => { setDraft(emptyDraft); setEditing(true); }} style={primaryBtn}>
+                <Plus size={15} /> Add template
+              </button>
+            </div>
+          )}
+        </div>
+        <p style={{ fontSize: 13, color: 'var(--muted)', margin: '0 0 22px', lineHeight: 1.55 }}>
+          Register each template exactly as approved in Interakt (Templates → the code name in the URL).
+          They appear behind the template button in every chat, and they are the only messages WhatsApp
+          allows when the 24-hour window is closed.
+        </p>
+
+        {syncNote && (
+          <div style={{ background: 'var(--amber-bg)', color: 'var(--ink)', padding: '11px 13px', borderRadius: 10, fontSize: 12.3, lineHeight: 1.55, marginBottom: 14 }}>
+            {syncNote}
+          </div>
+        )}
+
+        {bulkOpen && (
+          <section className="animate-pop-in" style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 14, padding: 18, marginBottom: 20, boxShadow: 'var(--shadow)' }}>
+            <label style={label}>Paste your templates — one per block, blank line between them</label>
+            <textarea
+              value={bulk}
+              onChange={(e) => setBulk(e.target.value)}
+              rows={10}
+              placeholder={'gtv_welcome_v2 | en | UTILITY\nHi {{1}}, thanks for your interest in the UK Global Talent Visa. Shall we book a quick call?\n\nifv_docs | en | UTILITY\nHi {{1}}, here is the document checklist for the Innovator Founder Visa.'}
+              style={{ ...input, resize: 'vertical', lineHeight: 1.55, fontFamily: 'ui-monospace, SFMono-Regular, monospace', fontSize: 12.5 }}
+            />
+            <div style={{ fontSize: 11.5, color: 'var(--muted)', margin: '7px 0 12px', lineHeight: 1.55 }}>
+              First line: <strong>code name | language | category</strong> — the code name is the URL segment in
+              Interakt between <code>template/</code> and <code>/view</code>. Everything after it is the approved body.
+            </div>
+            {bulkNote && <div style={{ color: 'var(--red)', fontSize: 12.5, fontWeight: 500, marginBottom: 10 }}>{bulkNote}</div>}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={importBulk} style={primaryBtn}><ClipboardPaste size={14} /> Import</button>
+              <button onClick={() => { setBulkOpen(false); setBulk(''); setBulkNote(null); }} style={ghostBtn}>Cancel</button>
+            </div>
+          </section>
+        )}
+
+        {editing && (
+          <section className="animate-pop-in" style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 14, padding: 18, marginBottom: 20, boxShadow: 'var(--shadow)' }}>
+            <div style={{ display: 'flex', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+              <div style={{ flex: 2, minWidth: 200 }}>
+                <label style={label}>Template code name (exact)</label>
+                <input value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} placeholder="gtv_welcome_v2" style={input} />
+              </div>
+              <div style={{ flex: '0 0 90px' }}>
+                <label style={label}>Language</label>
+                <input value={draft.language} onChange={(e) => setDraft({ ...draft, language: e.target.value })} placeholder="en" style={input} />
+              </div>
+              <div style={{ flex: '0 0 140px' }}>
+                <label style={label}>Category</label>
+                <input value={draft.category} onChange={(e) => setDraft({ ...draft, category: e.target.value })} placeholder="UTILITY" style={input} />
+              </div>
+            </div>
+
+            <label style={label}>Approved body — optional, for preview only. Keep {'{{1}}'} placeholders as approved.</label>
+            <textarea
+              value={draft.body}
+              onChange={(e) => setDraft({ ...draft, body: e.target.value })}
+              rows={5}
+              placeholder={'Hi {{1}}, thanks for your interest in the UK Global Talent Visa…'}
+              style={{ ...input, resize: 'vertical', lineHeight: 1.55 }}
+            />
+            <div style={{ fontSize: 11.5, color: 'var(--muted)', margin: '6px 0 12px' }}>
+              {countVars(draft.body)} variable{countVars(draft.body) === 1 ? '' : 's'} detected.
+            </div>
+
+            {error && <div style={{ color: 'var(--red)', fontSize: 12.5, fontWeight: 500, marginBottom: 10 }}>{error}</div>}
+
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={save} disabled={saving} style={primaryBtn}>
+                {saving && <Loader2 size={13} style={{ animation: 'spin .8s linear infinite' }} />}
+                {draft.id ? 'Save changes' : 'Add template'}
+              </button>
+              <button onClick={() => { setEditing(false); setDraft(emptyDraft); setError(null); }} style={ghostBtn}>Cancel</button>
+            </div>
+          </section>
+        )}
+
+        {items.length === 0 && !editing && (
+          <div style={{ textAlign: 'center', padding: '50px 20px', color: 'var(--muted)' }}>
+            <LayoutTemplate size={26} style={{ marginBottom: 10, opacity: 0.5 }} />
+            <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 5 }}>No templates registered</div>
+            <div style={{ fontSize: 12.5, lineHeight: 1.6, maxWidth: 400, margin: '0 auto' }}>
+              Add the templates already approved on your Interakt account. Until then, a closed
+              24-hour window means a chat cannot be reopened from here.
+            </div>
+          </div>
+        )}
+
+        {items.map((t) => (
+          <div key={t.id} style={{ display: 'flex', gap: 12, alignItems: 'flex-start', background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, padding: '13px 15px', marginBottom: 9 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 13.5, fontWeight: 700 }}>{t.name}</span>
+                <span style={{ fontSize: 10.5, fontWeight: 700, padding: '2px 7px', borderRadius: 99, background: 'var(--teal-bg)', color: 'var(--teal-ink)' }}>{t.language}</span>
+                {t.category && <span style={{ fontSize: 10.5, fontWeight: 700, padding: '2px 7px', borderRadius: 99, background: 'var(--surface-3)', color: 'var(--muted)' }}>{t.category}</span>}
+                {t.variable_count > 0 && (
+                  <span style={{ fontSize: 11, color: 'var(--muted)', fontWeight: 600 }}>{t.variable_count} variable{t.variable_count === 1 ? '' : 's'}</span>
+                )}
+              </div>
+              <p style={{ fontSize: 12.5, color: 'var(--muted)', margin: '4px 0 0', lineHeight: 1.5, whiteSpace: 'pre-wrap', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                {t.body}
+              </p>
+            </div>
+            <button onClick={() => { setDraft({ id: t.id, name: t.name, language: t.language, body: t.body, category: t.category || '' }); setEditing(true); window.scrollTo({ top: 0 }); }} aria-label="Edit" style={rowBtn}><Pencil size={14} /></button>
+            <button onClick={() => remove(t.id)} aria-label="Delete" style={{ ...rowBtn, color: 'var(--red)' }}><Trash2 size={14} /></button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const label: React.CSSProperties = { display: 'block', fontSize: 11.5, fontWeight: 700, color: 'var(--ink-2)', marginBottom: 5 };
+const input: React.CSSProperties = { width: '100%', padding: '9px 12px', borderRadius: 9, border: '1px solid var(--line)', background: 'var(--surface-2)', outline: 'none', fontSize: 13.5 };
+const primaryBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 15px', borderRadius: 9, border: 0, background: 'var(--teal)', color: '#fff', fontSize: 12.5, fontWeight: 700, cursor: 'pointer' };
+const ghostBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 15px', borderRadius: 9, border: '1px solid var(--line)', background: 'transparent', color: 'var(--ink-2)', fontSize: 12.5, fontWeight: 600, cursor: 'pointer' };
+const rowBtn: React.CSSProperties = { width: 30, height: 30, borderRadius: 8, border: 0, background: 'var(--surface-2)', color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flex: 'none' };

@@ -10,7 +10,20 @@ import {
 import { initialsOf, avatarTint, formatPhone } from '@/lib/phone';
 import type { Contact } from '@/lib/contacts';
 import { windowState, formatWindow } from '@/lib/interakt';
-import type { RelayMessage, QuickReply } from '@/lib/messages';
+import type { RelayMessage, QuickReply, RelayTemplate } from '@/lib/messages';
+import { LayoutTemplate } from 'lucide-react';
+
+// =============================================================================
+// SPEED: a per-conversation message cache.
+// -----------------------------------------------------------------------------
+// Opening a chat used to run two sequential queries every single time — one to
+// find the conversation by phone, one for its messages — and fetched the OLDEST
+// 500 rows at that (ascending + limit takes from the top of the sort). Both
+// are gone: the conversation comes free with the contact row, only the NEWEST
+// 200 messages are pulled (descending, then reversed), and a revisited chat
+// paints instantly from this cache while a background refresh reconciles it.
+// =============================================================================
+const messageCache = new Map<string, RelayMessage[]>();
 
 interface PendingFile { path: string; name: string; mime: string; size: number }
 
@@ -25,6 +38,8 @@ export function ChatPanel({
   contact,
   workspaceId,
   role,
+  quickReplies,
+  templates,
   crmOpen,
   onToggleCrm,
   onBack,
@@ -34,6 +49,8 @@ export function ChatPanel({
   contact: Contact | null;
   workspaceId: string;
   role: 'admin' | 'member';
+  quickReplies: QuickReply[];
+  templates: RelayTemplate[];
   crmOpen: boolean;
   onToggleCrm: () => void;
   onBack: () => void;
@@ -54,8 +71,9 @@ export function ChatPanel({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [quickReplies, setQuickReplies] = useState<QuickReply[]>([]);
   const [qrOpen, setQrOpen] = useState(false);
+  const [qrIndex, setQrIndex] = useState(0);
+  const [tplOpen, setTplOpen] = useState(false);
   const [, setTick] = useState(0);
 
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -70,40 +88,66 @@ export function ChatPanel({
 
   // ---- conversation + history ---------------------------------------------
   useEffect(() => {
-    if (!contactKey || !phoneE164) {
+    if (!contact || !contactKey || !phoneE164) {
       setConversationId(null); setMessages([]); setLastInboundAt(null); setSpotlight(false);
       return;
     }
     let cancelled = false;
     lastCountRef.current = 0;
-    setLoading(true); setError(null); setDraft(''); setPending([]); setInternal(false);
+    setError(null); setDraft(''); setPending([]); setInternal(false);
 
     (async () => {
-      const { data: conv } = await supabase
-        .from('relay_conversations')
-        .select('id, last_inbound_at, spotlight')
-        .eq('workspace_id', workspaceId)
-        .eq('phone_e164', phoneE164)
-        .maybeSingle();
+      // The contact row from the list already carries the conversation — no
+      // lookup round-trip. Only a contact opened before any thread exists
+      // falls back to the phone query.
+      let convId: string | null = contact.conversationId;
+      let convInbound = contact.conversation?.last_inbound_at ?? null;
+      let convSpot = contact.conversation?.spotlight ?? false;
 
-      if (cancelled) return;
-      if (!conv) {
-        setConversationId(null); setLastInboundAt(null); setSpotlight(false); setMessages([]); setLoading(false);
-        return;
+      if (!convId) {
+        const { data: conv } = await supabase
+          .from('relay_conversations')
+          .select('id, last_inbound_at, spotlight')
+          .eq('workspace_id', workspaceId)
+          .eq('phone_e164', phoneE164)
+          .maybeSingle();
+        if (cancelled) return;
+        if (!conv) {
+          setConversationId(null); setLastInboundAt(null); setSpotlight(false); setMessages([]); setLoading(false);
+          return;
+        }
+        convId = conv.id; convInbound = conv.last_inbound_at; convSpot = !!conv.spotlight;
       }
-      setConversationId(conv.id);
-      setLastInboundAt(conv.last_inbound_at);
-      setSpotlight(!!conv.spotlight);
 
+      if (!convId) return;
+      const cid: string = convId;
+      setConversationId(cid);
+      setLastInboundAt(convInbound);
+      setSpotlight(convSpot);
+
+      // Cached thread paints NOW; the fetch below reconciles it silently.
+      const cached = messageCache.get(cid);
+      if (cached) {
+        lastCountRef.current = cached.length;
+        setMessages(cached);
+        setLoading(false);
+      } else {
+        setLoading(true);
+      }
+
+      // Newest 200, not oldest 500: ascending+limit was returning the START of
+      // long threads and silently dropping the recent messages.
       const { data: msgs } = await supabase
         .from('relay_messages')
         .select('*')
-        .eq('conversation_id', conv.id)
-        .order('created_at', { ascending: true })
-        .limit(500);
+        .eq('conversation_id', cid)
+        .order('created_at', { ascending: false })
+        .limit(200);
 
       if (cancelled) return;
-      setMessages((msgs || []) as RelayMessage[]);
+      const ordered = ((msgs || []) as RelayMessage[]).reverse();
+      messageCache.set(cid, ordered);
+      setMessages(ordered);
       setLoading(false);
     })();
 
@@ -131,10 +175,9 @@ export function ChatPanel({
           if (!row?.id) return;
           setMessages((prev) => {
             const i = prev.findIndex((m) => m.id === row.id);
-            if (i === -1) return [...prev, row];
-            const copy = [...prev];
-            copy[i] = row;
-            return copy;
+            const next = i === -1 ? [...prev, row] : prev.map((m, j) => (j === i ? row : m));
+            messageCache.set(conversationId, next);
+            return next;
           });
           if (row.direction === 'in') setLastInboundAt(row.created_at);
         }
@@ -142,21 +185,6 @@ export function ChatPanel({
       .subscribe();
     return () => { supabase.removeChannel(channel); };
   }, [supabase, conversationId]);
-
-  // ---- quick replies -------------------------------------------------------
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const { data } = await supabase
-        .from('relay_quick_replies')
-        .select('*')
-        .eq('workspace_id', workspaceId)
-        .order('sort_order')
-        .order('title');
-      if (!cancelled && data) setQuickReplies(data as QuickReply[]);
-    })();
-    return () => { cancelled = true; };
-  }, [supabase, workspaceId]);
 
   useEffect(() => {
     const t = setInterval(() => setTick((n) => n + 1), 30_000);
@@ -177,6 +205,7 @@ export function ChatPanel({
   // from every serious support tool.
   useEffect(() => {
     setQrOpen(draft === '/' || (draft.startsWith('/') && draft.length <= 20 && !draft.includes(' ')));
+    setQrIndex(0); // typing narrows the list; the highlight restarts at the top
   }, [draft]);
 
   const win = windowState(lastInboundAt);
@@ -249,6 +278,67 @@ export function ChatPanel({
       taRef.current?.focus();
     }
   }, [draft, pending, internal, contact, sending, conversationId, supabase]);
+
+  // ---- send an approved template (works with the window CLOSED — that is
+  // its whole purpose) --------------------------------------------------------
+  const [tplSel, setTplSel] = useState<RelayTemplate | null>(null);
+  const [tplVars, setTplVars] = useState<string[]>([]);
+  const [tplSending, setTplSending] = useState(false);
+
+  function openTemplate(t: RelayTemplate) {
+    setTplSel(t);
+    setTplVars(Array.from({ length: t.variable_count }, () => ''));
+  }
+
+  // A template registered without its body has an unknown variable count, so
+  // the agent adds fields until it matches. Interakt names the mismatch
+  // precisely if it is wrong, and that error is shown verbatim.
+  const addVar = () => setTplVars((v) => [...v, '']);
+  const removeVar = () => setTplVars((v) => v.slice(0, -1));
+
+  /** The approved body with {{n}} placeholders replaced by the typed values. */
+  function fillTemplate(t: RelayTemplate, vars: string[]): string {
+    return t.body.replace(/\{\{\s*(\d+)\s*\}\}/g, (_, n) => vars[Number(n) - 1] || `{{${n}}}`);
+  }
+
+  async function sendTemplateNow() {
+    if (!tplSel || !contact || tplSending) return;
+    if (tplVars.length > 0 && tplVars.some((v) => !v.trim())) {
+      setError('Fill every variable box, or remove the empty ones.');
+      return;
+    }
+    setTplSending(true); setError(null);
+    try {
+      const res = await fetch('/api/whatsapp/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone: contact.phoneRaw,
+          conversationId: conversationId || undefined,
+          templateName: tplSel.name,
+          templateLanguage: tplSel.language,
+          templateValues: tplVars,
+          // The thread shows the real text, not "[template: x]".
+          message: fillTemplate(tplSel, tplVars),
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) { setError(json.error || 'Template send failed.'); setTplSending(false); return; }
+      setTplOpen(false); setTplSel(null);
+      if (!conversationId && json.conversationId) setConversationId(json.conversationId);
+      if (json.conversationId) {
+        const { data } = await supabase
+          .from('relay_messages').select('*')
+          .eq('conversation_id', json.conversationId)
+          .order('created_at', { ascending: false }).limit(200);
+        if (data) { const ordered = (data as RelayMessage[]).reverse(); messageCache.set(json.conversationId, ordered); setMessages(ordered); }
+      }
+    } catch {
+      setError('Network error — the template was not sent.');
+    } finally {
+      setTplSending(false);
+    }
+  }
 
   // ---- quick reply insert --------------------------------------------------
   function applyQuickReply(q: QuickReply) {
@@ -436,9 +526,9 @@ export function ChatPanel({
         {/* Quick replies popover */}
         {qrOpen && qrMatches.length > 0 && (
           <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 280, overflowY: 'auto', zIndex: 20 }}>
-            <div style={{ padding: '9px 14px 5px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>Quick replies</div>
-            {qrMatches.map((q) => (
-              <button key={q.id} onClick={() => applyQuickReply(q)} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 14px', border: 0, borderTop: '1px solid var(--line-2)', background: 'transparent', cursor: 'pointer' }}>
+            <div style={{ padding: '9px 14px 5px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>Quick replies · ↑↓ then ⏎</div>
+            {qrMatches.map((q, qi) => (
+              <button key={q.id} onClick={() => applyQuickReply(q)} onMouseEnter={() => setQrIndex(qi)} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 14px', border: 0, borderTop: '1px solid var(--line-2)', background: qi === qrIndex ? 'var(--surface-3)' : 'transparent', cursor: 'pointer' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                   <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--teal-ink)' }}>/{q.shortcut}</span>
                   <span style={{ fontSize: 12.5, fontWeight: 600 }}>{q.title}</span>
@@ -454,6 +544,72 @@ export function ChatPanel({
           </div>
         )}
 
+        {tplOpen && (
+          <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 340, overflowY: 'auto', zIndex: 21 }}>
+            {!tplSel ? (
+              <>
+                <div style={{ padding: '10px 14px 6px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>
+                  Approved templates — allowed even when the window is closed
+                </div>
+                {templates.length === 0 && (
+                  <div style={{ padding: '12px 14px 14px', fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.55 }}>
+                    None registered yet. Add your approved templates under <strong>Templates</strong> in the sidebar.
+                  </div>
+                )}
+                {templates.map((t) => (
+                  <button key={t.id} onClick={() => openTemplate(t)} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '10px 14px', border: 0, borderTop: '1px solid var(--line-2)', background: 'transparent', cursor: 'pointer' }}>
+                    <div style={{ display: 'flex', gap: 7, alignItems: 'center' }}>
+                      <span style={{ fontSize: 13, fontWeight: 700 }}>{t.name}</span>
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 99, background: 'var(--teal-bg)', color: 'var(--teal-ink)' }}>{t.language}</span>
+                    </div>
+                    <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.body}</div>
+                  </button>
+                ))}
+              </>
+            ) : (
+              <div style={{ padding: '12px 14px 14px' }}>
+                <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>{tplSel.name}</div>
+                <div style={{ fontSize: 12.5, background: 'var(--surface-2)', border: '1px solid var(--line-2)', borderRadius: 9, padding: '9px 11px', lineHeight: 1.55, whiteSpace: 'pre-wrap', marginBottom: 10, color: tplSel.body ? 'var(--ink-2)' : 'var(--muted)' }}>
+                  {tplSel.body
+                    ? fillTemplate(tplSel, tplVars)
+                    : 'No preview stored — WhatsApp sends the approved wording. Add the body under Templates if you want it shown here.'}
+                </div>
+                {tplVars.map((v, i) => (
+                  <input
+                    key={i}
+                    value={v}
+                    onChange={(e) => setTplVars((prev) => prev.map((x, j) => (j === i ? e.target.value : x)))}
+                    placeholder={`Variable {{${i + 1}}}${i === 0 ? ` — e.g. ${firstName}` : ''}`}
+                    style={{ width: '100%', padding: '8px 11px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface-2)', outline: 'none', fontSize: 13, marginBottom: 7 }}
+                  />
+                ))}
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 8 }}>
+                  <button onClick={addVar} style={{ padding: '5px 10px', borderRadius: 7, border: '1px solid var(--line)', background: 'transparent', color: 'var(--ink-2)', fontSize: 11.5, fontWeight: 600, cursor: 'pointer' }}>
+                    + Variable
+                  </button>
+                  {tplVars.length > 0 && (
+                    <button onClick={removeVar} style={{ padding: '5px 10px', borderRadius: 7, border: '1px solid var(--line)', background: 'transparent', color: 'var(--muted)', fontSize: 11.5, fontWeight: 600, cursor: 'pointer' }}>
+                      − Variable
+                    </button>
+                  )}
+                  <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+                    {tplVars.length === 0 ? 'No variables — send as-is' : `${tplVars.length} variable${tplVars.length === 1 ? '' : 's'}`}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                  <button onClick={sendTemplateNow} disabled={tplSending} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 15px', borderRadius: 9, border: 0, background: 'var(--teal)', color: '#fff', fontSize: 12.5, fontWeight: 700, cursor: 'pointer' }}>
+                    {tplSending ? <Loader2 size={13} style={{ animation: 'spin .8s linear infinite' }} /> : <Send size={13} />}
+                    Send template
+                  </button>
+                  <button onClick={() => setTplSel(null)} style={{ padding: '8px 15px', borderRadius: 9, border: '1px solid var(--line)', background: 'transparent', color: 'var(--ink-2)', fontSize: 12.5, fontWeight: 600, cursor: 'pointer' }}>
+                    Back
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {error && (
           <div className="animate-fade-in" style={{ display: 'flex', alignItems: 'flex-start', gap: 8, background: 'var(--red-bg)', color: 'var(--red)', padding: '9px 12px', borderRadius: 10, fontSize: 12.3, fontWeight: 500, marginBottom: 8, lineHeight: 1.5 }}>
             <AlertCircle size={14} style={{ flex: 'none', marginTop: 1 }} />
@@ -465,7 +621,7 @@ export function ChatPanel({
         {!win.open && !internal && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'var(--amber-bg)', color: 'var(--ink-2)', padding: '9px 12px', borderRadius: 10, fontSize: 12.3, marginBottom: 8, lineHeight: 1.5 }}>
             <AlertCircle size={14} style={{ flex: 'none', color: 'var(--amber)' }} />
-            <span><strong>24-hour window closed.</strong> Only an approved template can reach {firstName} — or switch to an internal note (🔒).</span>
+            <span><strong>24-hour window closed.</strong> Use the template button below to reach {firstName}, or write an internal note (🔒).</span>
           </div>
         )}
 
@@ -504,8 +660,16 @@ export function ChatPanel({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
+              // While the "/" popover is open the arrows walk it and Enter
+              // picks — exactly how a command palette behaves.
+              if (qrOpen && qrMatches.length > 0) {
+                if (e.key === 'ArrowDown') { e.preventDefault(); setQrIndex((i) => (i + 1) % qrMatches.length); return; }
+                if (e.key === 'ArrowUp') { e.preventDefault(); setQrIndex((i) => (i - 1 + qrMatches.length) % qrMatches.length); return; }
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); applyQuickReply(qrMatches[Math.min(qrIndex, qrMatches.length - 1)]); return; }
+                if (e.key === 'Tab') { e.preventDefault(); applyQuickReply(qrMatches[Math.min(qrIndex, qrMatches.length - 1)]); return; }
+              }
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-              if (e.key === 'Escape') setQrOpen(false);
+              if (e.key === 'Escape') { setQrOpen(false); setTplOpen(false); }
             }}
             disabled={(!canType && !internal) || sending}
             rows={1}
@@ -540,6 +704,14 @@ export function ChatPanel({
               style={composerBtn}
             >
               <Zap size={17} />
+            </button>
+            <button
+              onClick={() => setTplOpen((v) => !v)}
+              title="Send an approved template (works when the window is closed)"
+              aria-label="Templates"
+              style={{ ...composerBtn, color: tplOpen ? 'var(--teal-ink)' : 'var(--muted)' }}
+            >
+              <LayoutTemplate size={16} />
             </button>
             <button
               onClick={() => setInternal((v) => !v)}
@@ -696,7 +868,7 @@ function Bubble({ message: m, isAdmin, onDelete, onFlip }: { message: RelayMessa
             </div>
           )}
 
-          {(m.body || (!hasFile && !m.template_name)) && (
+          {((m.body && !(hasFile && (m.body === 'None' || m.body === 'null'))) || (!hasFile && !m.template_name)) && (
             <div style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: hasFile && isImage ? '6px 9px 2px' : 0 }}>
               {m.body}
             </div>
@@ -807,7 +979,7 @@ function EmptyState() {
             <path d="M4 19V7a3 3 0 013-3h10a3 3 0 013 3v6a3 3 0 01-3 3H8z" />
           </svg>
         </div>
-        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 7 }}>Relay</div>
+        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 7 }}>Migrizo</div>
         <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, margin: 0 }}>Pick a chat on the left, or find someone in Contacts.</p>
       </div>
     </div>
