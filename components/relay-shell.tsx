@@ -356,7 +356,22 @@ export function RelayShell({
   }
 
   return (
-    <div style={{ height: '100dvh', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg)' }}>
+    // `height: 100dvh` alone is not enough on a phone: the value can lag behind
+    // the browser chrome collapsing, leaving the app taller than what you can
+    // actually see — which pushed the composer up into mid-screen with dead
+    // space beneath it. Pinning to the viewport with position:fixed makes the
+    // app exactly as tall as the visible area, always.
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        height: '100dvh',
+        display: 'flex',
+        flexDirection: 'column',
+        overflow: 'hidden',
+        background: 'var(--bg)',
+      }}
+    >
       {pushBanner && (
         <div
           style={{

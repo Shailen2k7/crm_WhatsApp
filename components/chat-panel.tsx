@@ -422,7 +422,17 @@ export function ChatPanel({
       </div>
 
       {/* Composer */}
-      <div style={{ padding: '8px 12px', paddingBottom: 'calc(12px + env(safe-area-inset-bottom))', flex: 'none', position: 'relative' }}>
+      <div
+        style={{
+          padding: '8px 12px',
+          // Only the home-indicator inset sits below the composer — nothing else,
+          // so it rests on the bottom edge the way every messaging app does.
+          paddingBottom: 'calc(8px + env(safe-area-inset-bottom))',
+          flex: 'none',
+          position: 'relative',
+          background: 'var(--chat)',
+        }}
+      >
         {/* Quick replies popover */}
         {qrOpen && qrMatches.length > 0 && (
           <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 280, overflowY: 'auto', zIndex: 20 }}>
