@@ -262,7 +262,18 @@ export async function POST(req: Request) {
         // Surface the REAL Supabase error, not a generic string — the generic
         // one made this bug undebuggable in the field.
         console.error('[relay send] sign failed', { path: att.path, err: signErr });
-        result = { ok: false, code: 'sign_failed', detail: signErr?.message ? `Link error: ${signErr.message}` : 'Could not create a link for the file.' };
+        // "Object not found" means the row still points at a file that is no
+        // longer in the bucket — almost always a quick-reply attachment whose
+        // file was deleted from Files. Say that, rather than the raw storage
+        // error, because the fix is a re-upload and nothing else.
+        const missing = /not found/i.test(signErr?.message || '');
+        result = {
+          ok: false,
+          code: missing ? 'file_missing' : 'sign_failed',
+          detail: missing
+            ? `“${att.name}” is no longer stored — re-attach it in Quick replies and send again.`
+            : signErr?.message ? `Link error: ${signErr.message}` : 'Could not create a link for the file.',
+        };
       } else {
         result = await sendMedia({
           phoneE164, mediaUrl: signed.signedUrl, mediaType: mType,

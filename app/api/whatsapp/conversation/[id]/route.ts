@@ -60,7 +60,18 @@ export async function DELETE(req: Request, ctx: { params: Promise<{ id: string }
       return NextResponse.json({ ok: false, error: 'Message not found in this conversation.' }, { status: 404 });
     }
     if (msg.media_path) {
-      await admin.storage.from(RELAY_BUCKET).remove([msg.media_path]);
+      // A quick reply's attachment is sent by REFERENCE — the message row and
+      // the quick reply point at the same object. Deleting it here would break
+      // that quick reply for every future send ("no longer stored"), which is
+      // exactly how /gtveligible1 died. Remove the message, keep the file.
+      const { data: usedBy } = await admin
+        .from('relay_quick_replies')
+        .select('shortcut, attachments')
+        .eq('workspace_id', member.workspace_id);
+      const stillNeeded = (usedBy || []).some((q) =>
+        ((q.attachments || []) as { path?: string }[]).some((a) => a.path === msg.media_path));
+
+      if (!stillNeeded) await admin.storage.from(RELAY_BUCKET).remove([msg.media_path]);
     }
     await admin.from('relay_messages').delete().eq('id', msg.id);
     return NextResponse.json({ ok: true, deleted: 'message' });

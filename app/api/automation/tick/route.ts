@@ -50,6 +50,19 @@ export async function POST(req: NextRequest) {
   const cronSecret = process.env.AUTOMATION_CRON_SECRET || '';
   const viaCron = !!cronSecret && req.headers.get('x-cron-secret') === cronSecret;
 
+  // A caller that PRESENTED a cron secret but failed the check must be told
+  // exactly why, or a missing environment variable looks identical to a
+  // logged-out browser and the automation dies silently every 2 minutes.
+  const presented = req.headers.get('x-cron-secret');
+  if (presented && !viaCron) {
+    return NextResponse.json({
+      ok: false,
+      error: cronSecret
+        ? 'The x-cron-secret header does not match AUTOMATION_CRON_SECRET on the server.'
+        : 'AUTOMATION_CRON_SECRET is not set on the server. Add it in Netlify and redeploy.',
+    }, { status: 401 });
+  }
+
   let workspaceId: string | null = null;
   if (!viaCron) {
     const supabase = await createClient();
