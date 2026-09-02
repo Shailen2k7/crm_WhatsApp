@@ -1,9 +1,9 @@
 'use client';
 
-import { MessageSquare, Users, Star, FileText, Zap, LayoutTemplate, User, Settings, Moon, Sun, ExternalLink, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
+import { MessageSquare, Users, Star, FileText, Zap, LayoutTemplate, Workflow, User, Settings, Moon, Sun, ExternalLink, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
 import { initialsOf, avatarTint } from '@/lib/phone';
 
-export type RailKey = 'chat' | 'contacts' | 'starred' | 'files' | 'quickreplies' | 'templates' | 'team' | 'settings';
+export type RailKey = 'chat' | 'contacts' | 'starred' | 'files' | 'quickreplies' | 'templates' | 'automation' | 'team' | 'settings';
 
 const ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
   { key: 'chat', label: 'Chats', Icon: MessageSquare },
@@ -12,6 +12,7 @@ const ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
   { key: 'files', label: 'Files', Icon: FileText },
   { key: 'quickreplies', label: 'Quick replies', Icon: Zap },
   { key: 'templates', label: 'Templates', Icon: LayoutTemplate },
+  { key: 'automation', label: 'Automation', Icon: Workflow },
   { key: 'team', label: 'Team', Icon: User },
   { key: 'settings', label: 'Settings', Icon: Settings },
 ];

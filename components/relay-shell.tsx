@@ -16,6 +16,7 @@ import { SettingsPanel } from './settings-panel';
 import { QuickRepliesManager } from './quick-replies';
 import { TemplatesPanel } from './templates-panel';
 import { FilesPanel } from './files-panel';
+import { AutomationPanel } from './automation-panel';
 import { Placeholder } from './placeholder';
 import { MobileTabs, MobileHeader } from './mobile-tabs';
 import { BellRing, X } from 'lucide-react';
@@ -509,6 +510,8 @@ export function RelayShell({
           <QuickRepliesManager workspaceId={workspace.id} />
         ) : nav === 'templates' ? (
           <TemplatesPanel workspaceId={workspace.id} />
+        ) : nav === 'automation' ? (
+          <AutomationPanel workspaceId={workspace.id} />
         ) : nav === 'files' ? (
           <FilesPanel workspaceId={workspace.id} contacts={contacts} isAdmin={role === 'admin'} onOpenChat={(key) => { setNav('chat'); setSelectedKey(key); }} />
         ) : nav === 'settings' ? (
@@ -543,6 +546,7 @@ const NAV_TITLES: Partial<Record<RailKey, string>> = {
   files: 'Files',
   quickreplies: 'Quick replies',
   templates: 'Templates',
+  automation: 'Automation',
   team: 'Team',
   settings: 'Settings',
 };

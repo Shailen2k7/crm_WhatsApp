@@ -70,10 +70,21 @@ export function mergeContacts(leads: Lead[], conversations: RelayConversation[])
   }
 
   const usedConvIds = new Set<string>();
+  const seenPhoneKeys = new Set<string>();  // collapse duplicate lead rows
   const out: Contact[] = [];
 
   for (const lead of leads) {
     const k = matchKey(lead.phone);
+
+    // DEDUPE. The CRM sometimes holds two or three lead rows for one person
+    // (e.g. "Narresh adurti" twice). Without this, each duplicate row grabbed
+    // the SAME conversation and the chat appeared two or three times. The first
+    // row for a phone wins; the rest are dropped from the list.
+    if (k) {
+      if (seenPhoneKeys.has(k)) continue;
+      seenPhoneKeys.add(k);
+    }
+
     const conv = convByLeadId.get(lead.id) ?? (k ? convByKey.get(k) ?? null : null);
     if (conv) usedConvIds.add(conv.id);
 

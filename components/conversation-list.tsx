@@ -43,6 +43,12 @@ function RowTicks({ status }: { status: string | null }) {
   return <CheckCheck size={12} style={{ flex: 'none', opacity: 0.45 }} />;
 }
 
+/** A readable list preview: a paperclip for media, the text otherwise. */
+function previewText(p: string | null): string {
+  if (!p || p === '[media]') return '📎 Attachment';
+  return p;
+}
+
 function ago(iso: string | null): string {
   if (!iso) return '';
   const ms = Date.now() - new Date(iso).getTime();
@@ -277,7 +283,7 @@ export function ConversationList({
                     }}
                   >
                     {hasThread && c.lastDirection === 'out' && <RowTicks status={c.lastStatus} />}
-                    {hasThread ? c.lastPreview || '[media]' : formatPhone(c.phoneE164)}
+                    {hasThread ? previewText(c.lastPreview) : formatPhone(c.phoneE164)}
                   </span>
 
                   {c.spotlight && (

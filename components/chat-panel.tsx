@@ -259,17 +259,23 @@ export function ChatPanel({
         return; // draft and files kept — never throw away what someone typed
       }
 
+      const wasNewConversation = !conversationId;
       setDraft(''); setPending([]); setInternal(false);
-      if (!conversationId && json.conversationId) setConversationId(json.conversationId);
+      if (wasNewConversation && json.conversationId) setConversationId(json.conversationId);
       if (json.partialFailures > 0) setError(`${json.partialFailures} file(s) failed to send — they stay in the thread marked failed.`);
-      if (json.conversationId) {
+
+      // A brand-new conversation has no live subscription yet, so pull its
+      // messages once. An existing thread needs NO refetch — realtime delivers
+      // the sent row in milliseconds. Dropping this 500-row round-trip is the
+      // main "sending is slow" fix.
+      if (wasNewConversation && json.conversationId) {
         const { data } = await supabase
           .from('relay_messages')
           .select('*')
           .eq('conversation_id', json.conversationId)
-          .order('created_at', { ascending: true })
-          .limit(500);
-        if (data) setMessages(data as RelayMessage[]);
+          .order('created_at', { ascending: false })
+          .limit(200);
+        if (data) { const ordered = (data as RelayMessage[]).reverse(); messageCache.set(json.conversationId, ordered); setMessages(ordered); }
       }
     } catch {
       setError('Network error — nothing was sent.');
@@ -281,33 +287,30 @@ export function ChatPanel({
 
   // ---- send an approved template (works with the window CLOSED — that is
   // its whole purpose) --------------------------------------------------------
-  const [tplSel, setTplSel] = useState<RelayTemplate | null>(null);
-  const [tplVars, setTplVars] = useState<string[]>([]);
-  const [tplSending, setTplSending] = useState(false);
+  const [tplSending, setTplSending] = useState<string | null>(null);
 
-  function openTemplate(t: RelayTemplate) {
-    setTplSel(t);
-    setTplVars(Array.from({ length: t.variable_count }, () => ''));
+  /**
+   * Values we send for a template's {{1}} {{2}} … placeholders, best guess in
+   * order. The agent is never asked: the CRM already knows who this is, and a
+   * template picker that interrogates you is not a picker.
+   *
+   * If the count is wrong the SERVER learns the right one from Interakt's
+   * rejection and retries with the same list — see the send route.
+   */
+  function autoValues(): string[] {
+    const first = contact && !contact.unknown ? contact.name.split(' ')[0] : 'there';
+    const visa =
+      contact?.lead?.visa_type?.toLowerCase().includes('ifv') || contact?.lead?.visa_type?.toLowerCase().includes('innovator')
+        ? 'Innovator Founder Visa'
+        : 'Global Talent Visa';
+    return [first, visa, 'Migrizo'];
   }
 
-  // A template registered without its body has an unknown variable count, so
-  // the agent adds fields until it matches. Interakt names the mismatch
-  // precisely if it is wrong, and that error is shown verbatim.
-  const addVar = () => setTplVars((v) => [...v, '']);
-  const removeVar = () => setTplVars((v) => v.slice(0, -1));
-
-  /** The approved body with {{n}} placeholders replaced by the typed values. */
-  function fillTemplate(t: RelayTemplate, vars: string[]): string {
-    return t.body.replace(/\{\{\s*(\d+)\s*\}\}/g, (_, n) => vars[Number(n) - 1] || `{{${n}}}`);
-  }
-
-  async function sendTemplateNow() {
-    if (!tplSel || !contact || tplSending) return;
-    if (tplVars.length > 0 && tplVars.some((v) => !v.trim())) {
-      setError('Fill every variable box, or remove the empty ones.');
-      return;
-    }
-    setTplSending(true); setError(null);
+  /** Pick a template -> it sends. That is the whole interaction. */
+  async function sendTemplateNow(t: RelayTemplate) {
+    if (!contact || tplSending) return;
+    setTplSending(t.id);
+    setError(null);
     try {
       const res = await fetch('/api/whatsapp/send', {
         method: 'POST',
@@ -315,18 +318,18 @@ export function ChatPanel({
         body: JSON.stringify({
           phone: contact.phoneRaw,
           conversationId: conversationId || undefined,
-          templateName: tplSel.name,
-          templateLanguage: tplSel.language,
-          templateValues: tplVars,
-          // The thread shows the real text, not "[template: x]".
-          message: fillTemplate(tplSel, tplVars),
+          templateName: t.name,
+          templateLanguage: t.language,
+          autoValues: autoValues(),
         }),
       });
       const json = await res.json();
-      if (!res.ok || !json.ok) { setError(json.error || 'Template send failed.'); setTplSending(false); return; }
-      setTplOpen(false); setTplSel(null);
-      if (!conversationId && json.conversationId) setConversationId(json.conversationId);
-      if (json.conversationId) {
+      if (!res.ok || !json.ok) { setError(json.error || 'Template send failed.'); setTplSending(null); return; }
+
+      const wasNew = !conversationId;
+      setTplOpen(false);
+      if (wasNew && json.conversationId) setConversationId(json.conversationId);
+      if (wasNew && json.conversationId) {
         const { data } = await supabase
           .from('relay_messages').select('*')
           .eq('conversation_id', json.conversationId)
@@ -336,7 +339,7 @@ export function ChatPanel({
     } catch {
       setError('Network error — the template was not sent.');
     } finally {
-      setTplSending(false);
+      setTplSending(null);
     }
   }
 
@@ -382,6 +385,42 @@ export function ChatPanel({
       .update({ direction: next, status: next === 'out' ? 'delivered' : 'received' })
       .eq('id', m.id);
     if (err) setError(err.message);
+  }
+
+  /**
+   * Re-send a message that failed. Reconstructs the payload from the stored
+   * row (text or file) and posts it fresh, then removes the failed one.
+   */
+  async function retryMessage(m: RelayMessage) {
+    if (!contact) return;
+    setError(null);
+    try {
+      const payload: Record<string, unknown> = {
+        phone: contact.phoneRaw,
+        conversationId: conversationId || undefined,
+      };
+      if (m.template_name) {
+        payload.templateName = m.template_name;
+        payload.templateLanguage = m.template_language || 'en';
+        payload.autoValues = autoValues();
+      } else if (m.media_path) {
+        payload.message = m.body || '';
+        payload.attachments = [{ path: m.media_path, name: m.media_name, mime: m.media_mime, size: m.media_size }];
+      } else {
+        payload.message = m.body;
+      }
+      const res = await fetch('/api/whatsapp/send', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) { setError(json.error || 'Retry failed.'); return; }
+      // remove the old failed row; realtime delivers the new one
+      await supabase.from('relay_messages').delete().eq('id', m.id);
+      setMessages((prev) => prev.filter((x) => x.id !== m.id));
+    } catch {
+      setError('Network error on retry.');
+    }
   }
 
   async function deleteMessage(id: string) {
@@ -504,7 +543,7 @@ export function ChatPanel({
             return (
               <div key={m.id}>
                 {showDate && <DateSeparator iso={m.created_at} />}
-                <Bubble message={m} isAdmin={role === 'admin'} onDelete={() => deleteMessage(m.id)} onFlip={() => flipSide(m)} />
+                <Bubble message={m} isAdmin={role === 'admin'} onDelete={() => deleteMessage(m.id)} onFlip={() => flipSide(m)} onRetry={() => retryMessage(m)} />
               </div>
             );
           })}
@@ -545,68 +584,38 @@ export function ChatPanel({
         )}
 
         {tplOpen && (
-          <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 340, overflowY: 'auto', zIndex: 21 }}>
-            {!tplSel ? (
-              <>
-                <div style={{ padding: '10px 14px 6px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>
-                  Approved templates — allowed even when the window is closed
-                </div>
-                {templates.length === 0 && (
-                  <div style={{ padding: '12px 14px 14px', fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.55 }}>
-                    None registered yet. Add your approved templates under <strong>Templates</strong> in the sidebar.
-                  </div>
-                )}
-                {templates.map((t) => (
-                  <button key={t.id} onClick={() => openTemplate(t)} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '10px 14px', border: 0, borderTop: '1px solid var(--line-2)', background: 'transparent', cursor: 'pointer' }}>
-                    <div style={{ display: 'flex', gap: 7, alignItems: 'center' }}>
-                      <span style={{ fontSize: 13, fontWeight: 700 }}>{t.name}</span>
-                      <span style={{ fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 99, background: 'var(--teal-bg)', color: 'var(--teal-ink)' }}>{t.language}</span>
-                    </div>
-                    <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.body}</div>
-                  </button>
-                ))}
-              </>
-            ) : (
-              <div style={{ padding: '12px 14px 14px' }}>
-                <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>{tplSel.name}</div>
-                <div style={{ fontSize: 12.5, background: 'var(--surface-2)', border: '1px solid var(--line-2)', borderRadius: 9, padding: '9px 11px', lineHeight: 1.55, whiteSpace: 'pre-wrap', marginBottom: 10, color: tplSel.body ? 'var(--ink-2)' : 'var(--muted)' }}>
-                  {tplSel.body
-                    ? fillTemplate(tplSel, tplVars)
-                    : 'No preview stored — WhatsApp sends the approved wording. Add the body under Templates if you want it shown here.'}
-                </div>
-                {tplVars.map((v, i) => (
-                  <input
-                    key={i}
-                    value={v}
-                    onChange={(e) => setTplVars((prev) => prev.map((x, j) => (j === i ? e.target.value : x)))}
-                    placeholder={`Variable {{${i + 1}}}${i === 0 ? ` — e.g. ${firstName}` : ''}`}
-                    style={{ width: '100%', padding: '8px 11px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface-2)', outline: 'none', fontSize: 13, marginBottom: 7 }}
-                  />
-                ))}
-                <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 8 }}>
-                  <button onClick={addVar} style={{ padding: '5px 10px', borderRadius: 7, border: '1px solid var(--line)', background: 'transparent', color: 'var(--ink-2)', fontSize: 11.5, fontWeight: 600, cursor: 'pointer' }}>
-                    + Variable
-                  </button>
-                  {tplVars.length > 0 && (
-                    <button onClick={removeVar} style={{ padding: '5px 10px', borderRadius: 7, border: '1px solid var(--line)', background: 'transparent', color: 'var(--muted)', fontSize: 11.5, fontWeight: 600, cursor: 'pointer' }}>
-                      − Variable
-                    </button>
-                  )}
-                  <span style={{ fontSize: 11, color: 'var(--muted)' }}>
-                    {tplVars.length === 0 ? 'No variables — send as-is' : `${tplVars.length} variable${tplVars.length === 1 ? '' : 's'}`}
-                  </span>
-                </div>
-                <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-                  <button onClick={sendTemplateNow} disabled={tplSending} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 15px', borderRadius: 9, border: 0, background: 'var(--teal)', color: '#fff', fontSize: 12.5, fontWeight: 700, cursor: 'pointer' }}>
-                    {tplSending ? <Loader2 size={13} style={{ animation: 'spin .8s linear infinite' }} /> : <Send size={13} />}
-                    Send template
-                  </button>
-                  <button onClick={() => setTplSel(null)} style={{ padding: '8px 15px', borderRadius: 9, border: '1px solid var(--line)', background: 'transparent', color: 'var(--ink-2)', fontSize: 12.5, fontWeight: 600, cursor: 'pointer' }}>
-                    Back
-                  </button>
-                </div>
+          <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 320, overflowY: 'auto', zIndex: 21 }}>
+            <div style={{ padding: '10px 14px 6px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>
+              Templates — tap to send{!win.open ? ' (works with the window closed)' : ''}
+            </div>
+            {templates.length === 0 && (
+              <div style={{ padding: '12px 14px 14px', fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.55 }}>
+                None registered yet. Add your approved templates under <strong>Templates</strong> in the sidebar.
               </div>
             )}
+            {templates.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => sendTemplateNow(t)}
+                disabled={!!tplSending}
+                style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', textAlign: 'left', padding: '12px 14px', border: 0, borderTop: '1px solid var(--line-2)', background: 'transparent', cursor: tplSending ? 'default' : 'pointer' }}
+              >
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', gap: 7, alignItems: 'center' }}>
+                    <span style={{ fontSize: 13.5, fontWeight: 700 }}>{t.name}</span>
+                    <span style={{ fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 99, background: 'var(--teal-bg)', color: 'var(--teal-ink)' }}>{t.language}</span>
+                  </div>
+                  <div style={{ fontSize: 11.8, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {t.body
+                      ? t.body.replace(/\{\{\s*1\s*\}\}/g, firstName)
+                      : `Sends the approved wording to ${firstName}`}
+                  </div>
+                </div>
+                {tplSending === t.id
+                  ? <Loader2 size={16} style={{ animation: 'spin .8s linear infinite', color: 'var(--teal)', flex: 'none' }} />
+                  : <Send size={15} style={{ color: 'var(--teal)', flex: 'none' }} />}
+              </button>
+            ))}
           </div>
         )}
 
@@ -708,7 +717,7 @@ export function ChatPanel({
             <button
               onClick={() => setTplOpen((v) => !v)}
               title="Send an approved template (works when the window is closed)"
-              aria-label="Templates"
+              aria-label="Send a template"
               style={{ ...composerBtn, color: tplOpen ? 'var(--teal-ink)' : 'var(--muted)' }}
             >
               <LayoutTemplate size={16} />
@@ -765,7 +774,7 @@ function DateSeparator({ iso }: { iso: string }) {
   );
 }
 
-function Bubble({ message: m, isAdmin, onDelete, onFlip }: { message: RelayMessage; isAdmin: boolean; onDelete: () => void; onFlip: () => void }) {
+function Bubble({ message: m, isAdmin, onDelete, onFlip, onRetry }: { message: RelayMessage; isAdmin: boolean; onDelete: () => void; onFlip: () => void; onRetry: () => void }) {
   const out = m.direction === 'out';
   const failed = m.status === 'failed';
   const internal = m.is_internal;
@@ -870,7 +879,12 @@ function Bubble({ message: m, isAdmin, onDelete, onFlip }: { message: RelayMessa
 
           {((m.body && !(hasFile && (m.body === 'None' || m.body === 'null'))) || (!hasFile && !m.template_name)) && (
             <div style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: hasFile && isImage ? '6px 9px 2px' : 0 }}>
-              {m.body}
+              {/* Messages sent before the wording was captured are stored as
+                  "[template: x]". Show the template name rather than the raw
+                  placeholder, so old history reads sensibly too. */}
+              {/^\[template:\s*(.+)\]$/.test(m.body)
+                ? `Template “${m.body.replace(/^\[template:\s*/, '').replace(/\]$/, '')}”`
+                : m.body}
             </div>
           )}
 
@@ -883,10 +897,14 @@ function Bubble({ message: m, isAdmin, onDelete, onFlip }: { message: RelayMessa
         </div>
 
         {failed && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--red)', marginTop: 3, justifyContent: 'flex-end', fontWeight: 500 }}>
+          <button
+            onClick={onRetry}
+            style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--red)', marginTop: 3, marginLeft: 'auto', fontWeight: 600, background: 'transparent', border: 0, cursor: 'pointer' }}
+            title="Tap to retry"
+          >
             <RotateCw size={11} />
-            {m.error_detail || 'Not delivered'}
-          </div>
+            {m.error_detail || 'Not delivered'} · Retry
+          </button>
         )}
       </div>
 
@@ -990,6 +1008,12 @@ const iconBtn: React.CSSProperties = {
   width: 36, height: 36, borderRadius: 10, border: 0, background: 'transparent',
   color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center',
   cursor: 'pointer', flex: 'none',
+};
+
+const miniBtn: React.CSSProperties = {
+  width: 26, height: 26, borderRadius: 7, border: '1px solid var(--line)',
+  background: 'transparent', color: 'var(--muted)', fontSize: 14, fontWeight: 700,
+  cursor: 'pointer', lineHeight: 1, flex: 'none',
 };
 
 const composerBtn: React.CSSProperties = {

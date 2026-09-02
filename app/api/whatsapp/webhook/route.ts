@@ -230,7 +230,7 @@ export async function POST(req: Request) {
         }
       }
 
-      await logAttempt({ ok: true, reason: auth.how, eventType, sigPresent: !!sig, phone: customer?.channel_phone_number, handled: 'status:' + status });
+      await logAttempt({ ok: true, reason: auth.how, eventType, sigPresent: !!sig, phone: customer?.channel_phone_number, handled: 'status:' + status, bodyPreview: rawBody });
       return NextResponse.json({ ok: true, handled: eventType });
     }
 
@@ -323,6 +323,16 @@ export async function POST(req: Request) {
           handled: `out · chat_message_type=${message?.chat_message_type || 'ABSENT'}`,
         });
         return NextResponse.json({ ok: true, handled: 'message_received', direction: 'out' });
+      }
+
+      // Honour "Reply STOP to opt out": one word, alone, in the inbound text.
+      // Automations check relay_suppressions before every send.
+      const inboundText = (message?.message || '').trim().toLowerCase();
+      if (/^(stop|unsubscribe|opt ?out)$/.test(inboundText)) {
+        await admin.from('relay_suppressions').upsert(
+          { workspace_id: ws.id, phone_e164: phoneE164, reason: 'stop' },
+          { onConflict: 'workspace_id,phone_e164' },
+        );
       }
 
       // Wake the team up. Name the sender if the CRM knows them.

@@ -55,24 +55,53 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
    * Blocks separated by a blank line. Faster than filling the form ten times.
    */
   async function importBulk() {
-    const blocks = bulk.split(/\n\s*\n/).map((b) => b.trim()).filter(Boolean);
-    if (blocks.length === 0) { setBulkNote('Nothing to import.'); return; }
+    // SPLIT ON HEADER LINES, NOT BLANK LINES.
+    //
+    // Real approved templates contain blank lines — they are several paragraphs
+    // long. Splitting the paste on blank lines therefore tore each template
+    // apart and stored only its first paragraph. A header line is unambiguous:
+    // "name | language | category", or just a bare template code on its own
+    // line. Everything until the NEXT header belongs to that template's body.
+    const lines = bulk.split('\n');
+    const isHeader = (ln: string): boolean => {
+      const t = ln.trim();
+      if (!t) return false;
+      if (t.includes('|')) return /^[\w.-]+\s*\|/.test(t);       // name | en | CATEGORY
+      return /^[a-z0-9][\w.-]{0,40}$/i.test(t) && !/\s/.test(t);  // a bare code like "t2"
+    };
 
-    const rows = blocks.map((block) => {
-      const lines = block.split('\n');
-      const header = lines[0].split('|').map((x) => x.trim());
-      return {
-        workspace_id: workspaceId,
-        name: header[0] || '',
-        language: header[1] || 'en',
-        category: header[2] || null,
-        body: lines.slice(1).join('\n').trim(),
-        variable_count: countVars(lines.slice(1).join('\n')),
-      };
-    }).filter((r) => r.name && r.body);
+    const rows: { workspace_id: string; name: string; language: string; category: string | null; body: string; variable_count: number }[] = [];
+    let cur: { name: string; language: string; category: string | null; body: string[] } | null = null;
+
+    const flush = () => {
+      if (!cur) return;
+      const body = cur.body.join('\n').trim();
+      if (cur.name && body) {
+        rows.push({
+          workspace_id: workspaceId,
+          name: cur.name,
+          language: cur.language || 'en',
+          category: cur.category,
+          body,
+          variable_count: countVars(body),
+        });
+      }
+      cur = null;
+    };
+
+    for (const ln of lines) {
+      if (isHeader(ln)) {
+        flush();
+        const parts = ln.split('|').map((x) => x.trim());
+        cur = { name: parts[0], language: parts[1] || 'en', category: parts[2] || null, body: [] };
+      } else if (cur) {
+        cur.body.push(ln);
+      }
+    }
+    flush();
 
     if (rows.length === 0) {
-      setBulkNote('Could not read any template. Check the format: "code_name | en | UTILITY" then the body on the next line(s).');
+      setBulkNote('Could not read any template. Each one needs a header line — "t2 | en | UTILITY" or just "t2" — followed by its body.');
       return;
     }
 
@@ -81,7 +110,14 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
       .upsert(rows, { onConflict: 'workspace_id,name,language' });
     if (err) { setBulkNote(err.message); return; }
 
+    let repaired = 0;
+    for (const r of rows) repaired += await backfill(r.name, r.body);
+
     setBulk(''); setBulkOpen(false); setBulkNote(null);
+    setSyncNote(
+      `Imported ${rows.length} template${rows.length === 1 ? '' : 's'} (${rows.map((r) => r.name).join(', ')}).` +
+      (repaired > 0 ? ` ${repaired} past message${repaired === 1 ? '' : 's'} now show the real wording.` : '')
+    );
     load();
   }
 
@@ -123,13 +159,52 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
       ? supabase.from('relay_templates').update(row).eq('id', draft.id)
       : supabase.from('relay_templates').insert(row);
     const { error: err } = await q;
-    setSaving(false);
     if (err) {
+      setSaving(false);
       setError(err.message.includes('duplicate') ? `"${name}" (${row.language}) is already registered.` : err.message);
       return;
     }
+
+    // REPAIR THE HISTORY.
+    // Messages sent before the wording was known were recorded as
+    // 'Template "t1" · Upen' — accurate but useless as a record of what the
+    // client read. Now that the approved text exists, every one of them is
+    // re-rendered with its own stored variable values.
+    const repaired = await backfill(name, row.body);
+
+    setSaving(false);
     setDraft(emptyDraft); setEditing(false);
+    if (repaired > 0) setSyncNote(`Saved. ${repaired} past message${repaired === 1 ? '' : 's'} in your chats now show the real wording.`);
     load();
+  }
+
+  /**
+   * Re-renders past messages of a template using the newly-known wording and
+   * each message's own stored bodyValues. Returns how many were fixed.
+   */
+  async function backfill(templateName: string, body: string): Promise<number> {
+    if (!body.trim()) return 0;
+    const { data: msgs } = await supabase
+      .from('relay_messages')
+      .select('id, body, template_values')
+      .eq('workspace_id', workspaceId)
+      .eq('template_name', templateName)
+      .limit(500);
+    if (!msgs?.length) return 0;
+
+    let n = 0;
+    for (const m of msgs as { id: string; body: string; template_values: { bodyValues?: string[] } | null }[]) {
+      // Only replace placeholders — never overwrite a real message someone typed.
+      const isPlaceholder =
+        /^\[template:/.test(m.body) || /^Template\s*[“"]/.test(m.body) || m.body.trim() === '';
+      if (!isPlaceholder) continue;
+
+      const vals = m.template_values?.bodyValues || [];
+      const rendered = body.replace(/\{\{\s*(\d+)\s*\}\}/g, (_x, k: string) => vals[Number(k) - 1] || '');
+      const { error: uerr } = await supabase.from('relay_messages').update({ body: rendered }).eq('id', m.id);
+      if (!uerr) n++;
+    }
+    return n;
   }
 
   async function remove(id: string) {

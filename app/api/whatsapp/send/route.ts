@@ -63,6 +63,8 @@ export async function POST(req: Request) {
     templateName?: string;
     templateLanguage?: string;
     templateValues?: string[];
+    /** Candidate values, best-guess order, used to auto-fill and auto-retry. */
+    autoValues?: string[];
   };
   try {
     body = await req.json();
@@ -141,23 +143,80 @@ export async function POST(req: Request) {
   }
 
   // ---- template ------------------------------------------------------------
+  //
+  // ONE CLICK, NO QUESTIONS. The agent picks a template and it goes.
+  //
+  // WhatsApp requires exactly as many values as the approved body has {{n}}
+  // placeholders, and Interakt will not tell us that number until we try. So:
+  // send with our best guess, and if Interakt rejects it for the count, read
+  // the number out of its own error, refill from the same candidate list, and
+  // retry immediately. The agent sees a sent message, not a form.
   if (isTemplate) {
+    const templateName = body.templateName as string;
+
+    // Best-guess values in order: first name, then visa route, then the firm.
+    const candidates = (body.autoValues || []).filter((v) => typeof v === 'string');
+    const pad = (n: number): string[] =>
+      Array.from({ length: n }, (_, i) => (candidates[i] && candidates[i].trim()) || candidates[0] || 'Migrizo');
+
+    // What we know so far about this template's shape.
+    const { data: tplRow } = await admin
+      .from('relay_templates')
+      .select('id, body, variable_count')
+      .eq('workspace_id', workspaceId)
+      .eq('name', templateName)
+      .maybeSingle();
+
+    const known = tplRow?.variable_count ?? 0;
+    let values = body.templateValues && body.templateValues.length ? body.templateValues : pad(known);
+
+    /** The approved wording with values filled, for the thread record. */
+    const renderBody = (vals: string[]): string => {
+      if (tplRow?.body) {
+        return tplRow.body.replace(/\{\{\s*(\d+)\s*\}\}/g, (_m: string, n: string) => vals[Number(n) - 1] || '');
+      }
+      return `Template “${templateName}”${vals.filter(Boolean).length ? ' · ' + vals.filter(Boolean).join(' · ') : ''}`;
+    };
+
     const { data: msg } = await admin
       .from('relay_messages')
       .insert({
         workspace_id: workspaceId, conversation_id: conversationId, direction: 'out',
-        body: text || `[template: ${body.templateName}]`,
-        template_name: body.templateName, template_language: body.templateLanguage || null,
-        template_values: body.templateValues ? { bodyValues: body.templateValues } : null,
+        body: renderBody(values),
+        template_name: templateName, template_language: body.templateLanguage || null,
+        template_values: { bodyValues: values },
         status: 'queued', sent_by: user.id,
       })
       .select('id').single();
     if (!msg) return NextResponse.json({ ok: false, error: 'Could not save message.' }, { status: 500 });
 
-    const result = await sendTemplate({
-      phoneE164, templateName: body.templateName as string,
-      languageCode: body.templateLanguage, bodyValues: body.templateValues, callbackData: msg.id,
+    let result = await sendTemplate({
+      phoneE164, templateName,
+      languageCode: body.templateLanguage, bodyValues: values, callbackData: msg.id,
     });
+
+    // Wrong number of values? Interakt names the right one. Learn it and retry.
+    if (!result.ok) {
+      const m = /expected number of values (?:are|is)\s*(\d+)/i.exec(result.detail || '');
+      if (m) {
+        const required = Number(m[1]);
+        values = pad(required);
+        if (tplRow?.id) {
+          await admin.from('relay_templates')
+            .update({ variable_count: required, updated_at: new Date().toISOString() })
+            .eq('id', tplRow.id);
+        }
+        await admin.from('relay_messages')
+          .update({ body: renderBody(values), template_values: { bodyValues: values } })
+          .eq('id', msg.id);
+
+        result = await sendTemplate({
+          phoneE164, templateName,
+          languageCode: body.templateLanguage, bodyValues: values, callbackData: msg.id,
+        });
+      }
+    }
+
     await admin.from('relay_messages').update({
       status: result.ok ? 'sent' : 'failed',
       provider_msg_id: result.providerMsgId || null,
@@ -166,8 +225,10 @@ export async function POST(req: Request) {
       updated_at: new Date().toISOString(),
     }).eq('id', msg.id);
 
-    if (!result.ok) return NextResponse.json({ ok: false, messageId: msg.id, error: result.detail, code: result.code }, { status: 502 });
-    return NextResponse.json({ ok: true, messageId: msg.id, conversationId });
+    if (!result.ok) {
+      return NextResponse.json({ ok: false, messageId: msg.id, error: result.detail, code: result.code }, { status: 502 });
+    }
+    return NextResponse.json({ ok: true, messageId: msg.id, conversationId, valuesUsed: values });
   }
 
   // ---- media (one WhatsApp message per file, caption rides on the first) ---
@@ -198,7 +259,10 @@ export async function POST(req: Request) {
 
       let result;
       if (signErr || !signed?.signedUrl) {
-        result = { ok: false, code: 'sign_failed', detail: 'Could not create a link for the file.' };
+        // Surface the REAL Supabase error, not a generic string — the generic
+        // one made this bug undebuggable in the field.
+        console.error('[relay send] sign failed', { path: att.path, err: signErr });
+        result = { ok: false, code: 'sign_failed', detail: signErr?.message ? `Link error: ${signErr.message}` : 'Could not create a link for the file.' };
       } else {
         result = await sendMedia({
           phoneE164, mediaUrl: signed.signedUrl, mediaType: mType,
