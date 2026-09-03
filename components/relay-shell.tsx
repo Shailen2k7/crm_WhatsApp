@@ -197,24 +197,42 @@ export function RelayShell({
     if (initialLeads.length < 1000) return; // there is no second page
     let cancelled = false;
 
+    /** Wait for a moment the browser is not busy — never fetch mid-scroll. */
+    const idle = () => new Promise<void>((resolve) => {
+      const ric = (window as unknown as {
+        requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number;
+      }).requestIdleCallback;
+      if (ric) ric(() => resolve(), { timeout: 3000 });
+      else setTimeout(resolve, 600);
+    });
+
     (async () => {
-      // Collect every page FIRST, then update state once.
+      // THREE THINGS KEEP THIS OFF THE USER'S SCROLL:
       //
-      // Calling setLeads per page fired up to 40 re-renders of the whole shell,
-      // each re-running mergeContacts over thousands of leads and rebuilding
-      // the chat list — while the user was scrolling it. That was the stutter.
-      // One commit at the end costs the same data and none of the thrash.
+      // 1. Only the columns the chat list actually reads. The full row carries
+      //    `last_note` free text and a dozen other fields; over ~2,500 leads
+      //    that is megabytes of JSON, and every JSON.parse blocks the main
+      //    thread. The CRM panel fetches the complete lead on demand anyway.
+      // 2. Each page waits for an idle moment first, so a fetch never lands
+      //    while a finger is on the list.
+      // 3. One setState at the end, not one per page — otherwise the shell
+      //    re-renders (and re-merges thousands of contacts) up to 40 times.
+      const LIST_COLUMNS = 'id, workspace_id, full_name, phone, stage, visa_type, updated_at, created_at, is_sample';
+
       const collected: Lead[] = [];
       for (let page = 1; page < 40 && !cancelled; page++) {
+        await idle();
+        if (cancelled) return;
+
         const { data, error } = await supabase
           .from('leads')
-          .select(LEAD_COLUMNS)
+          .select(LIST_COLUMNS)
           .not('phone', 'is', null)
           .order('updated_at', { ascending: false })
           .range(page * 1000, page * 1000 + 999);
 
         if (error || !data || data.length === 0) break;
-        collected.push(...(data as Lead[]));
+        collected.push(...(data as unknown as Lead[]));
         if (data.length < 1000) break;
       }
 

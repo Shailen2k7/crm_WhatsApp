@@ -550,9 +550,6 @@ export function ChatPanel({
           flex: 1,
           overflowY: 'auto',
           WebkitOverflowScrolling: 'touch',
-          // Keeps a flick at either end from scrolling the page behind the
-          // thread, which on mobile reads as the scroll "sticking".
-          overscrollBehavior: 'contain',
           minHeight: 0,
           padding: '16px 0 6px',
           paddingInline: 'clamp(12px, 7%, 110px)',

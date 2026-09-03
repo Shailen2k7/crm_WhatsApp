@@ -36,7 +36,14 @@ export function CrmPanel({
 
   useEffect(() => {
     setFetched(null);
-    if (contact.lead || !contact.phoneE164) return;
+
+    // Leads that arrived through the background pages carry only the handful of
+    // columns the chat list needs — pulling the rest for thousands of rows was
+    // blocking the main thread mid-scroll. `email` is absent (not null) on such
+    // a row, which is how we tell a light row from a complete one, and that is
+    // the cue to fetch the full record for just this one person.
+    const isLightRow = !!contact.lead && !('email' in (contact.lead as object));
+    if ((contact.lead && !isLightRow) || !contact.phoneE164) return;
 
     let cancelled = false;
     setLooking(true);
@@ -44,7 +51,12 @@ export function CrmPanel({
       const last10 = contact.phoneE164!.replace(/\D/g, '').slice(-10);
       let row: Lead | null = null;
 
-      if (contact.conversation?.lead_id) {
+      // Straight to it when we already know which lead this is.
+      if (contact.lead?.id) {
+        const { data } = await supabase.from('leads').select('*').eq('id', contact.lead.id).maybeSingle();
+        row = (data as Lead) || null;
+      }
+      if (!row && contact.conversation?.lead_id) {
         const { data } = await supabase.from('leads').select('*').eq('id', contact.conversation.lead_id).maybeSingle();
         row = (data as Lead) || null;
       }
@@ -58,7 +70,8 @@ export function CrmPanel({
     return () => { cancelled = true; };
   }, [supabase, contact]);
 
-  const lead = contact.lead ?? fetched;
+  // The fetched row is the complete one; prefer it over a light list row.
+  const lead = fetched ?? contact.lead;
 
   if (!lead) {
     if (looking) {
@@ -253,6 +266,7 @@ export function CrmPanel({
 
 interface LeadSeqState {
   enrolled: boolean;
+  sequenceExists?: boolean;
   sequenceName?: string;
   sequenceRunning?: boolean;
   status?: 'active' | 'completed' | 'replied' | 'skipped' | 'stopped';
@@ -279,7 +293,7 @@ function LeadSequence({ phone }: { phone: string | null | undefined }) {
 
   useEffect(() => { load(); }, [load]);
 
-  async function act(action: 'pause' | 'resume' | 'remove' | 'send_next') {
+  async function act(action: 'pause' | 'resume' | 'remove' | 'send_next' | 'add') {
     if (!phone || busy) return;
     if (action === 'remove' && !confirm('Take this person out of the follow-up sequence?\n\nThey keep every message already sent; nothing further goes out.')) return;
     setBusy(true);
@@ -295,7 +309,33 @@ function LeadSequence({ phone }: { phone: string | null | undefined }) {
     setBusy(false);
   }
 
-  if (!state || !state.enrolled) return null;
+  if (!state) return null;
+
+  // NOT ENROLLED — the old build returned null here, which is why the card was
+  // invisible for everyone still queued behind the daily intake. You should be
+  // able to act on any lead, so offer to put them in.
+  if (!state.enrolled) {
+    if (!state.sequenceExists) return null;
+    return (
+      <Section title="Follow-up sequence">
+        <div style={{ fontSize: 12.2, color: 'var(--muted)', lineHeight: 1.6, marginBottom: 10 }}>
+          Not in the sequence yet — waiting their turn in the daily intake.
+          Add them to start the {state.totalSteps}-message follow-up now.
+        </div>
+        <button
+          onClick={() => act('add')}
+          disabled={busy}
+          style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 13px', borderRadius: 8,
+            border: '1px solid var(--green)', background: 'transparent', color: 'var(--green)',
+            fontSize: 12, fontWeight: 600, cursor: busy ? 'default' : 'pointer',
+          }}
+        >
+          {busy ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} Add to sequence
+        </button>
+      </Section>
+    );
+  }
 
   const paused = state.status === 'stopped';
   const active = state.status === 'active';
@@ -339,6 +379,9 @@ function LeadSequence({ phone }: { phone: string | null | undefined }) {
         {state.status === 'skipped' && `Skipped — ${state.exitReason}.`}
       </div>
 
+      {/* Controls for EVERY state, not just the active ones. A lead who replied
+          or was skipped still needs a way back in — previously this rendered
+          nothing at all for them, which looked like the feature was missing. */}
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
         {active && (
           <>
@@ -350,16 +393,23 @@ function LeadSequence({ phone }: { phone: string | null | undefined }) {
             </button>
           </>
         )}
-        {paused && (
-          <button onClick={() => act('resume')} disabled={busy} style={{ ...btn, borderColor: 'var(--green)', color: 'var(--green)' }}>
-            {busy ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} Resume
+
+        {/* paused by hand, opted out, replied, or skipped — all can go back in,
+            continuing from the step they reached rather than starting over. */}
+        {!active && !done && (
+          <button
+            onClick={() => act('resume')}
+            disabled={busy}
+            title={replied ? 'Put them back in the sequence, continuing from where they stopped' : 'Resume the follow-up'}
+            style={{ ...btn, borderColor: 'var(--green)', color: 'var(--green)' }}
+          >
+            {busy ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} {replied ? 'Restart follow-up' : 'Resume'}
           </button>
         )}
-        {(active || paused) && (
-          <button onClick={() => act('remove')} disabled={busy} style={{ ...btn, color: 'var(--red)' }}>
-            Remove
-          </button>
-        )}
+
+        <button onClick={() => act('remove')} disabled={busy} style={{ ...btn, color: 'var(--red)' }}>
+          {done ? 'Clear' : 'Remove'}
+        </button>
       </div>
 
       {active && state.sequenceRunning === false && (

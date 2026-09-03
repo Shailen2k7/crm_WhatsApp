@@ -4,6 +4,7 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { sendText, sendTemplate, sendMedia, windowState, isConfigured, mediaTypeFrom } from '@/lib/interakt';
 import { toE164 } from '@/lib/phone';
 import { runSequences } from '@/lib/sequence-engine';
+import { runCampaigns } from '@/lib/campaign-engine';
 import { RELAY_BUCKET } from '@/lib/files';
 
 export const runtime = 'nodejs';
@@ -180,12 +181,17 @@ export async function POST(req: NextRequest) {
   // The C1–C8 follow-up machine rides the same tick. Dry runs skip it —
   // its own page has live counters, and a dry run must never send.
   let sequences: Awaited<ReturnType<typeof runSequences>> = [];
+  let campaigns: Awaited<ReturnType<typeof runCampaigns>> = [];
   if (!dryRun) {
     try { sequences = await runSequences(admin); }
     catch (e) { console.error('[sequences] tick failed', e); }
+    // One-time blasts ride the same tick, in their own try so a bad campaign
+    // can never stop the follow-up machine.
+    try { campaigns = await runCampaigns(admin); }
+    catch (e) { console.error('[campaigns] tick failed', e); }
   }
 
-  return NextResponse.json({ ok: true, dryRun, report, sequences });
+  return NextResponse.json({ ok: true, dryRun, report, sequences, campaigns });
 }
 
 // ---------------------------------------------------------------------------

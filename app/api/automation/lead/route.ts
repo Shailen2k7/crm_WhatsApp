@@ -43,7 +43,24 @@ export async function GET(req: NextRequest) {
     .eq('workspace_id', a.ws)
     .eq('phone_e164', phone)
     .maybeSingle();
-  if (!row) return NextResponse.json({ ok: true, enrolled: false });
+
+  if (!row) {
+    // Not enrolled — but the panel still wants to offer "add them", and to say
+    // what they would receive, so report the sequence that exists.
+    const { data: seq } = await a.admin
+      .from('relay_sequences').select('id, name, status').eq('workspace_id', a.ws)
+      .order('created_at').limit(1).maybeSingle();
+    const { count } = await a.admin
+      .from('relay_sequence_steps').select('id', { count: 'exact', head: true })
+      .eq('sequence_id', seq?.id || '00000000-0000-0000-0000-000000000000');
+    return NextResponse.json({
+      ok: true, enrolled: false,
+      sequenceExists: !!seq,
+      sequenceName: seq?.name || null,
+      sequenceRunning: seq?.status === 'running',
+      totalSteps: count ?? 0,
+    });
+  }
 
   // How far through are they, and what is coming next?
   const [{ data: seq }, { data: steps }] = await Promise.all([
@@ -84,6 +101,28 @@ export async function POST(req: NextRequest) {
     .eq('workspace_id', a.ws)
     .eq('phone_e164', phone)
     .maybeSingle();
+
+  // Put someone into the sequence by hand, ahead of the daily intake queue.
+  if (action === 'add') {
+    if (row) return NextResponse.json({ ok: false, error: 'Already in the sequence.' }, { status: 400 });
+    const { data: seq } = await a.admin
+      .from('relay_sequences').select('id').eq('workspace_id', a.ws)
+      .order('created_at').limit(1).maybeSingle();
+    if (!seq) return NextResponse.json({ ok: false, error: 'No sequence exists yet.' }, { status: 404 });
+
+    const { data: lead } = await a.admin
+      .from('leads').select('id').eq('workspace_id', a.ws)
+      .or(`phone.eq.${phone},phone.like.%${phone.slice(-10)}`).limit(1).maybeSingle();
+
+    const { error } = await a.admin.from('relay_lead_sequences').insert({
+      workspace_id: a.ws, sequence_id: seq.id, lead_id: lead?.id ?? null,
+      phone_e164: phone, status: 'active', current_step: 0,
+      next_send_at: new Date().toISOString(),
+    });
+    if (error) return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
+    return NextResponse.json({ ok: true, status: 'active' });
+  }
+
   if (!row) return NextResponse.json({ ok: false, error: 'This person is not in the sequence.' }, { status: 404 });
 
   const now = new Date().toISOString();
