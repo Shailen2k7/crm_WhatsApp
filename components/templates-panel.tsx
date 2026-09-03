@@ -63,11 +63,29 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
     // "name | language | category", or just a bare template code on its own
     // line. Everything until the NEXT header belongs to that template's body.
     const lines = bulk.split('\n');
+
+    // Table noise from a dashboard copy-paste: status words, categories,
+    // language names, dates and row buttons. Never part of a body.
+    const NOISE = /^(approved|pending|rejected|draft|in review|marketing|utility|authentication|english|english \(us\)|edit|delete|duplicate|view|actions?|name|status|category|language|type)$/i;
+
     const isHeader = (ln: string): boolean => {
       const t = ln.trim();
-      if (!t) return false;
-      if (t.includes('|')) return /^[\w.-]+\s*\|/.test(t);       // name | en | CATEGORY
-      return /^[a-z0-9][\w.-]{0,40}$/i.test(t) && !/\s/.test(t);  // a bare code like "t2"
+      if (!t || NOISE.test(t)) return false;
+      if (t.includes('|')) return /^[\w.-]+\s*\|/.test(t);        // name | en | CATEGORY
+      if (t.includes('\t')) return /^[a-z0-9][\w.-]{0,40}\t/i.test(t); // name<TAB>UTILITY<TAB>Approved
+      return /^[a-z0-9][\w.-]{0,40}$/i.test(t) && !/\s/.test(t);   // a bare code like "t2"
+    };
+
+    /** Splits a header into name / language / category, whatever the separator. */
+    const readHeader = (ln: string) => {
+      const parts = ln.trim().split(/\s*[|\t]\s*/).filter(Boolean);
+      const name = parts[0];
+      const rest = parts.slice(1);
+      const lang = rest.find((x) => /^[a-z]{2}(_[A-Z]{2})?$/.test(x))
+        || (rest.some((x) => /^english/i.test(x)) ? 'en' : '')
+        || 'en';
+      const cat = rest.find((x) => /^(marketing|utility|authentication)$/i.test(x))?.toUpperCase() || null;
+      return { name, language: lang, category: cat };
     };
 
     const rows: { workspace_id: string; name: string; language: string; category: string | null; body: string; variable_count: number }[] = [];
@@ -92,10 +110,10 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
     for (const ln of lines) {
       if (isHeader(ln)) {
         flush();
-        const parts = ln.split('|').map((x) => x.trim());
-        cur = { name: parts[0], language: parts[1] || 'en', category: parts[2] || null, body: [] };
+        const h = readHeader(ln);
+        cur = { name: h.name, language: h.language, category: h.category, body: [] };
       } else if (cur) {
-        cur.body.push(ln);
+        if (!NOISE.test(ln.trim())) cur.body.push(ln);
       }
     }
     flush();
@@ -222,7 +240,7 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
             <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
               <button onClick={syncFromInterakt} disabled={syncing} style={ghostBtn}>
                 {syncing ? <Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> : <RefreshCw size={14} />}
-                Sync from Interakt
+                Sync approved templates
               </button>
               <button onClick={() => { setBulkOpen((v) => !v); setBulkNote(null); }} style={ghostBtn}>
                 <ClipboardPaste size={14} /> Paste many
@@ -233,11 +251,33 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
             </div>
           )}
         </div>
-        <p style={{ fontSize: 13, color: 'var(--muted)', margin: '0 0 22px', lineHeight: 1.55 }}>
-          Register each template exactly as approved in Interakt (Templates → the code name in the URL).
-          They appear behind the template button in every chat, and they are the only messages WhatsApp
-          allows when the 24-hour window is closed.
+        <p style={{ fontSize: 13, color: 'var(--muted)', margin: '0 0 16px', lineHeight: 1.55 }}>
+          Every template here appears behind the template button in each chat, ready to send in one tap —
+          the customer&rsquo;s first name is filled in automatically. These are the only messages WhatsApp
+          allows once the 24-hour window has closed.
         </p>
+
+        {/* How to get them in automatically. Interakt's list API has been
+            returning HTTP 500 for months, so Meta is the route that works. */}
+        <details style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, padding: '12px 14px', marginBottom: 18 }}>
+          <summary style={{ fontSize: 12.8, fontWeight: 600, color: 'var(--ink)', cursor: 'pointer' }}>
+            Make &ldquo;Sync approved templates&rdquo; pull everything automatically
+          </summary>
+          <div style={{ fontSize: 12.3, color: 'var(--muted)', lineHeight: 1.7, marginTop: 10 }}>
+            Interakt&rsquo;s template list API has been returning an error for months (their bug — sending
+            works fine), so we ask Meta directly instead. One-time setup:
+            <ol style={{ margin: '9px 0 0', paddingLeft: 20 }}>
+              <li>Open <strong>business.facebook.com</strong> &rarr; Settings &rarr; Users &rarr; System users</li>
+              <li>Add a system user, then <strong>Generate token</strong> with the
+                  <strong> whatsapp_business_management</strong> permission</li>
+              <li>In Netlify, add <code>META_ACCESS_TOKEN</code> with that token, and redeploy</li>
+            </ol>
+            <div style={{ marginTop: 9 }}>
+              After that this button imports every approved template — names, wording and placeholders —
+              and re-importing keeps them current. Until then, use <strong>Paste many</strong>.
+            </div>
+          </div>
+        </details>
 
         {syncNote && (
           <div style={{ background: 'var(--amber-bg)', color: 'var(--ink)', padding: '11px 13px', borderRadius: 10, fontSize: 12.3, lineHeight: 1.55, marginBottom: 14 }}>
@@ -256,8 +296,10 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
               style={{ ...input, resize: 'vertical', lineHeight: 1.55, fontFamily: 'ui-monospace, SFMono-Regular, monospace', fontSize: 12.5 }}
             />
             <div style={{ fontSize: 11.5, color: 'var(--muted)', margin: '7px 0 12px', lineHeight: 1.55 }}>
-              First line: <strong>code name | language | category</strong> — the code name is the URL segment in
-              Interakt between <code>template/</code> and <code>/view</code>. Everything after it is the approved body.
+              Each template starts with a header line — <strong>code name | language | category</strong>, or just the
+              code name on its own line. Everything until the next header is the approved body, blank lines and all.
+              You can also select the template table in Interakt and paste it straight in: the row headings,
+              &ldquo;Approved&rdquo; labels and category columns are ignored automatically.
             </div>
             {bulkNote && <div style={{ color: 'var(--red)', fontSize: 12.5, fontWeight: 500, marginBottom: 10 }}>{bulkNote}</div>}
             <div style={{ display: 'flex', gap: 8 }}>

@@ -195,6 +195,29 @@ export async function POST(req: Request) {
       languageCode: body.templateLanguage, bodyValues: values, callbackData: msg.id,
     });
 
+    // Name not recognised? Interakt's dashboard displays template names in
+    // upper case while Meta stores them lower case, so a name copied off the
+    // screen can be right in spirit and wrong on the wire. Try the other case
+    // once, and remember the spelling that worked.
+    if (!result.ok && /no approved template found/i.test(result.detail || '')) {
+      const alt = templateName === templateName.toLowerCase() ? templateName.toUpperCase() : templateName.toLowerCase();
+      if (alt !== templateName) {
+        const retry = await sendTemplate({
+          phoneE164, templateName: alt,
+          languageCode: body.templateLanguage, bodyValues: values, callbackData: msg.id,
+        });
+        if (retry.ok) {
+          result = retry;
+          if (tplRow?.id) {
+            await admin.from('relay_templates')
+              .update({ name: alt, updated_at: new Date().toISOString() })
+              .eq('id', tplRow.id);
+          }
+          await admin.from('relay_messages').update({ template_name: alt }).eq('id', msg.id);
+        }
+      }
+    }
+
     // Wrong number of values? Interakt names the right one. Learn it and retry.
     if (!result.ok) {
       const m = /expected number of values (?:are|is)\s*(\d+)/i.exec(result.detail || '');
