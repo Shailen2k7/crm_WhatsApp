@@ -32,6 +32,7 @@ interface Stats {
   replied: number; skipped: number; stopped: number;
   enrolledToday: number; intakeLimit: number; sentToday: number; rampDay: number;
   delivery: { sent: number; delivered: number; read: number; failed: number };
+  failures?: { code: string; detail: string; hits: number }[];
 }
 interface Activity {
   id: string; lead_name: string; step_no: number; template_name: string;
@@ -287,6 +288,27 @@ export function SequencePanel({ templates }: { templates: RelayTemplate[] }) {
         {d.sent === 0 ? 'Receipts appear here as soon as the first messages go out.'
           : `${deliveredPct}% of sent messages reached the phone · ${readPct}% were read.`}
       </div>
+
+      {/* A bounce count on its own tells you nothing. Meta's 131049 means the
+          marketing frequency cap — slow down or move to UTILITY templates —
+          which is a different problem from a dead number. */}
+      {!!stats.failures?.length && (
+        <div style={{ marginTop: 12, borderTop: '1px solid var(--line)', paddingTop: 11 }}>
+          <div style={{ fontSize: 11.6, fontWeight: 700, color: 'var(--ink)', marginBottom: 7 }}>Why they bounced</div>
+          <div style={{ display: 'grid', gap: 6 }}>
+            {stats.failures.map((f) => (
+              <div key={f.code + f.detail} style={{ display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 11.5, lineHeight: 1.5 }}>
+                <span style={{ fontWeight: 700, color: 'var(--red)', flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}>{f.hits}×</span>
+                <span style={{ color: 'var(--muted)' }}>
+                  {/^131049$/.test(f.code)
+                    ? 'Meta held it back — this person has had too many marketing messages lately. Slow the daily rate, or use a UTILITY template.'
+                    : f.detail}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </section>
   );
 
@@ -318,20 +340,21 @@ export function SequencePanel({ templates }: { templates: RelayTemplate[] }) {
               <option value="">— template —</option>
               {templates.map((t) => <option key={t.id} value={t.name}>{t.name}</option>)}
             </select>
-            {i === 0 ? (
-              <span style={{ fontSize: 12, color: 'var(--muted)' }}>on the day they join</span>
-            ) : (
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, fontSize: 12, color: 'var(--muted)' }}>
-                <input
-                  type="number" min={1} max={90} style={numInput} value={stp.gap_days}
-                  onChange={(e) => {
-                    const next = steps.map((x, j) => j === i ? { ...x, gap_days: Math.max(1, Number(e.target.value) || 1) } : x);
-                    setSteps(next); queueSave({ steps: next });
-                  }}
-                />
-                day{stp.gap_days === 1 ? '' : 's'} later
-              </span>
-            )}
+            {/* Step 1 is schedulable too: a lead already gets the new-lead
+                message on arrival, so C1 usually wants a day or two of air. */}
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, fontSize: 12, color: 'var(--muted)' }}>
+              <input
+                type="number" min={i === 0 ? 0 : 1} max={90} style={numInput} value={stp.gap_days}
+                onChange={(e) => {
+                  const floor = i === 0 ? 0 : 1;
+                  const next = steps.map((x, j) => j === i ? { ...x, gap_days: Math.max(floor, Number(e.target.value) || floor) } : x);
+                  setSteps(next); queueSave({ steps: next });
+                }}
+              />
+              {i === 0
+                ? (stp.gap_days === 0 ? 'days after they join (same day)' : `day${stp.gap_days === 1 ? '' : 's'} after they join`)
+                : `day${stp.gap_days === 1 ? '' : 's'} later`}
+            </span>
             <button
               onClick={() => { const next = steps.filter((_, j) => j !== i); setSteps(next); queueSave({ steps: next }); }}
               aria-label={`Remove message ${i + 1}`}

@@ -90,8 +90,9 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
       .gte('enrolled_at', dayStartIst);
     let room = Math.max(0, limit - (enrolledToday ?? 0));
 
+    const stages = seq.audience === 'both' ? ['cold', 'hot'] : [seq.audience];
+
     if (room > 0) {
-      const stages = seq.audience === 'both' ? ['cold', 'hot'] : [seq.audience];
       // OLDEST FIRST — the whole point: every lead is eventually covered.
       const { data: leads } = await admin
         .from('leads')
@@ -109,6 +110,11 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
       const donePhones = new Set((already || []).map((a) => a.phone_e164));
       const stopPhones = new Set((suppressed || []).map((s) => s.phone_e164));
 
+      // Step 1 has a gap like any other step. A lead already gets the new-lead
+      // message on the day they arrive, so firing C1 the same day would be two
+      // messages in one morning — this lets C1 wait a couple of days.
+      const firstGapMs = ((steps as Step[])[0]?.gap_days ?? 0) * 86_400_000;
+
       for (const lead of leads || []) {
         if (room <= 0) break;
         if (lead.is_sample || doneLeads.has(lead.id)) continue;
@@ -118,7 +124,7 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
         const { error } = await admin.from('relay_lead_sequences').insert({
           workspace_id: ws, sequence_id: seq.id, lead_id: lead.id,
           phone_e164: phone, status: 'active', current_step: 0,
-          next_send_at: new Date().toISOString(),
+          next_send_at: new Date(Date.now() + firstGapMs).toISOString(),
         });
         if (!error) { donePhones.add(phone); room--; report.enrolled++; }
       }
@@ -150,6 +156,21 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
         }).eq('id', row.id);
         report.completed++;
         continue;
+      }
+
+      // Did this lead move out of the audience since enrolling? Someone who
+      // has turned hot, converted, or been marked junk should not keep getting
+      // cold follow-ups — that is the embarrassing kind of automation.
+      if (row.lead_id) {
+        const { data: cur } = await admin.from('leads').select('stage').eq('id', row.lead_id).maybeSingle();
+        if (cur && !stages.includes(cur.stage)) {
+          await admin.from('relay_lead_sequences').update({
+            status: 'stopped', exit_reason: `stage changed to ${cur.stage}`,
+            exited_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+          }).eq('id', row.id);
+          report.skipped.push(`${row.phone_e164}: now ${cur.stage}`);
+          continue;
+        }
       }
 
       // A STOP that arrived after enrolment still wins.

@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { ExternalLink, FileDown, Mail, Phone, Calendar, Tag, Briefcase, UserCircle, X, Loader2 } from 'lucide-react';
+import { ExternalLink, FileDown, Mail, Phone, Calendar, Tag, Briefcase, UserCircle, X, Loader2, Pause, Play, Workflow } from 'lucide-react';
 import type { Lead } from '@/lib/types';
 import { getStageMeta, getVisaMeta } from '@/lib/types';
 import type { Contact } from '@/lib/contacts';
@@ -183,6 +183,10 @@ export function CrmPanel({
         </Section>
       )}
 
+      {/* Where this person is in the follow-up sequence, and the controls to
+          pause or resume it for THEM without touching anyone else. */}
+      <LeadSequence phone={contact.phoneE164 || lead.phone} />
+
       {/* Latest note */}
       {lead.last_note && (
         <Section title="Latest note">
@@ -243,6 +247,127 @@ export function CrmPanel({
         </a>
       </div>
     </aside>
+  );
+}
+
+
+interface LeadSeqState {
+  enrolled: boolean;
+  sequenceName?: string;
+  sequenceRunning?: boolean;
+  status?: 'active' | 'completed' | 'replied' | 'skipped' | 'stopped';
+  currentStep?: number;
+  totalSteps?: number;
+  nextTemplate?: string | null;
+  nextSendAt?: string | null;
+  exitReason?: string | null;
+}
+
+/** The follow-up sequence, for one person. */
+function LeadSequence({ phone }: { phone: string | null | undefined }) {
+  const [state, setState] = useState<LeadSeqState | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    if (!phone) { setState({ enrolled: false }); return; }
+    try {
+      const r = await fetch(`/api/automation/lead?phone=${encodeURIComponent(phone)}`);
+      const j = await r.json();
+      setState(j.ok ? j : { enrolled: false });
+    } catch { setState({ enrolled: false }); }
+  }, [phone]);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function act(action: 'pause' | 'resume' | 'remove' | 'send_next') {
+    if (!phone || busy) return;
+    if (action === 'remove' && !confirm('Take this person out of the follow-up sequence?\n\nThey keep every message already sent; nothing further goes out.')) return;
+    setBusy(true);
+    try {
+      const r = await fetch('/api/automation/lead', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone, action }),
+      });
+      const j = await r.json();
+      if (!j.ok) alert(j.error || 'Could not do that.');
+      await load();
+    } catch { alert('Could not reach the server.'); }
+    setBusy(false);
+  }
+
+  if (!state || !state.enrolled) return null;
+
+  const paused = state.status === 'stopped';
+  const active = state.status === 'active';
+  const done = state.status === 'completed';
+  const replied = state.status === 'replied';
+
+  const TONE: Record<string, { label: string; bg: string; fg: string }> = {
+    active:    { label: 'Active',    bg: 'var(--green-bg)',  fg: 'var(--green)' },
+    stopped:   { label: 'Paused',    bg: 'var(--amber-bg)',  fg: '#B45309' },
+    completed: { label: 'Finished',  bg: 'var(--surface-3)', fg: 'var(--muted)' },
+    replied:   { label: 'Replied',   bg: 'var(--teal-bg)',   fg: 'var(--teal-ink)' },
+    skipped:   { label: 'Skipped',   bg: 'var(--red-bg)',    fg: 'var(--red)' },
+  };
+  const tone = TONE[state.status || 'active'] || TONE.active;
+
+  const btn: React.CSSProperties = {
+    display: 'inline-flex', alignItems: 'center', gap: 5, padding: '6px 11px', borderRadius: 8,
+    border: '1px solid var(--line)', background: 'var(--surface)', color: 'var(--ink)',
+    fontSize: 11.8, fontWeight: 600, cursor: busy ? 'default' : 'pointer',
+  };
+
+  return (
+    <Section title="Follow-up sequence">
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 7 }}>
+        <Workflow size={13} style={{ color: 'var(--green)', flex: 'none' }} />
+        <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink-2)' }}>
+          Message {Math.min((state.currentStep || 0) + (active ? 1 : 0), state.totalSteps || 0) || state.currentStep} of {state.totalSteps}
+        </span>
+        <span style={{ marginLeft: 'auto', fontSize: 10.5, fontWeight: 700, padding: '3px 9px', borderRadius: 99, background: tone.bg, color: tone.fg }}>
+          {tone.label}
+        </span>
+      </div>
+
+      <div style={{ fontSize: 11.6, color: 'var(--muted)', lineHeight: 1.6, marginBottom: 10 }}>
+        {replied  && 'They answered, so the sequence stopped for them.'}
+        {done     && 'They received every message.'}
+        {paused   && (state.exitReason?.includes('hand') ? 'Paused — nothing further goes out until you resume.' : `Stopped — ${state.exitReason}.`)}
+        {active   && (state.nextSendAt
+          ? <>Next: <b style={{ color: 'var(--ink-2)' }}>{state.nextTemplate}</b> on {fmtDate(state.nextSendAt)}</>
+          : 'Waiting for the next message.')}
+        {state.status === 'skipped' && `Skipped — ${state.exitReason}.`}
+      </div>
+
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+        {active && (
+          <>
+            <button onClick={() => act('pause')} disabled={busy} style={btn}>
+              {busy ? <Loader2 size={12} className="animate-spin" /> : <Pause size={12} />} Pause
+            </button>
+            <button onClick={() => act('send_next')} disabled={busy} style={btn} title="Send the next message on the next check instead of waiting">
+              Send next now
+            </button>
+          </>
+        )}
+        {paused && (
+          <button onClick={() => act('resume')} disabled={busy} style={{ ...btn, borderColor: 'var(--green)', color: 'var(--green)' }}>
+            {busy ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} Resume
+          </button>
+        )}
+        {(active || paused) && (
+          <button onClick={() => act('remove')} disabled={busy} style={{ ...btn, color: 'var(--red)' }}>
+            Remove
+          </button>
+        )}
+      </div>
+
+      {active && state.sequenceRunning === false && (
+        <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 8 }}>
+          The sequence itself is not running, so nothing sends right now.
+        </div>
+      )}
+    </Section>
   );
 }
 

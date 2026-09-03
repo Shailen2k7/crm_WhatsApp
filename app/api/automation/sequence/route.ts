@@ -52,7 +52,7 @@ export async function GET() {
       .eq('sequence_id', seq.id).eq('status', st));
 
   const [steps, ramp, audienceTotal, enrolledTotal, active, completed, replied, skipped, stopped,
-         enrolledToday, sentToday, sends, delivery] = await Promise.all([
+         enrolledToday, sentToday, sends, delivery, failures] = await Promise.all([
     admin.from('relay_sequence_steps').select('*').eq('sequence_id', seq.id).order('step_no').then((r) => r.data || []),
     admin.from('relay_sequence_ramp').select('*').eq('sequence_id', seq.id).order('stage_no').then((r) => r.data || []),
     count(admin.from('leads').select('id', { count: 'exact', head: true })
@@ -68,6 +68,9 @@ export async function GET() {
     // Receipts rolled up across every send this sequence has made (113).
     admin.rpc('relay_sequence_delivery', { p_sequence_id: seq.id })
       .then((r) => (Array.isArray(r.data) ? r.data[0] : r.data) || { sent: 0, delivered: 0, read: 0, failed: 0 }),
+    // Why messages bounced, so the number is actionable rather than alarming.
+    admin.rpc('relay_sequence_failures', { p_sequence_id: seq.id })
+      .then((r) => (Array.isArray(r.data) ? r.data : []) as { code: string; detail: string; hits: number }[]),
   ]);
 
   // Names for the activity list.
@@ -101,6 +104,9 @@ export async function GET() {
         read: Number(delivery.read) || 0,
         failed: Number(delivery.failed) || 0,
       },
+      failures: (failures || []).map((f) => ({
+        code: f.code, detail: f.detail, hits: Number(f.hits) || 0,
+      })),
     },
     activity: sends.map((s) => ({
       ...s, lead_name: (s.lead_id && names[s.lead_id]) || s.phone_e164,
