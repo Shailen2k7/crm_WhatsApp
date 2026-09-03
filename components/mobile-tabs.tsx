@@ -11,16 +11,31 @@
 // It hides while a chat is open: the conversation then owns the whole screen,
 // and the back arrow in the header is the way out.
 // =============================================================================
-import { MessageSquare, Users, FileText, Zap, Settings } from 'lucide-react';
+import { useState } from 'react';
+import {
+  MessageSquare, Users, FileText, Zap, Menu, X, Star, LayoutTemplate,
+  Workflow, User, Settings, ExternalLink,
+} from 'lucide-react';
 import type { RailKey } from './rail';
 
+// The four destinations a thumb reaches all day. Everything else lives one tap
+// away behind the ☰ sheet — nothing on the desktop rail is missing on a phone.
 const TABS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
   { key: 'chat', label: 'Chats', Icon: MessageSquare },
   { key: 'contacts', label: 'Contacts', Icon: Users },
   { key: 'files', label: 'Files', Icon: FileText },
   { key: 'quickreplies', label: 'Replies', Icon: Zap },
-  { key: 'settings', label: 'Settings', Icon: Settings },
 ];
+
+const MENU_ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare; hint: string }[] = [
+  { key: 'starred', label: 'Spotlight', Icon: Star, hint: 'Starred chats' },
+  { key: 'templates', label: 'Templates', Icon: LayoutTemplate, hint: 'Approved messages' },
+  { key: 'automation', label: 'Automation', Icon: Workflow, hint: 'New lead & follow-ups' },
+  { key: 'team', label: 'Team', Icon: User, hint: 'Who is on Migrizo' },
+  { key: 'settings', label: 'Settings', Icon: Settings, hint: 'Account & notifications' },
+];
+
+const CRM_URL = 'https://crm.migrizo.com';
 
 export function MobileTabs({
   active,
@@ -31,7 +46,93 @@ export function MobileTabs({
   onSelect: (k: RailKey) => void;
   unread: number;
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuActive = MENU_ITEMS.some((m) => m.key === active);
+
   return (
+    <>
+    {/* ── the ☰ sheet: every remaining destination, one tap away ────────── */}
+    {menuOpen && (
+      <div
+        onClick={() => setMenuOpen(false)}
+        style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)', zIndex: 40, animation: 'fade-in .15s ease' }}
+      >
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="animate-sheet-up"
+          style={{
+            position: 'absolute', left: 0, right: 0, bottom: 0,
+            background: 'var(--surface)', borderRadius: '20px 20px 0 0',
+            border: '1px solid var(--line)', borderBottom: 'none',
+            padding: '10px 16px calc(18px + env(safe-area-inset-bottom))',
+            boxShadow: '0 -12px 40px rgba(0,0,0,.25)',
+          }}
+        >
+          {/* grab handle */}
+          <div style={{ width: 40, height: 4, borderRadius: 2, background: 'var(--line)', margin: '2px auto 12px' }} />
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+            <span style={{ fontSize: 15, fontWeight: 800, color: 'var(--ink)' }}>Menu</span>
+            <button
+              onClick={() => setMenuOpen(false)}
+              aria-label="Close menu"
+              style={{ width: 32, height: 32, borderRadius: 10, border: 0, background: 'var(--surface-2)', color: 'var(--muted)', display: 'grid', placeItems: 'center', cursor: 'pointer' }}
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            {MENU_ITEMS.map(({ key, label, Icon, hint }) => {
+              const on = active === key;
+              return (
+                <button
+                  key={key}
+                  onClick={() => { setMenuOpen(false); onSelect(key); }}
+                  aria-current={on ? 'page' : undefined}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 12, textAlign: 'left',
+                    padding: '13px 14px', borderRadius: 14, cursor: 'pointer',
+                    border: '1px solid ' + (on ? 'var(--teal)' : 'var(--line)'),
+                    background: on ? 'var(--teal-bg)' : 'var(--bg)',
+                  }}
+                >
+                  <span style={{
+                    width: 38, height: 38, borderRadius: 11, display: 'grid', placeItems: 'center', flex: 'none',
+                    background: on ? 'var(--teal)' : 'var(--surface-2)', color: on ? '#fff' : 'var(--teal)',
+                  }}>
+                    <Icon size={18} />
+                  </span>
+                  <span style={{ minWidth: 0 }}>
+                    <span style={{ display: 'block', fontSize: 13.5, fontWeight: 700, color: 'var(--ink)' }}>{label}</span>
+                    <span style={{ display: 'block', fontSize: 11, color: 'var(--muted)', marginTop: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{hint}</span>
+                  </span>
+                </button>
+              );
+            })}
+
+            {/* Jump back to the main CRM, same as the rail's shortcut. */}
+            <a
+              href={CRM_URL}
+              target="_blank"
+              rel="noreferrer"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 12, textDecoration: 'none',
+                padding: '13px 14px', borderRadius: 14, border: '1px solid var(--line)', background: 'var(--bg)',
+              }}
+            >
+              <span style={{ width: 38, height: 38, borderRadius: 11, display: 'grid', placeItems: 'center', flex: 'none', background: 'var(--surface-2)', color: 'var(--teal)' }}>
+                <ExternalLink size={18} />
+              </span>
+              <span>
+                <span style={{ display: 'block', fontSize: 13.5, fontWeight: 700, color: 'var(--ink)' }}>Open CRM</span>
+                <span style={{ display: 'block', fontSize: 11, color: 'var(--muted)', marginTop: 1 }}>crm.migrizo.com</span>
+              </span>
+            </a>
+          </div>
+        </div>
+      </div>
+    )}
+
     <nav
       style={{
         display: 'flex',
@@ -98,7 +199,23 @@ export function MobileTabs({
           </button>
         );
       })}
+
+      {/* ── ☰ More — everything else ──────────────────────────────────────── */}
+      <button
+        onClick={() => setMenuOpen((v) => !v)}
+        aria-label="More options"
+        aria-expanded={menuOpen}
+        style={{
+          flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+          gap: 3, padding: '9px 0 7px', border: 0, background: 'transparent',
+          color: menuActive || menuOpen ? 'var(--teal)' : 'var(--muted)', cursor: 'pointer', minHeight: 54,
+        }}
+      >
+        <Menu size={21} strokeWidth={menuActive || menuOpen ? 2.2 : 1.7} />
+        <span style={{ fontSize: 10.5, fontWeight: menuActive || menuOpen ? 700 : 500, letterSpacing: '.01em' }}>Menu</span>
+      </button>
     </nav>
+    </>
   );
 }
 

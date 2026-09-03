@@ -15,6 +15,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { Workflow, Loader2, Play, ShieldCheck, ChevronDown } from 'lucide-react';
 import type { QuickReply, RelayTemplate } from '@/lib/messages';
+import { SequencePanel } from './sequence-panel';
 
 interface Rule {
   id: string;
@@ -22,20 +23,9 @@ interface Rule {
   quick_reply_shortcut: string | null;
   template_name: string | null;
   template_language: string;
-  delay_minutes: number;
+  delay_seconds: number;
   daily_cap: number;
   activated_at: string | null;
-}
-
-interface SentRow {
-  id: string;
-  lead_id: string | null;
-  phone_e164: string;
-  method: string | null;
-  detail: string | null;
-  ok: boolean;
-  error: string | null;
-  sent_at: string;
 }
 
 export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
@@ -43,31 +33,20 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
   const [rule, setRule] = useState<Rule | null>(null);
   const [quickReplies, setQuickReplies] = useState<QuickReply[]>([]);
   const [templates, setTemplates] = useState<RelayTemplate[]>([]);
-  const [log, setLog] = useState<SentRow[]>([]);
-  const [names, setNames] = useState<Record<string, string>>({});
   const [running, setRunning] = useState(false);
   const [runNote, setRunNote] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [tab, setTab] = useState<'newlead' | 'sequence'>('newlead');
 
   const load = useCallback(async () => {
-    const [r, qr, tp, lg] = await Promise.all([
+    const [r, qr, tp] = await Promise.all([
       supabase.from('relay_automations').select('*').eq('workspace_id', workspaceId).eq('key', 'new_lead_first').maybeSingle(),
       supabase.from('relay_quick_replies').select('*').eq('workspace_id', workspaceId).order('sort_order'),
       supabase.from('relay_templates').select('*').eq('workspace_id', workspaceId).order('sort_order'),
-      supabase.from('relay_automation_sent').select('*').eq('workspace_id', workspaceId).order('sent_at', { ascending: false }).limit(25),
     ]);
     if (r.data) setRule(r.data as Rule);
     if (qr.data) setQuickReplies(qr.data as QuickReply[]);
     if (tp.data) setTemplates(tp.data as RelayTemplate[]);
-    const rows = (lg.data || []) as SentRow[];
-    setLog(rows);
-    const ids = [...new Set(rows.map((x) => x.lead_id).filter(Boolean))] as string[];
-    if (ids.length) {
-      const { data: leads } = await supabase.from('leads').select('id, full_name').in('id', ids);
-      const m: Record<string, string> = {};
-      (leads || []).forEach((l) => { m[l.id] = l.full_name; });
-      setNames(m);
-    }
   }, [supabase, workspaceId]);
 
   useEffect(() => { load(); }, [load]);
@@ -124,10 +103,30 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
 
   return (
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg)' }}>
-      <div style={{ maxWidth: 700, margin: '0 auto', padding: '26px 20px 60px' }}>
-        <h1 style={{ fontSize: 19, fontWeight: 700, color: 'var(--ink)', margin: '0 0 22px', display: 'flex', alignItems: 'center', gap: 9 }}>
+      <div style={{ maxWidth: 1160, margin: '0 auto', padding: '26px 20px 60px' }}>
+        <h1 style={{ fontSize: 19, fontWeight: 700, color: 'var(--ink)', margin: '0 0 14px', display: 'flex', alignItems: 'center', gap: 9 }}>
           <Workflow size={19} style={{ color: 'var(--green)' }} /> Automation
         </h1>
+
+        {/* the two machines, one tab each */}
+        <div style={{ display: 'inline-flex', background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 11, padding: 3, marginBottom: 18, boxShadow: 'var(--shadow)' }}>
+          {([['newlead', 'New lead'], ['sequence', 'Follow-up sequence']] as const).map(([k, lbl]) => (
+            <button
+              key={k}
+              onClick={() => setTab(k)}
+              style={{
+                padding: '7px 16px', borderRadius: 9, border: 'none', fontSize: 12.8, fontWeight: 600, cursor: 'pointer',
+                background: tab === k ? 'var(--green)' : 'transparent',
+                color: tab === k ? '#fff' : 'var(--muted)',
+                transition: 'background .15s, color .15s',
+              }}
+            >
+              {lbl}
+            </button>
+          ))}
+        </div>
+
+        {tab === 'sequence' ? <SequencePanel templates={templates} /> : (<>
 
         {/* ── THE SWITCH ─────────────────────────────────────────────────── */}
         <section className="animate-pop-in" style={{ ...card, padding: 22 }}>
@@ -146,7 +145,7 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
               aria-label={rule.enabled ? 'Turn off' : 'Turn on'}
               style={{
                 width: 52, height: 30, borderRadius: 15, border: 'none', cursor: 'pointer', flexShrink: 0,
-                background: rule.enabled ? 'var(--green)' : 'var(--line)', position: 'relative', transition: 'background .18s',
+                background: rule.enabled ? 'var(--green)' : 'var(--track)', position: 'relative', transition: 'background .18s',
               }}
             >
               <span style={{
@@ -158,7 +157,7 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
 
           <div style={{
             marginTop: 16, padding: '10px 13px', borderRadius: 10,
-            background: rule.enabled ? 'var(--green-bg, rgba(37,211,102,.10))' : 'var(--bg)',
+            background: rule.enabled ? 'var(--green-bg)' : 'var(--bg)',
             border: '1px solid var(--line)',
             fontSize: 12.8, fontWeight: 600, color: rule.enabled ? 'var(--green)' : 'var(--muted)',
           }}>
@@ -234,8 +233,10 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
           <section style={card}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: 'var(--ink)' }}>
               <span>Wait</span>
-              <select style={select} value={rule.delay_minutes} onChange={(e) => patch({ delay_minutes: Number(e.target.value) })}>
-                {[0, 2, 5, 10, 30].map((m) => <option key={m} value={m}>{m === 0 ? 'no time' : `${m} minutes`}</option>)}
+              <select style={select} value={rule.delay_seconds} onChange={(e) => patch({ delay_seconds: Number(e.target.value) })}>
+                {[10, 30, 60].map((sec) => (
+                  <option key={sec} value={sec}>{sec < 60 ? `${sec} seconds` : '1 minute'}</option>
+                ))}
               </select>
               <span style={{ color: 'var(--muted)' }}>after the lead arrives, in case they message us first.</span>
             </div>
@@ -249,41 +250,29 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
           </section>
         )}
 
-        {/* ── activity ───────────────────────────────────────────────────── */}
-        <section style={card}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 14 }}>
-            <div style={{ fontSize: 13.8, fontWeight: 700, color: 'var(--ink)' }}>Sent by automation</div>
-            <button
-              onClick={runNow}
-              disabled={running}
-              title="Check for new leads right now instead of waiting for the next 2-minute check"
-              style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 12px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', color: 'var(--ink)', fontSize: 12.5, fontWeight: 600, cursor: 'pointer' }}
-            >
-              {running ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />} Check now
-            </button>
-          </div>
-
-          {runNote && (
-            <pre style={{ whiteSpace: 'pre-wrap', fontFamily: 'inherit', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, padding: '10px 12px', fontSize: 12.4, color: 'var(--ink)', lineHeight: 1.6, margin: '0 0 14px' }}>{runNote}</pre>
-          )}
-
-          {log.length === 0 ? (
-            <div style={{ fontSize: 12.5, color: 'var(--muted)' }}>Nothing sent yet.</div>
-          ) : (
-            <div style={{ display: 'grid', gap: 9 }}>
-              {log.map((row) => (
-                <div key={row.id} style={{ display: 'flex', alignItems: 'baseline', gap: 10, fontSize: 12.6, lineHeight: 1.5, borderBottom: '1px solid var(--line)', paddingBottom: 9 }}>
-                  <span style={{ color: row.ok ? 'var(--green)' : 'var(--red)', fontWeight: 700, flexShrink: 0 }}>{row.ok ? '✓' : '✕'}</span>
-                  <span style={{ color: 'var(--ink)', fontWeight: 600 }}>{(row.lead_id && names[row.lead_id]) || row.phone_e164}</span>
-                  {row.error && <span style={{ color: 'var(--red)' }}>{row.error}</span>}
-                  <span style={{ color: 'var(--muted)', marginLeft: 'auto', flexShrink: 0, fontSize: 11.5 }}>
-                    {new Date(row.sent_at).toLocaleString([], { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}
-                  </span>
-                </div>
-              ))}
+        {/* Every automated send lands in the normal chat thread, so a second
+            copy of the list here was just noise. What is worth keeping is the
+            manual trigger and whatever the last run reported. */}
+        <section style={{ ...card, display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+          <div style={{ flex: 1, minWidth: 220 }}>
+            <div style={{ fontSize: 13.4, fontWeight: 700, color: 'var(--ink)' }}>Run it now</div>
+            <div style={{ fontSize: 12.2, color: 'var(--muted)', marginTop: 3, lineHeight: 1.55 }}>
+              Checks for new leads immediately instead of waiting for the next 2-minute check.
+              Messages appear in the customer&rsquo;s chat as usual.
             </div>
+          </div>
+          <button
+            onClick={runNow}
+            disabled={running}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 15px', borderRadius: 10, border: '1px solid var(--line)', background: 'var(--surface)', color: 'var(--ink)', fontSize: 13, fontWeight: 600, cursor: 'pointer', flex: 'none' }}
+          >
+            {running ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />} Check now
+          </button>
+          {runNote && (
+            <pre style={{ flexBasis: '100%', whiteSpace: 'pre-wrap', fontFamily: 'inherit', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 10, padding: '10px 12px', fontSize: 12.4, color: 'var(--ink)', lineHeight: 1.6, margin: 0 }}>{runNote}</pre>
           )}
         </section>
+        </>)}
       </div>
     </div>
   );

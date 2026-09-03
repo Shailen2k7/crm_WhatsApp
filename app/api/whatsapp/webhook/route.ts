@@ -325,6 +325,14 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: true, handled: 'message_received', direction: 'out' });
       }
 
+      // Any reply at all takes this person out of the C1–C8 follow-up machine:
+      // they answered, so a human owns the conversation from here.
+      await admin
+        .from('relay_lead_sequences')
+        .update({ status: 'replied', exit_reason: 'replied', exited_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('phone_e164', phoneE164)
+        .eq('status', 'active');
+
       // Honour "Reply STOP to opt out": one word, alone, in the inbound text.
       // Automations check relay_suppressions before every send.
       const inboundText = (message?.message || '').trim().toLowerCase();

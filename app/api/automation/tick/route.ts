@@ -3,6 +3,7 @@ import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { sendText, sendTemplate, sendMedia, windowState, isConfigured, mediaTypeFrom } from '@/lib/interakt';
 import { toE164 } from '@/lib/phone';
+import { runSequences } from '@/lib/sequence-engine';
 import { RELAY_BUCKET } from '@/lib/files';
 
 export const runtime = 'nodejs';
@@ -106,7 +107,7 @@ export async function POST(req: NextRequest) {
     if (room === 0) { out.note = `Daily cap of ${rule.daily_cap} reached.`; continue; }
 
     // ---- eligible leads: created after activation, older than the delay ----
-    const cutoff = new Date(Date.now() - (rule.delay_minutes ?? 2) * 60_000).toISOString();
+    const cutoff = new Date(Date.now() - (rule.delay_seconds ?? 60) * 1_000).toISOString();
     const { data: leads } = await admin
       .from('leads')
       .select('id, full_name, phone, visa_type, created_at, is_sample')
@@ -176,7 +177,15 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  return NextResponse.json({ ok: true, dryRun, report });
+  // The C1–C8 follow-up machine rides the same tick. Dry runs skip it —
+  // its own page has live counters, and a dry run must never send.
+  let sequences: Awaited<ReturnType<typeof runSequences>> = [];
+  if (!dryRun) {
+    try { sequences = await runSequences(admin); }
+    catch (e) { console.error('[sequences] tick failed', e); }
+  }
+
+  return NextResponse.json({ ok: true, dryRun, report, sequences });
 }
 
 // ---------------------------------------------------------------------------

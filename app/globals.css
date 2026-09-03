@@ -20,6 +20,9 @@
   --muted: #6b7c77;
   --line: rgba(14, 28, 26, 0.09);
   --line-2: rgba(14, 28, 26, 0.05);
+  --track: #c3cfca;   /* toggle OFF track — visible on white */
+  --green: #12925f;      /* automation accent: passes contrast on white */
+  --green-bg: #e3f4ec;
   --teal: #0d8c7c;
   --teal-2: #0a6e62;
   --teal-ink: #0a5b51;
@@ -50,6 +53,9 @@
   --muted: #7d918b;
   --line: rgba(255, 255, 255, 0.1);
   --line-2: rgba(255, 255, 255, 0.055);
+  --track: rgba(255, 255, 255, 0.22);   /* toggle OFF track */
+  --green: #2bd48f;
+  --green-bg: rgba(43, 212, 143, 0.13);
   --teal: #2bbda6;
   --teal-2: #5fe6d0;
   --teal-ink: #85e7d4;
@@ -148,3 +154,42 @@ div:hover > .bubble-actions { opacity: .75; }
 @media (hover: none) {
   .bubble-actions { opacity: .55; }
 }
+
+/* Bottom sheet: slides up from the tab bar, like every native menu. */
+@keyframes sheet-up {
+  from { transform: translateY(24px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+.animate-sheet-up { animation: sheet-up .22s cubic-bezier(.2,.9,.3,1); }
+
+/* ---------------------------------------------------------------------------
+   SELECT DROPDOWNS
+   The native chevron is painted hard against the right border, which reads as
+   a rendering fault. We draw our own instead: appearance:none removes the
+   platform arrow, and a background SVG sits with real breathing room.
+
+   !important is deliberate and load-bearing. Every select in the app sets its
+   colours with an inline `background:` SHORTHAND, and that shorthand resets
+   background-image to none at inline priority — so the chevron only survives
+   by outranking it. Same for padding-right, which the inline `padding`
+   shorthand would otherwise squash back to 11px.
+--------------------------------------------------------------------------- */
+select {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%236b7c77' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E") !important;
+  background-repeat: no-repeat !important;
+  background-position: right 11px center !important;
+  background-size: 15px 15px !important;
+  padding-right: 34px !important;
+  cursor: pointer;
+}
+select:disabled { opacity: .55; cursor: default; }
+
+[data-theme='dark'] select {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%237d918b' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E") !important;
+}
+
+/* The options list is painted by the OS, so give it readable colours too. */
+select option { background: var(--surface); color: var(--ink); }
