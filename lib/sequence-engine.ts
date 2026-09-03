@@ -48,7 +48,14 @@ export function intakeLimitFor(day: number, ramp: Ramp[]): number {
   return 0; // schedule exhausted and no "thereafter" stage: intake stops
 }
 
-interface Step { step_no: number; template_name: string; template_language: string; gap_days: number }
+interface Step {
+  step_no: number; template_name: string; template_language: string;
+  gap_days: number; gap_hours?: number | null;
+}
+
+/** Hours are canonical (116); older rows only carry days. */
+const gapMs = (s: Step | undefined) =>
+  ((s?.gap_hours ?? (s?.gap_days ?? 0) * 24) || 0) * 3_600_000;
 
 export interface SequenceReport {
   sequence: string;
@@ -91,17 +98,15 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
     let room = Math.max(0, limit - (enrolledToday ?? 0));
 
     const stages = seq.audience === 'both' ? ['cold', 'hot'] : [seq.audience];
+    const noReply = seq.trigger_mode === 'no_reply';
+
+    // Industry filter: null/empty = everyone; '(none)' matches a blank industry.
+    const industries: string[] | null =
+      Array.isArray(seq.industries) && seq.industries.length ? seq.industries : null;
+    const industryOk = (ind: string | null | undefined) =>
+      !industries || industries.includes((ind || '').trim() || '(none)');
 
     if (room > 0) {
-      // OLDEST FIRST — the whole point: every lead is eventually covered.
-      const { data: leads } = await admin
-        .from('leads')
-        .select('id, full_name, phone, visa_type, created_at, is_sample')
-        .eq('workspace_id', ws)
-        .in('stage', stages)
-        .order('created_at', { ascending: true })
-        .limit(ENROL_BATCH);
-
       const [{ data: already }, { data: suppressed }] = await Promise.all([
         admin.from('relay_lead_sequences').select('lead_id, phone_e164').eq('sequence_id', seq.id),
         admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws),
@@ -109,24 +114,79 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
       const doneLeads = new Set((already || []).map((a) => a.lead_id).filter(Boolean));
       const donePhones = new Set((already || []).map((a) => a.phone_e164));
       const stopPhones = new Set((suppressed || []).map((s) => s.phone_e164));
+      const firstGap = gapMs((steps as Step[])[0]);
 
-      // Step 1 has a gap like any other step. A lead already gets the new-lead
-      // message on the day they arrive, so firing C1 the same day would be two
-      // messages in one morning — this lets C1 wait a couple of days.
-      const firstGapMs = ((steps as Step[])[0]?.gap_days ?? 0) * 86_400_000;
+      if (noReply) {
+        // ---- WHO: got the new-lead first message, said nothing since --------
+        // The audit rows from the new-lead rule are the source of truth for
+        // "we messaged them first". Two weeks back is plenty: beyond that the
+        // chase reads as spam, not follow-up.
+        const horizon = new Date(Date.now() - 14 * 86_400_000).toISOString();
+        const { data: firstSends } = await admin
+          .from('relay_automation_sent')
+          .select('lead_id, phone_e164, sent_at')
+          .eq('workspace_id', ws).eq('automation_key', 'new_lead_first')
+          .eq('ok', true).gte('sent_at', horizon)
+          .order('sent_at', { ascending: true })
+          .limit(ENROL_BATCH);
 
-      for (const lead of leads || []) {
-        if (room <= 0) break;
-        if (lead.is_sample || doneLeads.has(lead.id)) continue;
-        const phone = toE164(lead.phone);
-        if (!phone || donePhones.has(phone) || stopPhones.has(phone)) continue;
+        for (const fs of firstSends || []) {
+          if (room <= 0) break;
+          const phone = fs.phone_e164;
+          if (!phone || donePhones.has(phone) || stopPhones.has(phone)) continue;
+          if (fs.lead_id && doneLeads.has(fs.lead_id)) continue;
 
-        const { error } = await admin.from('relay_lead_sequences').insert({
-          workspace_id: ws, sequence_id: seq.id, lead_id: lead.id,
-          phone_e164: phone, status: 'active', current_step: 0,
-          next_send_at: new Date(Date.now() + firstGapMs).toISOString(),
-        });
-        if (!error) { donePhones.add(phone); room--; report.enrolled++; }
+          // Replied since the first message? Then there is nothing to chase.
+          const { data: conv } = await admin
+            .from('relay_conversations')
+            .select('last_inbound_at')
+            .eq('workspace_id', ws).eq('phone_e164', phone)
+            .maybeSingle();
+          if (conv?.last_inbound_at && conv.last_inbound_at >= fs.sent_at) continue;
+
+          // The lead's category and stage still have to fit.
+          let lead: { industry?: string | null; stage?: string } | null = null;
+          if (fs.lead_id) {
+            const { data: l } = await admin
+              .from('leads').select('industry, stage').eq('id', fs.lead_id).maybeSingle();
+            lead = l;
+          }
+          if (lead && ['junk', 'won', 'lost'].includes(lead.stage || '')) continue;
+          if (!industryOk(lead?.industry)) continue;
+
+          // The clock starts at the FIRST MESSAGE, not at enrolment: "T2 four
+          // hours after we asked for the CV" holds even if this pass runs late.
+          const { error } = await admin.from('relay_lead_sequences').insert({
+            workspace_id: ws, sequence_id: seq.id, lead_id: fs.lead_id,
+            phone_e164: phone, status: 'active', current_step: 0,
+            next_send_at: new Date(new Date(fs.sent_at).getTime() + firstGap).toISOString(),
+          });
+          if (!error) { donePhones.add(phone); room--; report.enrolled++; }
+        }
+      } else {
+        // ---- OLDEST FIRST through the backlog, as before --------------------
+        const { data: leads } = await admin
+          .from('leads')
+          .select('id, full_name, phone, visa_type, industry, created_at, is_sample')
+          .eq('workspace_id', ws)
+          .in('stage', stages)
+          .order('created_at', { ascending: true })
+          .limit(ENROL_BATCH);
+
+        for (const lead of leads || []) {
+          if (room <= 0) break;
+          if (lead.is_sample || doneLeads.has(lead.id)) continue;
+          if (!industryOk(lead.industry)) continue;
+          const phone = toE164(lead.phone);
+          if (!phone || donePhones.has(phone) || stopPhones.has(phone)) continue;
+
+          const { error } = await admin.from('relay_lead_sequences').insert({
+            workspace_id: ws, sequence_id: seq.id, lead_id: lead.id,
+            phone_e164: phone, status: 'active', current_step: 0,
+            next_send_at: new Date(Date.now() + firstGap).toISOString(),
+          });
+          if (!error) { donePhones.add(phone); room--; report.enrolled++; }
+        }
       }
     }
 
@@ -163,7 +223,10 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
       // cold follow-ups — that is the embarrassing kind of automation.
       if (row.lead_id) {
         const { data: cur } = await admin.from('leads').select('stage').eq('id', row.lead_id).maybeSingle();
-        if (cur && !stages.includes(cur.stage)) {
+        const out = noReply
+          ? ['junk', 'won', 'lost'].includes(cur?.stage || '')   // chase: only these disqualify
+          : !!cur && !stages.includes(cur.stage);                // backlog: must match audience
+        if (cur && out) {
           await admin.from('relay_lead_sequences').update({
             status: 'stopped', exit_reason: `stage changed to ${cur.stage}`,
             exited_at: new Date().toISOString(), updated_at: new Date().toISOString(),
@@ -227,7 +290,7 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
       report.sent++;
       const next = (steps as Step[]).find((s) => s.step_no === step.step_no + 1);
       if (next) {
-        const nextAt = new Date(Date.now() + next.gap_days * 86_400_000).toISOString();
+        const nextAt = new Date(Date.now() + gapMs(next)).toISOString();
         await admin.from('relay_lead_sequences').update({
           current_step: step.step_no, last_sent_at: new Date().toISOString(),
           next_send_at: nextAt, updated_at: new Date().toISOString(),

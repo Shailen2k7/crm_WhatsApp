@@ -37,12 +37,16 @@ export async function GET(req: NextRequest) {
   const phone = toE164(req.nextUrl.searchParams.get('phone') || '');
   if (!phone) return NextResponse.json({ ok: true, enrolled: false });
 
-  const { data: row } = await a.admin
+  // Two machines exist (backlog + no-reply chase), so one phone can carry two
+  // rows. Show the ACTIVE one if any — that is the one still sending — else
+  // whichever moved most recently. maybeSingle() would throw on two rows.
+  const { data: rows } = await a.admin
     .from('relay_lead_sequences')
-    .select('id, sequence_id, status, current_step, next_send_at, exit_reason, last_sent_at')
+    .select('id, sequence_id, status, current_step, next_send_at, exit_reason, last_sent_at, updated_at')
     .eq('workspace_id', a.ws)
     .eq('phone_e164', phone)
-    .maybeSingle();
+    .order('updated_at', { ascending: false });
+  const row = (rows || []).find((r) => r.status === 'active') || (rows || [])[0] || null;
 
   if (!row) {
     // Not enrolled — but the panel still wants to offer "add them", and to say
@@ -95,19 +99,23 @@ export async function POST(req: NextRequest) {
   const action = String(body.action || '');
   if (!phone) return NextResponse.json({ ok: false, error: 'No phone number.' }, { status: 400 });
 
-  const { data: row } = await a.admin
+  const { data: rows } = await a.admin
     .from('relay_lead_sequences')
-    .select('id, status, current_step')
+    .select('id, status, current_step, updated_at')
     .eq('workspace_id', a.ws)
     .eq('phone_e164', phone)
-    .maybeSingle();
+    .order('updated_at', { ascending: false });
+  const row = (rows || []).find((r) => r.status === 'active') || (rows || [])[0] || null;
 
   // Put someone into the sequence by hand, ahead of the daily intake queue.
   if (action === 'add') {
     if (row) return NextResponse.json({ ok: false, error: 'Already in the sequence.' }, { status: 400 });
-    const { data: seq } = await a.admin
-      .from('relay_sequences').select('id').eq('workspace_id', a.ws)
-      .order('created_at').limit(1).maybeSingle();
+    const { data: seqList } = await a.admin
+      .from('relay_sequences').select('id, trigger_mode').eq('workspace_id', a.ws)
+      .order('created_at');
+    // Adding by hand means the C1–C8 drip, not the no-reply chase — the chase
+    // picks its own people from who ignored the first message.
+    const seq = (seqList || []).find((x) => (x.trigger_mode || 'backlog') === 'backlog') || (seqList || [])[0];
     if (!seq) return NextResponse.json({ ok: false, error: 'No sequence exists yet.' }, { status: 404 });
 
     const { data: lead } = await a.admin

@@ -132,6 +132,47 @@ do $$ begin alter publication supabase_realtime add table public.relay_campaigns
 alter table public.relay_campaigns replica identity full;
 
 
+-- ═══ 116 ═══ THE NO-REPLY CHASE ═════════════════════════════════════════════
+alter table public.relay_sequences
+  add column if not exists trigger_mode text not null default 'backlog';
+alter table public.relay_sequences
+  add column if not exists industries text[];   -- null = all industries
+
+alter table public.relay_sequence_steps
+  add column if not exists gap_hours int;
+update public.relay_sequence_steps
+   set gap_hours = gap_days * 24
+ where gap_hours is null;
+
+-- ── seed the chase, DISABLED, with the asked-for ladder ──────────────────────
+do $$
+declare ws uuid; seq uuid;
+begin
+  select id into ws from public.workspaces order by created_at limit 1;
+  if ws is null then return; end if;
+  if exists (select 1 from public.relay_sequences
+              where workspace_id = ws and trigger_mode = 'no_reply') then return; end if;
+
+  insert into public.relay_sequences
+    (workspace_id, name, audience, status, trigger_mode, hours_enabled, send_start_hour, send_end_hour)
+  values (ws, 'No-reply chase', 'both', 'draft', 'no_reply', true, 9, 21)
+  returning id into seq;
+
+  -- T2 four hours after the first message; T3 eight hours after T2;
+  -- T4 sixteen hours after T3. All editable on the page.
+  insert into public.relay_sequence_steps
+    (sequence_id, workspace_id, step_no, template_name, gap_days, gap_hours) values
+    (seq, ws, 1, 't2', 0,  4),
+    (seq, ws, 2, 't3', 0,  8),
+    (seq, ws, 3, 't4', 1, 16);
+
+  -- One wide stage: the real limiter is how many first messages went out.
+  insert into public.relay_sequence_ramp
+    (sequence_id, workspace_id, stage_no, per_day, duration_days)
+  values (seq, ws, 1, 500, null);
+end $$;
+
+
 -- ═══ CHECK ═══ both rows should come back ═══════════════════════════════════
 select 'delivery report' as thing,
        count(*)::text as result
@@ -145,4 +186,8 @@ union all
 select 'campaign tables',
        count(*)::text
   from information_schema.tables
- where table_name in ('relay_campaigns','relay_campaign_recipients');
+ where table_name in ('relay_campaigns','relay_campaign_recipients')
+union all
+select 'no-reply chase seeded',
+       count(*)::text
+  from public.relay_sequences where trigger_mode = 'no_reply';

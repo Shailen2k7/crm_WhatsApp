@@ -33,15 +33,32 @@ async function auth() {
   return { ws: member.workspace_id as string, admin };
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const a = await auth();
   if ('error' in a) return a.error;
   const { ws, admin } = a;
 
-  const { data: seq } = await admin
+  // Every sequence, so the page can offer a switcher; ?id= picks which one the
+  // rest of this response describes (default: the first ever created).
+  const { data: all } = await admin
     .from('relay_sequences').select('*').eq('workspace_id', ws)
-    .order('created_at').limit(1).maybeSingle();
-  if (!seq) return NextResponse.json({ ok: false, error: 'Run migration 112 first.' }, { status: 404 });
+    .order('created_at');
+  if (!all?.length) return NextResponse.json({ ok: false, error: 'Run migration 112 first.' }, { status: 404 });
+
+  const wantId = req.nextUrl.searchParams.get('id');
+  const seq = all.find((x) => x.id === wantId) || all[0];
+
+  // The categories that exist in the data, for the industry filter chips.
+  const { data: indRows } = await admin
+    .from('leads').select('industry').eq('workspace_id', ws).not('industry', 'is', null).neq('industry', '');
+  const industryCounts = new Map<string, number>();
+  for (const r of indRows || []) {
+    const k = (r.industry as string).trim();
+    if (k) industryCounts.set(k, (industryCounts.get(k) || 0) + 1);
+  }
+  const industryOptions = [...industryCounts.entries()]
+    .sort((x, y) => y[1] - x[1])
+    .map(([value, count]) => ({ value, count }));
 
   const dayStartIst = new Date(`${istDate()}T00:00:00+05:30`).toISOString();
   const stages = seq.audience === 'both' ? ['cold', 'hot'] : [seq.audience];
@@ -55,8 +72,12 @@ export async function GET() {
          enrolledToday, sentToday, sends, delivery, failures] = await Promise.all([
     admin.from('relay_sequence_steps').select('*').eq('sequence_id', seq.id).order('step_no').then((r) => r.data || []),
     admin.from('relay_sequence_ramp').select('*').eq('sequence_id', seq.id).order('stage_no').then((r) => r.data || []),
-    count(admin.from('leads').select('id', { count: 'exact', head: true })
-      .eq('workspace_id', ws).in('stage', stages).not('phone', 'is', null).neq('phone', '')),
+    seq.trigger_mode === 'no_reply'
+      ? count(admin.from('relay_automation_sent').select('id', { count: 'exact', head: true })
+          .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', true)
+          .gte('sent_at', new Date(Date.now() - 14 * 86_400_000).toISOString()))
+      : count(admin.from('leads').select('id', { count: 'exact', head: true })
+          .eq('workspace_id', ws).in('stage', stages).not('phone', 'is', null).neq('phone', '')),
     count(admin.from('relay_lead_sequences').select('id', { count: 'exact', head: true }).eq('sequence_id', seq.id)),
     statusCount('active'), statusCount('completed'), statusCount('replied'), statusCount('skipped'), statusCount('stopped'),
     count(admin.from('relay_lead_sequences').select('id', { count: 'exact', head: true })
@@ -90,6 +111,8 @@ export async function GET() {
 
   return NextResponse.json({
     ok: true,
+    sequences: all.map((x) => ({ id: x.id, name: x.name, status: x.status, trigger_mode: x.trigger_mode || 'backlog' })),
+    industryOptions,
     sequence: seq,
     steps,
     ramp,
@@ -120,14 +143,15 @@ export async function PATCH(req: NextRequest) {
   const { ws, admin } = a;
   const body = await req.json().catch(() => ({}));
 
-  const { data: seq } = await admin
-    .from('relay_sequences').select('id').eq('workspace_id', ws)
-    .order('created_at').limit(1).maybeSingle();
+  let q = admin.from('relay_sequences').select('id').eq('workspace_id', ws).order('created_at').limit(1);
+  if (body.id) q = admin.from('relay_sequences').select('id').eq('workspace_id', ws).eq('id', String(body.id)).limit(1);
+  const { data: seqRows } = await q;
+  const seq = seqRows?.[0];
   if (!seq) return NextResponse.json({ ok: false, error: 'No sequence.' }, { status: 404 });
 
   if (body.sequence) {
     const allowed: Record<string, unknown> = {};
-    for (const k of ['name', 'audience', 'hours_enabled', 'send_start_hour', 'send_end_hour']) {
+    for (const k of ['name', 'audience', 'hours_enabled', 'send_start_hour', 'send_end_hour', 'industries']) {
       if (k in body.sequence) allowed[k] = body.sequence[k];
     }
     if (Object.keys(allowed).length) {
@@ -142,12 +166,17 @@ export async function PATCH(req: NextRequest) {
   if (Array.isArray(body.steps)) {
     const rows = body.steps
       .filter((st: { template_name?: string }) => st.template_name)
-      .map((st: { template_name: string; template_language?: string; gap_days?: number }, i: number) => ({
-        sequence_id: seq.id, workspace_id: ws, step_no: i + 1,
-        template_name: st.template_name,
-        template_language: st.template_language || 'en',
-        gap_days: Math.max(0, Math.min(90, Number(st.gap_days ?? 3))),
-      }));
+      .map((st: { template_name: string; template_language?: string; gap_hours?: number }, i: number) => {
+        // Hours are canonical; days are derived so old builds stay coherent.
+        const hours = Math.max(0, Math.min(24 * 90, Number(st.gap_hours ?? 72)));
+        return {
+          sequence_id: seq.id, workspace_id: ws, step_no: i + 1,
+          template_name: st.template_name,
+          template_language: st.template_language || 'en',
+          gap_hours: hours,
+          gap_days: Math.round(hours / 24),
+        };
+      });
     await admin.from('relay_sequence_steps').delete().eq('sequence_id', seq.id);
     if (rows.length) {
       const { error } = await admin.from('relay_sequence_steps').insert(rows);
@@ -177,11 +206,14 @@ export async function POST(req: NextRequest) {
   const a = await auth();
   if ('error' in a) return a.error;
   const { ws, admin } = a;
-  const { action } = await req.json().catch(() => ({}));
+  const body = await req.json().catch(() => ({}));
+  const action = body.action as string;
 
-  const { data: seq } = await admin
-    .from('relay_sequences').select('id, status, started_at').eq('workspace_id', ws)
-    .order('created_at').limit(1).maybeSingle();
+  const body2 = body as { id?: string };
+  let sq = admin.from('relay_sequences').select('id, status, started_at').eq('workspace_id', ws).order('created_at').limit(1);
+  if (body2.id) sq = admin.from('relay_sequences').select('id, status, started_at').eq('workspace_id', ws).eq('id', String(body2.id)).limit(1);
+  const { data: seqRows } = await sq;
+  const seq = seqRows?.[0];
   if (!seq) return NextResponse.json({ ok: false, error: 'No sequence.' }, { status: 404 });
 
   const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
