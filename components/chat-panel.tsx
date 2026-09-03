@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import {
   Search, Star, PanelRight, Paperclip, Send, MessageSquare, ArrowLeft,
@@ -77,6 +77,12 @@ export function ChatPanel({
   const [, setTick] = useState(0);
 
   const bottomRef = useRef<HTMLDivElement>(null);
+  const threadRef = useRef<HTMLDivElement>(null);
+  /** Is the reader parked at the live end of the thread? Kept in a ref because
+   *  the scroll handler and the message effect both need it without re-binding. */
+  const stickRef = useRef(true);
+  const [atBottom, setAtBottom] = useState(true);
+  const [unseen, setUnseen] = useState(0);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -191,15 +197,48 @@ export function ChatPanel({
     return () => clearInterval(t);
   }, []);
 
-  // Jump to the bottom when the thread CHANGES or GROWS — never on a re-render
-  // caused by a status tick, which used to yank the view around mid-read.
+  const scrollToEnd = useCallback((smooth = false) => {
+    const el = threadRef.current;
+    if (!el) return;
+    // scrollTop, not scrollIntoView: scrollIntoView also scrolls ANCESTORS,
+    // which on a phone drags the whole page and feels like a snag.
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+    stickRef.current = true;
+    setAtBottom(true);
+    setUnseen(0);
+  }, []);
+
+  /** Follow the live end only while the reader is already there. */
+  const onThreadScroll = useCallback(() => {
+    const el = threadRef.current;
+    if (!el) return;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    stickRef.current = near;
+    setAtBottom((was) => (was === near ? was : near));
+    if (near) setUnseen(0);
+  }, []);
+
+  // WhatsApp does not drag you to the bottom while you are reading history —
+  // it counts what arrived and lets you go down when you choose. This does the
+  // same: follow only if already at the end, otherwise raise the pill.
   const lastCountRef = useRef(0);
   useEffect(() => {
-    if (messages.length === lastCountRef.current) return;
-    const grew = messages.length > lastCountRef.current;
+    const prev = lastCountRef.current;
+    if (messages.length === prev) return;
     lastCountRef.current = messages.length;
-    bottomRef.current?.scrollIntoView({ behavior: grew && messages.length < 40 ? 'smooth' : 'auto' });
-  }, [messages.length]);
+    if (messages.length < prev) return;           // a delete: leave the view alone
+
+    if (stickRef.current) scrollToEnd(prev > 0 && messages.length - prev === 1);
+    else setUnseen((n) => n + (messages.length - prev));
+  }, [messages.length, scrollToEnd]);
+
+  // Opening a different chat always starts at the newest message, instantly.
+  useEffect(() => {
+    lastCountRef.current = 0;
+    stickRef.current = true;
+    setUnseen(0);
+    setAtBottom(true);
+  }, [conversationId]);
 
   // "/" at the start of an empty composer opens quick replies — muscle memory
   // from every serious support tool.
@@ -438,7 +477,7 @@ export function ChatPanel({
     : [];
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, background: 'var(--chat)' }}>
+    <div style={{ position: 'relative', flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, background: 'var(--chat)' }}>
       {/* Header */}
       <header style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '10px 14px', paddingTop: 'calc(10px + env(safe-area-inset-top))', background: 'var(--surface)', borderBottom: '1px solid var(--line)', flex: 'none' }}>
         {isMobile && (
@@ -505,10 +544,15 @@ export function ChatPanel({
           desktop without stealing half the screen on a phone, where every pixel
           of message width counts. */}
       <div
+        ref={threadRef}
+        onScroll={onThreadScroll}
         style={{
           flex: 1,
           overflowY: 'auto',
           WebkitOverflowScrolling: 'touch',
+          // Keeps a flick at either end from scrolling the page behind the
+          // thread, which on mobile reads as the scroll "sticking".
+          overscrollBehavior: 'contain',
           minHeight: 0,
           padding: '16px 0 6px',
           paddingInline: 'clamp(12px, 7%, 110px)',
@@ -549,6 +593,34 @@ export function ChatPanel({
           })}
         <div ref={bottomRef} />
       </div>
+
+      {/* Jump back to the live end. Appears only when you have scrolled away,
+          and counts anything that arrived while you were reading — so a new
+          message never steals the screen mid-sentence. */}
+      {!atBottom && (
+        <button
+          onClick={() => scrollToEnd(true)}
+          aria-label={unseen > 0 ? `${unseen} new message${unseen === 1 ? '' : 's'} — jump to latest` : 'Jump to latest'}
+          className="animate-pop-in"
+          style={{
+            position: 'absolute', right: 18, bottom: 92, zIndex: 15,
+            display: 'inline-flex', alignItems: 'center', gap: 7,
+            padding: unseen > 0 ? '8px 14px' : 0,
+            width: unseen > 0 ? 'auto' : 38, height: 38,
+            justifyContent: 'center',
+            borderRadius: 99, border: '1px solid var(--line)',
+            background: unseen > 0 ? 'var(--teal)' : 'var(--surface)',
+            color: unseen > 0 ? '#fff' : 'var(--muted)',
+            fontSize: 12.5, fontWeight: 700, cursor: 'pointer',
+            boxShadow: '0 4px 14px rgba(0,0,0,.18)',
+          }}
+        >
+          {unseen > 0 && <span>{unseen} new</span>}
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </button>
+      )}
 
       {/* Composer */}
       <div
@@ -627,13 +699,6 @@ export function ChatPanel({
           </div>
         )}
 
-        {!win.open && !internal && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'var(--amber-bg)', color: 'var(--ink-2)', padding: '9px 12px', borderRadius: 10, fontSize: 12.3, marginBottom: 8, lineHeight: 1.5 }}>
-            <AlertCircle size={14} style={{ flex: 'none', color: 'var(--amber)' }} />
-            <span><strong>24-hour window closed.</strong> Use the template button below to reach {firstName}, or write an internal note (🔒).</span>
-          </div>
-        )}
-
         {/* Pending attachments */}
         {pending.length > 0 && (
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
@@ -687,11 +752,12 @@ export function ChatPanel({
                 ? 'Note for the team — never sent to the client'
                 : canType
                 ? `Message ${firstName}…   ⏎ send · / quick replies`
-                : 'Window closed — template required, or write an internal note'
+                : `24h window closed — use a template ▦ or write a note 🔒`
             }
             style={{
               width: '100%', border: 0, outline: 0, resize: 'none', background: 'transparent',
-              padding: '13px 16px 4px', fontSize: 15, lineHeight: 1.5, maxHeight: 140, minHeight: 48,
+              // ~20% more room to write, and the placeholder no longer clips.
+              padding: '14px 16px 6px', fontSize: 15, lineHeight: 1.55, maxHeight: 168, minHeight: 58,
               cursor: canType || internal ? 'text' : 'not-allowed',
             }}
           />
@@ -704,7 +770,7 @@ export function ChatPanel({
               aria-label="Attach files"
               style={{ ...composerBtn, opacity: internal || !win.open ? 0.35 : 1 }}
             >
-              {uploading ? <Loader2 size={17} style={{ animation: 'spin .8s linear infinite' }} /> : <Paperclip size={17} />}
+              {uploading ? <Loader2 size={15} style={{ animation: 'spin .8s linear infinite' }} /> : <Paperclip size={15} />}
             </button>
             <button
               onClick={() => { setDraft((d) => (d.startsWith('/') ? d : '/')); taRef.current?.focus(); }}
@@ -712,7 +778,7 @@ export function ChatPanel({
               aria-label="Quick replies"
               style={composerBtn}
             >
-              <Zap size={17} />
+              <Zap size={15} />
             </button>
             <button
               onClick={() => setTplOpen((v) => !v)}
@@ -720,7 +786,7 @@ export function ChatPanel({
               aria-label="Send a template"
               style={{ ...composerBtn, color: tplOpen ? 'var(--teal-ink)' : 'var(--muted)' }}
             >
-              <LayoutTemplate size={16} />
+              <LayoutTemplate size={15} />
             </button>
             <button
               onClick={() => setInternal((v) => !v)}
@@ -728,7 +794,7 @@ export function ChatPanel({
               aria-label="Toggle internal note"
               style={{ ...composerBtn, background: internal ? 'var(--amber)' : 'transparent', color: internal ? '#fff' : 'var(--muted)' }}
             >
-              <Lock size={16} />
+              <Lock size={15} />
             </button>
 
             <div style={{ flex: 1 }} />
@@ -740,16 +806,18 @@ export function ChatPanel({
             <button
               onClick={send}
               disabled={!canSend}
-              aria-label="Send"
+              aria-label={internal ? 'Save note' : 'Send'}
+              title={internal ? 'Save note' : 'Send'}
               style={{
-                display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 15px', borderRadius: 10, border: 0,
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                width: 38, height: 38, borderRadius: 99, border: 0, flex: 'none',
                 background: canSend ? (internal ? 'var(--amber)' : 'var(--teal)') : 'var(--surface-3)',
                 color: canSend ? '#fff' : 'var(--muted)',
-                fontSize: 13, fontWeight: 700, cursor: canSend ? 'pointer' : 'not-allowed',
+                cursor: canSend ? 'pointer' : 'not-allowed',
+                transition: 'background .15s',
               }}
             >
-              {sending ? <Loader2 size={13} style={{ animation: 'spin .8s linear infinite' }} /> : internal ? <Lock size={13} /> : <Send size={13} />}
-              {sending ? 'Sending' : internal ? 'Save note' : 'Send'}
+              {sending ? <Loader2 size={16} style={{ animation: 'spin .8s linear infinite' }} /> : internal ? <Lock size={16} /> : <Send size={16} />}
             </button>
           </div>
         </div>
@@ -774,7 +842,12 @@ function DateSeparator({ iso }: { iso: string }) {
   );
 }
 
-function Bubble({ message: m, isAdmin, onDelete, onFlip, onRetry }: { message: RelayMessage; isAdmin: boolean; onDelete: () => void; onFlip: () => void; onRetry: () => void }) {
+/**
+ * Memoised on the message's identity and the fields that actually change
+ * (status ticks, edited body). Without this, one 30-second timer re-rendered
+ * every bubble in the thread — which is what made a long chat feel sticky.
+ */
+const Bubble = memo(function Bubble({ message: m, isAdmin, onDelete, onFlip, onRetry }: { message: RelayMessage; isAdmin: boolean; onDelete: () => void; onFlip: () => void; onRetry: () => void }) {
   const out = m.direction === 'out';
   const failed = m.status === 'failed';
   const internal = m.is_internal;
@@ -844,11 +917,23 @@ function Bubble({ message: m, isAdmin, onDelete, onFlip, onRetry }: { message: R
           {hasFile && isImage && (
             <a href={`/api/whatsapp/media/${m.id}`} target="_blank" rel="noopener noreferrer" style={{ display: 'block' }}>
               {/* eslint-disable-next-line @next/next/no-img-element */}
+              {/* A lazy image with no reserved height is the classic cause of
+                  jumpy scrolling: it loads while you are reading, suddenly
+                  claims 300px, and shoves the thread under your thumb. A fixed
+                  aspect ratio reserves the exact box up front, so nothing
+                  moves when the bytes arrive. */}
               <img
                 src={`/api/whatsapp/media/${m.id}`}
                 alt={m.media_name || 'photo'}
-                style={{ display: 'block', width: '100%', maxHeight: 340, objectFit: 'cover', borderRadius: 10 }}
+                width={320}
+                height={240}
+                style={{
+                  display: 'block', width: '100%', height: 'auto',
+                  aspectRatio: '4 / 3', maxHeight: 340, objectFit: 'cover',
+                  borderRadius: 10, background: 'var(--surface-3)',
+                }}
                 loading="lazy"
+                decoding="async"
               />
             </a>
           )}
@@ -963,7 +1048,7 @@ function Bubble({ message: m, isAdmin, onDelete, onFlip, onRetry }: { message: R
       )}
     </div>
   );
-}
+});
 
 const menuItem: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 9, width: '100%', padding: '10px 14px',
@@ -1017,7 +1102,7 @@ const miniBtn: React.CSSProperties = {
 };
 
 const composerBtn: React.CSSProperties = {
-  width: 34, height: 34, borderRadius: 9, border: 0, background: 'transparent',
+  width: 30, height: 30, borderRadius: 8, border: 0, background: 'transparent',
   color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center',
   cursor: 'pointer', flex: 'none',
 };

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { memo, useEffect, useMemo, useState } from 'react';
 import { Search, X, Check, CheckCheck, Star, Clock, AlertCircle } from 'lucide-react';
 import { getStageMeta, getVisaMeta } from '@/lib/types';
 import { initialsOf, avatarTint, formatPhone, matchKey } from '@/lib/phone';
@@ -188,7 +188,7 @@ export function ConversationList({
         )}
       </div>
 
-      <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
+      <div style={{ flex: 1, overflowY: 'auto', minHeight: 0, overscrollBehavior: 'contain' }}>
         {!loading && visible.length === 0 && (
           <div style={{ padding: '38px 24px', textAlign: 'center', color: 'var(--muted)' }}>
             <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 5 }}>
@@ -204,133 +204,157 @@ export function ConversationList({
           </div>
         )}
 
-        {visible.map((c) => {
-          const on = selectedKey === c.key;
-          const stage = c.lead ? getStageMeta(c.lead.stage) : null;
-          const visa = getVisaMeta(c.lead?.visa_type);
-          const hasThread = !!c.lastMessageAt;
-
-          return (
-            <button
-              key={c.key}
-              onClick={() => onSelect(c)}
-              style={{
-                width: '100%',
-                display: 'flex',
-                gap: 12,
-                padding: isMobile ? '13px 15px' : '11px 15px',
-                alignItems: 'center',
-                border: 0,
-                borderBottom: '1px solid var(--line-2)',
-                background: on ? 'var(--surface-3)' : 'transparent',
-                cursor: 'pointer',
-                textAlign: 'left',
-              }}
-            >
-              <div
-                style={{
-                  width: isMobile ? 46 : 40,
-                  height: isMobile ? 46 : 40,
-                  borderRadius: 99,
-                  background: c.unknown ? 'var(--surface-3)' : avatarTint(c.key),
-                  color: c.unknown ? 'var(--muted)' : '#fff',
-                  border: c.unknown ? '1px dashed var(--line)' : 'none',
-                  fontSize: 13,
-                  fontWeight: 700,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  flex: 'none',
-                }}
-              >
-                {c.unknown ? '?' : initialsOf(c.name)}
-              </div>
-
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
-                  <span
-                    style={{
-                      fontSize: isMobile ? 15 : 13.5,
-                      fontWeight: c.unread > 0 ? 700 : 600,
-                      color: 'var(--ink)',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                      flex: 1,
-                    }}
-                  >
-                    {c.unknown ? formatPhone(c.phoneE164) : c.name}
-                  </span>
-                  <span style={{ fontSize: 11, color: c.unread > 0 ? 'var(--teal)' : 'var(--muted)', flex: 'none', fontWeight: c.unread > 0 ? 700 : 400 }}>
-                    {ago(c.lastMessageAt || c.lead?.updated_at || null)}
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 3 }}>
-                  {/* A thread shows its last message; everyone else shows their number. */}
-                  <span
-                    style={{
-                      fontSize: isMobile ? 13 : 12,
-                      color: c.unread > 0 ? 'var(--ink-2)' : 'var(--muted)',
-                      fontWeight: c.unread > 0 ? 600 : 400,
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                      flex: 1,
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 4,
-                    }}
-                  >
-                    {hasThread && c.lastDirection === 'out' && <RowTicks status={c.lastStatus} />}
-                    {hasThread ? previewText(c.lastPreview) : formatPhone(c.phoneE164)}
-                  </span>
-
-                  {c.spotlight && (
-                    <Star size={12} style={{ color: 'var(--amber)', fill: 'var(--amber)', flex: 'none' }} />
-                  )}
-                  {c.unread > 0 && (
-                    <span
-                      style={{
-                        minWidth: 18,
-                        height: 18,
-                        padding: '0 5px',
-                        borderRadius: 99,
-                        background: 'var(--teal)',
-                        color: '#fff',
-                        fontSize: 10.5,
-                        fontWeight: 800,
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        flex: 'none',
-                      }}
-                    >
-                      {c.unread > 99 ? '99+' : c.unread}
-                    </span>
-                  )}
-
-                  {c.unknown && (
-                    <span style={{ fontSize: 9.5, fontWeight: 700, padding: '1px 6px', borderRadius: 4, background: 'var(--amber-bg)', color: 'var(--amber)', flex: 'none' }}>
-                      Not in CRM
-                    </span>
-                  )}
-                  {visa && (
-                    <span style={{ fontSize: 9.5, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: visa.bg, color: visa.fg, flex: 'none' }}>
-                      {visa.short}
-                    </span>
-                  )}
-                  {stage && (
-                    <span style={{ fontSize: 9.5, fontWeight: 700, padding: '1px 6px', borderRadius: 4, background: stage.bg, color: stage.fg, flex: 'none' }}>
-                      {stage.label}
-                    </span>
-                  )}
-                </div>
-              </div>
-            </button>
-          );
-        })}
+        {visible.map((c) => (
+          <Row
+            key={c.key}
+            c={c}
+            on={selectedKey === c.key}
+            isMobile={!!isMobile}
+            onSelect={onSelect}
+          />
+        ))}
       </div>
     </div>
   );
 }
+
+/**
+ * ONE ROW, MEMOISED.
+ *
+ * The list re-renders whenever a message lands, a lead page loads, or a filter
+ * changes — and 113 rows each rebuilding avatar tints, stage lookups and date
+ * maths is exactly what made scrolling feel like it was catching. React.memo
+ * means an untouched row costs nothing on a re-render.
+ *
+ * content-visibility lets the browser skip layout and paint for rows scrolled
+ * out of view, with contain-intrinsic-size reserving their height so the
+ * scrollbar never jumps.
+ */
+const Row = memo(function Row({
+  c, on, isMobile, onSelect,
+}: {
+  c: Contact; on: boolean; isMobile: boolean; onSelect: (c: Contact) => void;
+}) {
+  const stage = c.lead ? getStageMeta(c.lead.stage) : null;
+  const visa = getVisaMeta(c.lead?.visa_type);
+  const hasThread = !!c.lastMessageAt;
+
+  return (
+          <button
+            onClick={() => onSelect(c)}
+            style={{
+              width: '100%',
+              display: 'flex',
+              gap: 12,
+              padding: isMobile ? '13px 15px' : '11px 15px',
+              alignItems: 'center',
+              border: 0,
+              borderBottom: '1px solid var(--line-2)',
+              background: on ? 'var(--surface-3)' : 'transparent',
+              cursor: 'pointer',
+              textAlign: 'left',
+            }}
+          >
+            <div
+              style={{
+                width: isMobile ? 46 : 40,
+                height: isMobile ? 46 : 40,
+                borderRadius: 99,
+                background: c.unknown ? 'var(--surface-3)' : avatarTint(c.key),
+                color: c.unknown ? 'var(--muted)' : '#fff',
+                border: c.unknown ? '1px dashed var(--line)' : 'none',
+                fontSize: 13,
+                fontWeight: 700,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flex: 'none',
+              }}
+            >
+              {c.unknown ? '?' : initialsOf(c.name)}
+            </div>
+
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
+                <span
+                  style={{
+                    fontSize: isMobile ? 15 : 13.5,
+                    fontWeight: c.unread > 0 ? 700 : 600,
+                    color: 'var(--ink)',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    flex: 1,
+                  }}
+                >
+                  {c.unknown ? formatPhone(c.phoneE164) : c.name}
+                </span>
+                <span style={{ fontSize: 11, color: c.unread > 0 ? 'var(--teal)' : 'var(--muted)', flex: 'none', fontWeight: c.unread > 0 ? 700 : 400 }}>
+                  {ago(c.lastMessageAt || c.lead?.updated_at || null)}
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 3 }}>
+                {/* A thread shows its last message; everyone else shows their number. */}
+                <span
+                  style={{
+                    fontSize: isMobile ? 13 : 12,
+                    color: c.unread > 0 ? 'var(--ink-2)' : 'var(--muted)',
+                    fontWeight: c.unread > 0 ? 600 : 400,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    flex: 1,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 4,
+                  }}
+                >
+                  {hasThread && c.lastDirection === 'out' && <RowTicks status={c.lastStatus} />}
+                  {hasThread ? previewText(c.lastPreview) : formatPhone(c.phoneE164)}
+                </span>
+
+                {c.spotlight && (
+                  <Star size={12} style={{ color: 'var(--amber)', fill: 'var(--amber)', flex: 'none' }} />
+                )}
+                {c.unread > 0 && (
+                  <span
+                    style={{
+                      minWidth: 18,
+                      height: 18,
+                      padding: '0 5px',
+                      borderRadius: 99,
+                      background: 'var(--teal)',
+                      color: '#fff',
+                      fontSize: 10.5,
+                      fontWeight: 800,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      flex: 'none',
+                    }}
+                  >
+                    {c.unread > 99 ? '99+' : c.unread}
+                  </span>
+                )}
+
+                {c.unknown && (
+                  <span style={{ fontSize: 9.5, fontWeight: 700, padding: '1px 6px', borderRadius: 4, background: 'var(--amber-bg)', color: 'var(--amber)', flex: 'none' }}>
+                    Not in CRM
+                  </span>
+                )}
+                {visa && (
+                  <span style={{ fontSize: 9.5, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: visa.bg, color: visa.fg, flex: 'none' }}>
+                    {visa.short}
+                  </span>
+                )}
+                {stage && (
+                  <span style={{ fontSize: 9.5, fontWeight: 700, padding: '1px 6px', borderRadius: 4, background: stage.bg, color: stage.fg, flex: 'none' }}>
+                    {stage.label}
+                  </span>
+                )}
+              </div>
+            </div>
+          </button>
+        );
+});

@@ -198,6 +198,13 @@ export function RelayShell({
     let cancelled = false;
 
     (async () => {
+      // Collect every page FIRST, then update state once.
+      //
+      // Calling setLeads per page fired up to 40 re-renders of the whole shell,
+      // each re-running mergeContacts over thousands of leads and rebuilding
+      // the chat list — while the user was scrolling it. That was the stutter.
+      // One commit at the end costs the same data and none of the thrash.
+      const collected: Lead[] = [];
       for (let page = 1; page < 40 && !cancelled; page++) {
         const { data, error } = await supabase
           .from('leads')
@@ -207,15 +214,16 @@ export function RelayShell({
           .range(page * 1000, page * 1000 + 999);
 
         if (error || !data || data.length === 0) break;
-
-        setLeads((prev) => {
-          const seen = new Set(prev.map((l) => l.id));
-          const fresh = (data as Lead[]).filter((l) => !seen.has(l.id));
-          return fresh.length ? [...prev, ...fresh] : prev;
-        });
-
+        collected.push(...(data as Lead[]));
         if (data.length < 1000) break;
       }
+
+      if (cancelled || collected.length === 0) return;
+      setLeads((prev) => {
+        const seen = new Set(prev.map((l) => l.id));
+        const fresh = collected.filter((l) => !seen.has(l.id));
+        return fresh.length ? [...prev, ...fresh] : prev;
+      });
     })();
 
     return () => { cancelled = true; };
