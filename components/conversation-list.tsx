@@ -188,7 +188,7 @@ export function ConversationList({
         )}
       </div>
 
-      <div style={{ flex: 1, overflowY: 'auto', minHeight: 0, overscrollBehavior: 'contain' }}>
+      <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
         {!loading && visible.length === 0 && (
           <div style={{ padding: '38px 24px', textAlign: 'center', color: 'var(--muted)' }}>
             <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 5 }}>
