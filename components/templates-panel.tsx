@@ -33,13 +33,49 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
   // every request shape), but the button stays: the day they fix it this starts
   // working with no change here, and until then it reports their real response
   // rather than leaving you to wonder.
-  async function syncFromInterakt() {
+  const [connected, setConnected] = useState<boolean | null>(null);
+  const [connectOpen, setConnectOpen] = useState(false);
+  const [orgId, setOrgId] = useState('');
+  const [token, setToken] = useState('');
+
+  useEffect(() => {
+    fetch('/api/whatsapp/templates/fetch')
+      .then((r) => r.json())
+      .then((j) => setConnected(!!j.connected || !!j.metaAvailable))
+      .catch(() => setConnected(false));
+  }, []);
+
+  /** THE BUTTON. Pulls every approved template from Interakt in one go. */
+  async function fetchTemplates() {
     setSyncing(true); setSyncNote(null);
     try {
-      const res = await fetch('/api/whatsapp/templates/sync', { method: 'POST' });
+      const res = await fetch('/api/whatsapp/templates/fetch', { method: 'POST' });
       const j = await res.json();
-      setSyncNote(j.ok ? j.note : j.error);
-      if (j.ok) load();
+      if (j.ok) { setSyncNote(j.note); load(); }
+      else {
+        setSyncNote(j.error);
+        if (j.needsConnection || j.expired) { setConnected(false); setConnectOpen(true); }
+      }
+    } catch {
+      setSyncNote('Could not reach the server.');
+    }
+    setSyncing(false);
+  }
+
+  /** One-time (and after expiry) connection. Verified before it is saved. */
+  async function saveConnection() {
+    setSyncing(true); setSyncNote(null);
+    try {
+      const res = await fetch('/api/whatsapp/templates/fetch', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orgId: orgId.trim(), token: token.trim() }),
+      });
+      const j = await res.json();
+      if (j.ok) {
+        setConnected(true); setConnectOpen(false); setToken(''); setOrgId('');
+        setSyncNote(`Connected — ${j.found} approved template${j.found === 1 ? '' : 's'} found. Press Fetch templates.`);
+      } else setSyncNote(j.error);
     } catch {
       setSyncNote('Could not reach the server.');
     }
@@ -238,9 +274,13 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
           <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>Templates</h1>
           {!editing && (
             <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
-              <button onClick={syncFromInterakt} disabled={syncing} style={ghostBtn}>
+              <button
+                onClick={() => (connected === false ? setConnectOpen(true) : fetchTemplates())}
+                disabled={syncing}
+                style={{ ...primaryBtn, background: 'var(--teal)' }}
+              >
                 {syncing ? <Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> : <RefreshCw size={14} />}
-                Sync approved templates
+                {connected === false ? 'Connect Interakt' : 'Fetch templates'}
               </button>
               <button onClick={() => { setBulkOpen((v) => !v); setBulkNote(null); }} style={ghostBtn}>
                 <ClipboardPaste size={14} /> Paste many
@@ -257,27 +297,44 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
           allows once the 24-hour window has closed.
         </p>
 
-        {/* How to get them in automatically. Interakt's list API has been
-            returning HTTP 500 for months, so Meta is the route that works. */}
-        <details style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, padding: '12px 14px', marginBottom: 18 }}>
-          <summary style={{ fontSize: 12.8, fontWeight: 600, color: 'var(--ink)', cursor: 'pointer' }}>
-            Make &ldquo;Sync approved templates&rdquo; pull everything automatically
-          </summary>
-          <div style={{ fontSize: 12.3, color: 'var(--muted)', lineHeight: 1.7, marginTop: 10 }}>
-            Interakt&rsquo;s template list API has been returning an error for months (their bug — sending
-            works fine), so we ask Meta directly instead. One-time setup:
-            <ol style={{ margin: '9px 0 0', paddingLeft: 20 }}>
-              <li>Open <strong>business.facebook.com</strong> &rarr; Settings &rarr; Users &rarr; System users</li>
-              <li>Add a system user, then <strong>Generate token</strong> with the
-                  <strong> whatsapp_business_management</strong> permission</li>
-              <li>In Netlify, add <code>META_ACCESS_TOKEN</code> with that token, and redeploy</li>
-            </ol>
-            <div style={{ marginTop: 9 }}>
-              After that this button imports every approved template — names, wording and placeholders —
-              and re-importing keeps them current. Until then, use <strong>Paste many</strong>.
+        {/* Connect once; after that the button just works. */}
+        {connectOpen && (
+          <section className="animate-pop-in" style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 14, padding: 18, marginBottom: 18, boxShadow: 'var(--shadow)' }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--ink)', marginBottom: 4 }}>Connect Interakt</div>
+            <div style={{ fontSize: 12.4, color: 'var(--muted)', lineHeight: 1.7, marginBottom: 14 }}>
+              One time only. After this, <strong>Fetch templates</strong> imports everything in one click.
+              <ol style={{ margin: '9px 0 0', paddingLeft: 20 }}>
+                <li>Open <strong>app.interakt.ai</strong> in another tab and sign in</li>
+                <li>Press <strong>F12</strong> &rarr; <strong>Application</strong> &rarr; <strong>Local storage</strong> &rarr; <code>app.interakt.ai</code></li>
+                <li>Copy the values of <code>organizationId</code> and <code>token</code> into the boxes below</li>
+              </ol>
             </div>
-          </div>
-        </details>
+
+            <label style={label}>Organisation id</label>
+            <input style={input} value={orgId} onChange={(e) => setOrgId(e.target.value)} placeholder="59c88059-…" />
+
+            <div style={{ height: 12 }} />
+            <label style={label}>Token</label>
+            <textarea
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              rows={3}
+              placeholder="eyJhbGciOiJI…"
+              style={{ ...input, resize: 'vertical', fontFamily: 'ui-monospace, SFMono-Regular, monospace', fontSize: 11.5 }}
+            />
+
+            <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
+              <button onClick={saveConnection} disabled={syncing || !orgId.trim() || !token.trim()} style={primaryBtn}>
+                {syncing ? <Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> : null} Connect
+              </button>
+              <button onClick={() => setConnectOpen(false)} style={ghostBtn}>Cancel</button>
+            </div>
+            <div style={{ fontSize: 11.3, color: 'var(--muted)', marginTop: 11, lineHeight: 1.6 }}>
+              Interakt expires this connection every so often. When it does, the button says so and you
+              repeat these three steps — nothing else breaks in the meantime.
+            </div>
+          </section>
+        )}
 
         {syncNote && (
           <div style={{ background: 'var(--amber-bg)', color: 'var(--ink)', padding: '11px 13px', borderRadius: 10, fontSize: 12.3, lineHeight: 1.55, marginBottom: 14 }}>
