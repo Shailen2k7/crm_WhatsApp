@@ -154,6 +154,10 @@ export async function PATCH(req: NextRequest) {
     for (const k of ['name', 'audience', 'hours_enabled', 'send_start_hour', 'send_end_hour', 'industries']) {
       if (k in body.sequence) allowed[k] = body.sequence[k];
     }
+    if ('per_hour_cap' in body.sequence) {
+      const n = Number(body.sequence.per_hour_cap);
+      allowed.per_hour_cap = Number.isFinite(n) && n > 0 ? Math.min(200, Math.round(n)) : null;
+    }
     if (Object.keys(allowed).length) {
       const { error } = await admin.from('relay_sequences')
         .update({ ...allowed, updated_at: new Date().toISOString() }).eq('id', seq.id);
@@ -177,10 +181,46 @@ export async function PATCH(req: NextRequest) {
           gap_days: Math.round(hours / 24),
         };
       });
+
+    // The old gaps, kept so the people already waiting can be re-timed below.
+    const { data: oldSteps } = await admin
+      .from('relay_sequence_steps').select('step_no, gap_hours, gap_days').eq('sequence_id', seq.id);
+
     await admin.from('relay_sequence_steps').delete().eq('sequence_id', seq.id);
     if (rows.length) {
       const { error } = await admin.from('relay_sequence_steps').insert(rows);
       if (error) return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
+    }
+
+    // ---- re-time everyone already waiting ----------------------------------
+    // Changing "C1 goes out after 2 days" to "after 0 days" has to move the
+    // people already queued, otherwise the new setting only reaches leads who
+    // enrol tomorrow and the page lies about what will happen today. Each row
+    // shifts by exactly the change in its own next gap, which preserves the
+    // chase's anchoring to the first message.
+    const hoursOf = (s?: { gap_hours?: number | null; gap_days?: number | null }) =>
+      (s?.gap_hours ?? (s?.gap_days ?? 0) * 24) || 0;
+    const oldByNo = new Map((oldSteps || []).map((s) => [s.step_no, hoursOf(s)]));
+    const newByNo = new Map(rows.map((r: { step_no: number; gap_hours: number }) => [r.step_no, r.gap_hours]));
+
+    const { data: waiting } = await admin
+      .from('relay_lead_sequences')
+      .select('id, current_step, next_send_at')
+      .eq('sequence_id', seq.id).eq('status', 'active');
+
+    const edits: { id: string; next_send_at: string }[] = [];
+    for (const w of waiting || []) {
+      const nextNo = (w.current_step ?? 0) + 1;
+      if (!newByNo.has(nextNo) || !w.next_send_at) continue;   // step gone: engine will finish them
+      const deltaMs = ((newByNo.get(nextNo) as number) - (oldByNo.get(nextNo) ?? 0)) * 3_600_000;
+      if (!deltaMs) continue;
+      edits.push({ id: w.id, next_send_at: new Date(new Date(w.next_send_at).getTime() + deltaMs).toISOString() });
+    }
+    for (let i = 0; i < edits.length; i += 25) {
+      await Promise.all(edits.slice(i, i + 25).map((e) =>
+        admin.from('relay_lead_sequences')
+          .update({ next_send_at: e.next_send_at, updated_at: new Date().toISOString() })
+          .eq('id', e.id)));
     }
   }
 
@@ -215,6 +255,45 @@ export async function POST(req: NextRequest) {
   const { data: seqRows } = await sq;
   const seq = seqRows?.[0];
   if (!seq) return NextResponse.json({ ok: false, error: 'No sequence.' }, { status: 404 });
+
+  // ---- release: send the first message now, oldest lead first --------------
+  // For when the schedule changed under people who were already queued. Only
+  // leads who have not yet had ANYTHING from this sequence move: someone
+  // between C1 and C2 has a deliberate three-day gap, and collapsing that to
+  // the same afternoon is exactly the mistake this guard exists to prevent.
+  // Order is preserved by stamping the oldest lead a second earlier than the
+  // next, so the engine still works through them oldest first.
+  if (action === 'release_now') {
+    const { data: waiting } = await admin
+      .from('relay_lead_sequences')
+      .select('id, lead_id, enrolled_at')
+      .eq('sequence_id', seq.id).eq('status', 'active')
+      .eq('current_step', 0)
+      .gt('next_send_at', new Date().toISOString());
+    if (!waiting?.length) return NextResponse.json({ ok: true, released: 0 });
+
+    const ids = waiting.map((w) => w.lead_id).filter(Boolean) as string[];
+    const born = new Map<string, string>();
+    for (let i = 0; i < ids.length; i += 200) {
+      const { data } = await admin.from('leads').select('id, created_at').in('id', ids.slice(i, i + 200));
+      for (const l of data || []) born.set(l.id, l.created_at);
+    }
+    const order = [...waiting].sort((x, y) =>
+      String(born.get(x.lead_id || '') || x.enrolled_at || '').localeCompare(
+      String(born.get(y.lead_id || '') || y.enrolled_at || '')));
+
+    const now = Date.now();
+    const stamped = order.map((w, rank) => ({
+      id: w.id, at: new Date(now - (order.length - rank) * 1000).toISOString(),
+    }));
+    for (let i = 0; i < stamped.length; i += 25) {
+      await Promise.all(stamped.slice(i, i + 25).map((s) =>
+        admin.from('relay_lead_sequences')
+          .update({ next_send_at: s.at, updated_at: new Date().toISOString() })
+          .eq('id', s.id)));
+    }
+    return NextResponse.json({ ok: true, released: order.length });
+  }
 
   const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
   if (action === 'start' || action === 'resume') {
