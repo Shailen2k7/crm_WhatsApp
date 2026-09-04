@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Play, Pause, Square, Plus, X, Loader2, CheckCircle2, MessageSquareReply,
-  SkipForward, Users, Send, ListChecks, CalendarClock, Clock,
+  SkipForward, Users, Send, ListChecks, CalendarClock, Clock, Zap,
 } from 'lucide-react';
 import type { RelayTemplate } from '@/lib/messages';
 
@@ -25,6 +25,7 @@ interface Seq {
   trigger_mode?: 'backlog' | 'no_reply';
   industries?: string[] | null;
   hours_enabled: boolean; send_start_hour: number; send_end_hour: number;
+  per_hour_cap: number | null;
   started_at: string | null;
 }
 interface SeqSummary { id: string; name: string; status: Seq['status']; trigger_mode: string }
@@ -70,6 +71,7 @@ export function SequencePanel({ templates }: { templates: RelayTemplate[] }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState<'idle' | 'saving' | 'saved'>('idle');
   const [acting, setActing] = useState(false);
+  const [released, setReleased] = useState<number | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Two columns when the PANEL is wide enough — measured, not guessed.
@@ -99,6 +101,7 @@ export function SequencePanel({ templates }: { templates: RelayTemplate[] }) {
         // While polling, keep whatever the user is mid-editing.
         audience: prev.audience, hours_enabled: prev.hours_enabled, industries: prev.industries,
         send_start_hour: prev.send_start_hour, send_end_hour: prev.send_end_hour,
+        per_hour_cap: prev.per_hour_cap,
       } } : j.sequence);
       setStats(j.stats);
       setActivity(j.activity || []);
@@ -132,7 +135,7 @@ export function SequencePanel({ templates }: { templates: RelayTemplate[] }) {
     }, 600);
   }
 
-  async function act(action: 'start' | 'pause' | 'resume' | 'stop') {
+  async function act(action: 'start' | 'pause' | 'resume' | 'stop' | 'release_now') {
     if (!seq) return;
     setActing(true);
     try {
@@ -140,12 +143,18 @@ export function SequencePanel({ templates }: { templates: RelayTemplate[] }) {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, id: seq.id }),
       });
       const j = await res.json();
-      if (j.ok) { setSeq({ ...seq, status: j.status }); load(true); }
+      if (j.ok) {
+        if (action === 'release_now') setReleased(j.released ?? 0);
+        else setSeq({ ...seq, status: j.status });
+        load(true);
+      }
     } catch { /* pill stays as it was */ }
     setActing(false);
   }
 
   const chase = seq?.trigger_mode === 'no_reply';
+  const windowHours = seq?.hours_enabled
+    ? Math.max(1, (seq.send_end_hour ?? 19) - (seq.send_start_hour ?? 9)) : 24;
   const gapWord = (h: number) => h % 24 === 0 && h >= 24 ? `${h / 24} day${h === 24 ? '' : 's'}` : `${h} hour${h === 1 ? '' : 's'}`;
 
   const summary = useMemo(() => {
@@ -214,6 +223,11 @@ export function SequencePanel({ templates }: { templates: RelayTemplate[] }) {
       </div>
       <div style={{ fontSize: 12.9, color: 'var(--muted)', lineHeight: 1.6, margin: '8px 0 16px', maxWidth: 640 }}>
         {summary} Anyone who replies leaves it immediately.
+        {released !== null && (
+          <span style={{ color: 'var(--green)', fontWeight: 600 }}>
+            {' '}{released} {released === 1 ? 'lead is' : 'leads are'} now in today&rsquo;s queue.
+          </span>
+        )}
       </div>
 
       <div style={{ display: 'flex', gap: 9, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -226,6 +240,14 @@ export function SequencePanel({ templates }: { templates: RelayTemplate[] }) {
           <>
             <button onClick={() => act('pause')} disabled={acting} style={btn(false)}><Pause size={14} /> Pause</button>
             <button onClick={() => act('stop')} disabled={acting} style={{ ...btn(false), color: 'var(--red)' }}><Square size={13} /> Stop</button>
+            <button
+              onClick={() => act('release_now')}
+              disabled={acting}
+              title="Leads queued for their first message go out today, oldest first. People already mid-sequence keep their gaps."
+              style={btn(false)}
+            >
+              <Zap size={14} /> Start waiting leads now
+            </button>
           </>
         )}
         {(seq.status === 'paused' || seq.status === 'stopped') && (
@@ -397,11 +419,15 @@ export function SequencePanel({ templates }: { templates: RelayTemplate[] }) {
                 <span style={{ fontWeight: 700, color: 'var(--red)', flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}>{f.hits}×</span>
                 <span style={{ color: 'var(--muted)' }}>
                   {/^131049$/.test(f.code)
-                    ? 'Meta held it back — this person has had too many marketing messages lately. Slow the daily rate, or use a UTILITY template.'
+                    ? 'Meta held it back — this person has had too many marketing messages lately. We try again the next morning, up to twice.'
                     : f.detail}
                 </span>
               </div>
             ))}
+          </div>
+          <div style={{ fontSize: 11.4, color: 'var(--muted)', marginTop: 9, lineHeight: 1.55 }}>
+            A bounce does not lose the lead: the same message is queued again for
+            11am the following day, and only after three attempts do we stop.
           </div>
         </div>
       )}
@@ -578,6 +604,30 @@ export function SequencePanel({ templates }: { templates: RelayTemplate[] }) {
           {Array.from({ length: 24 }, (_, h) => <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>)}
         </select>
         <span style={{ fontSize: 11.6, color: 'var(--muted)' }}>IST</span>
+      </div>
+
+      <div style={{ borderTop: '1px solid var(--line)', margin: '14px 0 12px' }} />
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 12.8, fontWeight: 600, color: 'var(--ink)' }}>Send at most</span>
+        <input
+          type="number" min={1} max={200}
+          style={{ ...numInput, width: 74 }}
+          value={seq.per_hour_cap ?? ''}
+          placeholder="—"
+          onChange={(e) => {
+            const v = e.target.value === '' ? null : Math.max(1, Math.min(200, Number(e.target.value) || 1));
+            setSeq({ ...seq, per_hour_cap: v });
+            queueSave({ sequence: { per_hour_cap: v } });
+          }}
+        />
+        <span style={{ fontSize: 12.8, color: 'var(--ink)' }}>messages an hour</span>
+      </div>
+      <div style={{ fontSize: 11.8, color: 'var(--muted)', marginTop: 7, lineHeight: 1.55 }}>
+        {seq.per_hour_cap
+          ? <>That is <b style={{ color: 'var(--ink)' }}>{seq.per_hour_cap * windowHours} a day</b> across your{' '}
+              {windowHours}-hour window — small batches through the day, not the whole queue at 9am.</>
+          : <>No hourly limit: the queue goes out as fast as it can. Set a number to spread it through the day.</>}
       </div>
     </section>
   );
