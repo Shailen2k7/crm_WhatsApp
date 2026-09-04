@@ -40,6 +40,15 @@ function visaLabelOf(visaType: string | null | undefined): string {
   const v = (visaType || '').toLowerCase();
   return v.includes('ifv') || v.includes('innovator') ? 'Innovator Founder Visa' : 'Global Talent Visa';
 }
+/**
+ * The Meta lead form arrives as a message that spells the name out. When the
+ * number is not in the CRM that line is all we have to greet them by.
+ */
+function nameFromEnquiry(body: string | null | undefined): string | null {
+  const m = (body || '').match(/full\s*name\s*:\s*(.+)/i);
+  const n = m?.[1]?.split('\n')[0]?.trim();
+  return n || null;
+}
 /** {{name}} / {{first_name}} / {{visa}} tokens in quick-reply bodies. */
 function personalise(body: string, lead: { full_name?: string | null; visa_type?: string | null }): string {
   return body
@@ -175,6 +184,84 @@ export async function POST(req: NextRequest) {
       await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claim.id);
       if (ok) out.sent = (out.sent as number) + 1;
       else (out.skipped as string[]).push(`${lead.full_name}: ${errText}`);
+    }
+
+    // ---- people who message us from a number that is not in the CRM -------
+    // They fill the form with one number and then WhatsApp from another. The
+    // reply belongs on the number they actually used, so an unknown inbound
+    // gets the same first message without waiting for a lead record.
+    const { data: inbound } = await admin
+      .from('relay_conversations')
+      .select('id, phone_e164, last_inbound_at')
+      .eq('workspace_id', ws)
+      .not('last_inbound_at', 'is', null)
+      .gte('last_inbound_at', rule.activated_at)
+      .lte('last_inbound_at', cutoff)
+      .order('last_inbound_at', { ascending: true })
+      .limit(100);
+
+    // Lead phones are stored however they arrived — "+91 98108 27787",
+    // "9810827787", "+919810827787" — so "is this number in the CRM?" can only
+    // be answered on digits. A LIKE against the raw column silently misses the
+    // spaced ones and would message people who are already customers.
+    const knownDigits = new Set<string>();
+    if ((inbound || []).length) {
+      for (let page = 0; page < 10; page++) {
+        const { data: phones } = await admin
+          .from('leads').select('phone').eq('workspace_id', ws)
+          .range(page * 1000, page * 1000 + 999);
+        if (!phones?.length) break;
+        for (const p of phones) {
+          const d = String(p.phone || '').replace(/\D/g, '');
+          if (d.length >= 10) knownDigits.add(d.slice(-10));
+        }
+        if (phones.length < 1000) break;
+      }
+    }
+
+    for (const conv of inbound || []) {
+      if ((out.sent as number) >= room) { (out.skipped as string[]).push('daily cap reached mid-run'); break; }
+      const phoneE164 = conv.phone_e164 as string;
+      if (!phoneE164 || donePhones.has(phoneE164) || stopPhones.has(phoneE164)) continue;
+
+      // A number that already has a lead row was handled by the pass above, or
+      // belongs to an older contact this rule deliberately leaves alone.
+      if (knownDigits.has(phoneE164.replace(/\D/g, '').slice(-10))) continue;
+
+      // Greet them by the name in their enquiry when it carries one.
+      const { data: firstMsg } = await admin
+        .from('relay_messages')
+        .select('body').eq('conversation_id', conv.id).eq('direction', 'in')
+        .order('created_at', { ascending: true }).limit(1).maybeSingle();
+      const stranger = { full_name: nameFromEnquiry(firstMsg?.body), visa_type: null };
+
+      if (dryRun) {
+        (out.skipped as string[]).push(`DRY RUN — would send the first message to ${phoneE164} (not in CRM)`);
+        continue;
+      }
+
+      const { data: claim, error: claimErr } = await admin
+        .from('relay_automation_sent')
+        .insert({
+          workspace_id: ws, automation_key: rule.key, lead_id: null, phone_e164: phoneE164,
+          method: 'quick_reply', detail: rule.quick_reply_shortcut, ok: false,
+        })
+        .select('id').single();
+      if (claimErr || !claim) continue;   // another tick got there first
+
+      let ok = false; let errText: string | null = null;
+      try {
+        // They have just messaged us, so the 24-hour window is open and the
+        // free-form quick reply is the right thing to send.
+        ok = await sendQuickReply(admin, ws, conv.id, phoneE164, rule.quick_reply_shortcut, stranger);
+        if (!ok) errText = 'quick reply failed (see message row)';
+      } catch (e) {
+        errText = e instanceof Error ? e.message : String(e);
+      }
+
+      await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claim.id);
+      if (ok) { out.sent = (out.sent as number) + 1; donePhones.add(phoneE164); }
+      else (out.skipped as string[]).push(`${phoneE164}: ${errText}`);
     }
   }
 
