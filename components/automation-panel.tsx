@@ -17,6 +17,7 @@ import { Workflow, Loader2, Play, ShieldCheck, ChevronDown } from 'lucide-react'
 import type { QuickReply, RelayTemplate } from '@/lib/messages';
 import { SequencePanel } from './sequence-panel';
 import { CampaignPanel } from './campaign-panel';
+import { HotLeadsPanel } from './hot-leads-panel';
 
 interface Rule {
   id: string;
@@ -37,7 +38,7 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
   const [running, setRunning] = useState(false);
   const [runNote, setRunNote] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [tab, setTab] = useState<'newlead' | 'sequence' | 'campaign'>('newlead');
+  const [tab, setTab] = useState<'newlead' | 'sequence' | 'hot' | 'campaign'>('newlead');
 
   const load = useCallback(async () => {
     const [r, qr, tp] = await Promise.all([
@@ -109,9 +110,9 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
           <Workflow size={19} style={{ color: 'var(--green)' }} /> Automation
         </h1>
 
-        {/* the two machines, one tab each */}
+        {/* one tab per machine */}
         <div style={{ display: 'inline-flex', background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 11, padding: 3, marginBottom: 18, boxShadow: 'var(--shadow)' }}>
-          {([['newlead', 'New lead'], ['sequence', 'Follow-up sequence'], ['campaign', 'Campaigns']] as const).map(([k, lbl]) => (
+          {([['newlead', 'New lead'], ['sequence', 'Cold follow-up'], ['hot', 'Hot leads'], ['campaign', 'Campaigns']] as const).map(([k, lbl]) => (
             <button
               key={k}
               onClick={() => setTab(k)}
@@ -128,6 +129,7 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
         </div>
 
         {tab === 'campaign' ? <CampaignPanel templates={templates} />
+         : tab === 'hot' ? <HotLeadsPanel templates={templates} />
          : tab === 'sequence' ? <SequencePanel templates={templates} /> : (<>
 
         {/* ── THE SWITCH ─────────────────────────────────────────────────── */}

@@ -12,6 +12,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { intakeLimitFor } from '@/lib/sequence-engine';
+import { toE164 } from '@/lib/phone';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -44,6 +45,20 @@ export async function GET(req: NextRequest) {
     .from('relay_sequences').select('*').eq('workspace_id', ws)
     .order('created_at');
   if (!all?.length) return NextResponse.json({ ok: false, error: 'Run migration 112 first.' }, { status: 404 });
+
+  // A caller that only needs to know which machines exist should not pay for
+  // the counters below: each one is several exact counts plus two RPCs, and
+  // asking for them N times to identify one sequence is how a page ends up
+  // taking twenty seconds to render.
+  if (req.nextUrl.searchParams.get('list') === '1') {
+    return NextResponse.json({
+      ok: true,
+      sequences: all.map((x) => ({
+        id: x.id, name: x.name, status: x.status,
+        audience: x.audience, trigger_mode: x.trigger_mode || 'backlog',
+      })),
+    });
+  }
 
   const wantId = req.nextUrl.searchParams.get('id');
   const seq = all.find((x) => x.id === wantId) || all[0];
@@ -111,7 +126,10 @@ export async function GET(req: NextRequest) {
 
   return NextResponse.json({
     ok: true,
-    sequences: all.map((x) => ({ id: x.id, name: x.name, status: x.status, trigger_mode: x.trigger_mode || 'backlog' })),
+    sequences: all.map((x) => ({
+      id: x.id, name: x.name, status: x.status,
+      audience: x.audience, trigger_mode: x.trigger_mode || 'backlog',
+    })),
     industryOptions,
     sequence: seq,
     steps,
@@ -249,6 +267,50 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}));
   const action = body.action as string;
 
+  // ---- create: a brand new machine ----------------------------------------
+  // Handled before the lookup below, which 404s when the machine does not
+  // exist yet. Created as 'draft' and never as 'running': the templates it
+  // names may still be waiting on Meta approval, and a machine that starts
+  // itself the moment it is created is a machine nobody consented to.
+  if (action === 'create') {
+    const name = String(body.name || 'Hot leads follow-up').slice(0, 80);
+    const audience = ['cold', 'hot', 'both'].includes(String(body.audience))
+      ? String(body.audience) : 'hot';
+
+    const { data: clash } = await admin.from('relay_sequences')
+      .select('id').eq('workspace_id', ws).eq('audience', audience)
+      .eq('trigger_mode', 'backlog').maybeSingle();
+    if (clash) {
+      return NextResponse.json(
+        { ok: false, error: `A ${audience} machine already exists. Edit that one instead of adding a second.` },
+        { status: 400 });
+    }
+
+    const { data: made, error: mkErr } = await admin.from('relay_sequences').insert({
+      workspace_id: ws, name, audience, status: 'draft', trigger_mode: 'backlog',
+      hours_enabled: true, send_start_hour: 10, send_end_hour: 19,
+    }).select('id').single();
+    if (mkErr || !made) {
+      return NextResponse.json({ ok: false, error: mkErr?.message || 'Could not create it.' }, { status: 500 });
+    }
+
+    const steps = Array.isArray(body.steps) && body.steps.length
+      ? (body.steps as { template_name?: string; gap_hours?: number }[])
+      : [{ template_name: 'h1', gap_hours: 0 }, { template_name: 'h2', gap_hours: 72 },
+         { template_name: 'h3', gap_hours: 72 }, { template_name: 'h4', gap_hours: 96 }];
+    await admin.from('relay_sequence_steps').insert(steps.slice(0, 10).map((st, i) => ({
+      sequence_id: made.id, workspace_id: ws, step_no: i + 1,
+      template_name: String(st.template_name || `h${i + 1}`),
+      gap_days: Math.round(Number(st.gap_hours ?? 72) / 24),
+      gap_hours: Math.max(0, Number(st.gap_hours ?? 72)),
+    })));
+    await admin.from('relay_sequence_ramp').insert({
+      sequence_id: made.id, workspace_id: ws, stage_no: 1,
+      per_day: Math.max(1, Math.min(1000, Number(body.per_day) || 25)), duration_days: null,
+    });
+    return NextResponse.json({ ok: true, id: made.id, status: 'draft' });
+  }
+
   const body2 = body as { id?: string };
   let sq = admin.from('relay_sequences').select('id, status, started_at').eq('workspace_id', ws).order('created_at').limit(1);
   if (body2.id) sq = admin.from('relay_sequences').select('id, status, started_at').eq('workspace_id', ws).eq('id', String(body2.id)).limit(1);
@@ -293,6 +355,90 @@ export async function POST(req: NextRequest) {
           .eq('id', s.id)));
     }
     return NextResponse.json({ ok: true, released: order.length });
+  }
+
+  // ---- enrol_all: put every reachable person in NOW ------------------------
+  // The ramp meters intake so a cold database is never carpet bombed. A hot
+  // list is the opposite case: people who already spoke to us, where waiting
+  // days to reach the last one costs deals. This fills the queue in one pass.
+  //
+  // It only ADDS, and every guard the engine applies still applies here: opted
+  // out, already enrolled, active in another machine, unusable number. The
+  // point is to skip the WAIT, not to skip the rules. Sending stays paced by
+  // the hourly cap and the sending window.
+  if (action === 'enrol_all') {
+    const { data: full } = await admin.from('relay_sequences')
+      .select('audience, industries, trigger_mode').eq('id', seq.id).maybeSingle();
+    if ((full?.trigger_mode || 'backlog') === 'no_reply') {
+      return NextResponse.json(
+        { ok: false, error: 'The no-reply chase picks its own people, so there is no audience to enrol.' },
+        { status: 400 });
+    }
+    const stages = full?.audience === 'both' ? ['cold', 'hot'] : [full?.audience || 'cold'];
+    const industries: string[] | null = full?.industries ?? null;
+    const industryOk = (ind: string | null) =>
+      !industries || industries.includes((ind || '').trim() || '(none)');
+
+    const [{ data: already }, { data: busy }, { data: stops }] = await Promise.all([
+      admin.from('relay_lead_sequences').select('lead_id, phone_e164').eq('sequence_id', seq.id),
+      admin.from('relay_lead_sequences').select('lead_id, phone_e164')
+        .eq('workspace_id', ws).eq('status', 'active').neq('sequence_id', seq.id),
+      admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws),
+    ]);
+    const doneLeads = new Set([...(already || []), ...(busy || [])].map((r) => r.lead_id).filter(Boolean));
+    const donePhones = new Set([...(already || []), ...(busy || [])].map((r) => r.phone_e164));
+    const stopPhones = new Set((stops || []).map((s) => s.phone_e164));
+
+    const rows: Record<string, unknown>[] = [];
+    for (let page = 0; page < 40; page++) {
+      const { data: leads } = await admin.from('leads')
+        .select('id, phone, industry, is_sample')
+        .eq('workspace_id', ws).in('stage', stages)
+        .order('created_at', { ascending: true })
+        .range(page * 500, page * 500 + 499);
+      if (!leads?.length) break;
+      for (const l of leads) {
+        if (l.is_sample || doneLeads.has(l.id) || !industryOk(l.industry)) continue;
+        const phone = toE164(l.phone);
+        if (!phone || donePhones.has(phone) || stopPhones.has(phone)) continue;
+        donePhones.add(phone);            // two lead rows, one number, one message
+        rows.push({
+          workspace_id: ws, sequence_id: seq.id, lead_id: l.id, phone_e164: phone,
+          status: 'active', current_step: 0, next_send_at: new Date().toISOString(),
+        });
+      }
+      if (leads.length < 500) break;
+    }
+    if (!rows.length) return NextResponse.json({ ok: true, enrolled: 0 });
+
+    let enrolled = 0;
+    for (let i = 0; i < rows.length; i += 200) {
+      const { data, error: insErr } = await admin.from('relay_lead_sequences')
+        .insert(rows.slice(i, i + 200)).select('id');
+      if (insErr) return NextResponse.json({ ok: false, error: insErr.message, enrolled }, { status: 500 });
+      enrolled += data?.length ?? 0;
+    }
+    return NextResponse.json({ ok: true, enrolled });
+  }
+
+  // ---- delete: remove the machine and everything it remembers --------------
+  // Guarded on status, because deleting a running sequence strands people the
+  // engine is mid-way through. Stop it, look at what stopped, then delete.
+  if (action === 'delete') {
+    if (seq.status === 'running') {
+      return NextResponse.json(
+        { ok: false, error: 'Stop it first. Deleting a running machine would strand people mid-sequence.' },
+        { status: 400 });
+    }
+    await admin.from('relay_sequence_sends').delete().eq('sequence_id', seq.id);
+    await admin.from('relay_lead_sequences').delete().eq('sequence_id', seq.id);
+    // Steps and ramp cascade from relay_sequences; deleting them explicitly
+    // means a future schema change that drops the cascade leaves no orphans.
+    await admin.from('relay_sequence_steps').delete().eq('sequence_id', seq.id);
+    await admin.from('relay_sequence_ramp').delete().eq('sequence_id', seq.id);
+    const { error: delErr } = await admin.from('relay_sequences').delete().eq('id', seq.id);
+    if (delErr) return NextResponse.json({ ok: false, error: delErr.message }, { status: 500 });
+    return NextResponse.json({ ok: true, deleted: true });
   }
 
   const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
