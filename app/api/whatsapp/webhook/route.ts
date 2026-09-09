@@ -23,6 +23,7 @@ import { statusFromEvent, mediaTypeFrom, type InteraktWebhook } from '@/lib/inte
 import { toE164 } from '@/lib/phone';
 import { pushToWorkspace } from '@/lib/push-server';
 import { RELAY_BUCKET, MAX_UPLOAD_BYTES, mediaPath, safeFilename, mimeFor, presentableName } from '@/lib/files';
+import { captureCvFromDocument } from '@/lib/cv-capture';
 import { createHmac, timingSafeEqual } from 'crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
@@ -98,7 +99,7 @@ async function logAttempt(row: {
 async function archiveMedia(
   admin: SupabaseClient,
   opts: { workspaceId: string; conversationId: string; messageId: string; url: string; contentTypeHint?: string | null; mediaType?: string | null }
-): Promise<{ path: string; name: string; mime: string; size: number } | null> {
+): Promise<{ path: string; name: string; mime: string; size: number; buf: Buffer } | null> {
   try {
     const res = await fetch(opts.url, { signal: AbortSignal.timeout(30_000) });
     if (!res.ok) return null;
@@ -120,7 +121,7 @@ async function archiveMedia(
       upsert: true,
     });
     if (error) return null;
-    return { path, name: filename, mime, size: buf.byteLength };
+    return { path, name: filename, mime, size: buf.byteLength, buf };
   } catch {
     return null;
   }
@@ -312,6 +313,19 @@ export async function POST(req: Request) {
             media_mime: stored.mime,
             media_size: stored.size,
           }).eq('id', inserted.id);
+
+          // A client's document might be their CV. If it reads like one, the
+          // text lands on the lead right now, so the CRM drawer shows "View
+          // profile" without anyone touching a file. Strict threshold, no
+          // matching needed (the conversation already knows its lead), and
+          // never allowed to fail the webhook.
+          if (direction === 'in' && mediaType === 'document') {
+            const cv = await captureCvFromDocument(admin, {
+              workspaceId: ws.id, conversationId: convId as string, messageId: inserted.id,
+              buf: stored.buf, filename: stored.name, mime: stored.mime,
+            });
+            if (cv.captured) console.log('[relay webhook] cv captured', inserted.id, cv.reason);
+          }
         }
       }
 
