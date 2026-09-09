@@ -18,6 +18,7 @@ import type { QuickReply, RelayTemplate } from '@/lib/messages';
 import { SequencePanel } from './sequence-panel';
 import { CampaignPanel } from './campaign-panel';
 import { HotLeadsPanel } from './hot-leads-panel';
+import { MeetingRulesPanel } from './meeting-rules-panel';
 
 interface Rule {
   id: string;
@@ -38,7 +39,7 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
   const [running, setRunning] = useState(false);
   const [runNote, setRunNote] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [tab, setTab] = useState<'newlead' | 'sequence' | 'hot' | 'campaign'>('newlead');
+  const [tab, setTab] = useState<'newlead' | 'sequence' | 'hot' | 'meetings' | 'campaign'>('newlead');
 
   const load = useCallback(async () => {
     const [r, qr, tp] = await Promise.all([
@@ -73,7 +74,7 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
     try {
       const res = await fetch('/api/automation/tick', { method: 'POST' });
       const j = await res.json();
-      const r = j.report?.[0];
+      const r = (j.report || []).find((x: { key?: string }) => x.key === 'new_lead_first') || j.report?.[0];
       if (!j.ok) setRunNote(j.error || 'The run failed.');
       else if (!r) setRunNote(j.note || 'Switch it on first.');
       else {
@@ -112,7 +113,7 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
 
         {/* one tab per machine */}
         <div style={{ display: 'inline-flex', background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 11, padding: 3, marginBottom: 18, boxShadow: 'var(--shadow)' }}>
-          {([['newlead', 'New lead'], ['sequence', 'Cold follow-up'], ['hot', 'Hot leads'], ['campaign', 'Campaigns']] as const).map(([k, lbl]) => (
+          {([['newlead', 'New lead'], ['sequence', 'Cold follow-up'], ['hot', 'Hot leads'], ['meetings', 'Meetings'], ['campaign', 'Campaigns']] as const).map(([k, lbl]) => (
             <button
               key={k}
               onClick={() => setTab(k)}
@@ -130,6 +131,7 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
 
         {tab === 'campaign' ? <CampaignPanel templates={templates} />
          : tab === 'hot' ? <HotLeadsPanel templates={templates} />
+         : tab === 'meetings' ? <MeetingRulesPanel workspaceId={workspaceId} templates={templates} />
          : tab === 'sequence' ? <SequencePanel templates={templates} /> : (<>
 
         {/* ── THE SWITCH ─────────────────────────────────────────────────── */}

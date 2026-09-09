@@ -72,7 +72,14 @@ export async function PUT(req: NextRequest) {
   // Verify BEFORE saving, so a bad paste is caught while the user is still
   // looking at the form rather than the next time they press Fetch.
   const probe = await fetchInteraktTemplates(orgId, token);
-  if (!probe.ok) return NextResponse.json({ ok: false, error: probe.error }, { status: 400 });
+  if (!probe.ok) {
+    // This is a FRESH paste, so "your saved connection expired" is the wrong
+    // sentence. Say what actually went wrong and what to do about it.
+    const error = probe.expired
+      ? 'Interakt rejected those details. The token only lasts a few hours after you sign in — open app.interakt.ai again, copy a fresh token from Local storage, and check the organisation id matches.'
+      : probe.error;
+    return NextResponse.json({ ok: false, error }, { status: 400 });
+  }
 
   const now = new Date().toISOString();
   const { error } = await a.admin.from('relay_settings').upsert([

@@ -24,7 +24,12 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
-  const [syncNote, setSyncNote] = useState<string | null>(null);
+  // Every press of Connect / Fetch ends in exactly one of these, shown where
+  // the person is looking: inside the connect box while it is open, under
+  // the button otherwise. The first version put a plain string further down
+  // the page and people pressed the button, saw nothing, and pressed again.
+  const [syncNote, setSyncNote] = useState<{ tone: 'info' | 'ok' | 'error'; text: string } | null>(null);
+  const [checking, setChecking] = useState(true);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulk, setBulk] = useState('');
   const [bulkNote, setBulkNote] = useState<string | null>(null);
@@ -42,42 +47,57 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
     fetch('/api/whatsapp/templates/fetch')
       .then((r) => r.json())
       .then((j) => setConnected(!!j.connected || !!j.metaAvailable))
-      .catch(() => setConnected(false));
+      .catch(() => setConnected(false))
+      .finally(() => setChecking(false));
   }, []);
 
   /** THE BUTTON. Pulls every approved template from Interakt in one go. */
   async function fetchTemplates() {
-    setSyncing(true); setSyncNote(null);
+    setSyncing(true);
+    setSyncNote({ tone: 'info', text: 'Asking Interakt for your approved templates…' });
     try {
       const res = await fetch('/api/whatsapp/templates/fetch', { method: 'POST' });
-      const j = await res.json();
-      if (j.ok) { setSyncNote(j.note); load(); }
-      else {
-        setSyncNote(j.error);
+      const j = await res.json().catch(() => ({ ok: false, error: `Server replied ${res.status} with no detail.` }));
+      if (j.ok) {
+        const n = Number(j.imported ?? 0), added = Number(j.added ?? 0);
+        setSyncNote({ tone: 'ok', text:
+          n === 0 ? (j.note || `${j.source || 'Interakt'} reported no approved templates.`)
+          : `Imported ${n} approved template${n === 1 ? '' : 's'} from ${j.source || 'Interakt'}` +
+            (added ? ` — ${added} new` : ' — nothing new since last time') +
+            (j.skipped ? `. ${j.skipped} pending or rejected ${j.skipped === 1 ? 'one was' : 'were'} left out.` : '.') });
+        await load();
+      } else {
+        setSyncNote({ tone: 'error', text: j.error || `Interakt refused (HTTP ${res.status}).` });
         if (j.needsConnection || j.expired) { setConnected(false); setConnectOpen(true); }
       }
     } catch {
-      setSyncNote('Could not reach the server.');
+      setSyncNote({ tone: 'error', text: 'Could not reach the server. Check your connection and try again.' });
     }
     setSyncing(false);
   }
 
-  /** One-time (and after expiry) connection. Verified before it is saved. */
+  /** One-time (and after expiry) connection. Verified before it is saved, and
+   *  followed straight away by the fetch — nobody should have to press twice. */
   async function saveConnection() {
-    setSyncing(true); setSyncNote(null);
+    setSyncing(true);
+    setSyncNote({ tone: 'info', text: 'Checking the connection with Interakt…' });
     try {
       const res = await fetch('/api/whatsapp/templates/fetch', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ orgId: orgId.trim(), token: token.trim() }),
       });
-      const j = await res.json();
+      const j = await res.json().catch(() => ({ ok: false, error: `Server replied ${res.status} with no detail.` }));
       if (j.ok) {
         setConnected(true); setConnectOpen(false); setToken(''); setOrgId('');
-        setSyncNote(`Connected — ${j.found} approved template${j.found === 1 ? '' : 's'} found. Press Fetch templates.`);
-      } else setSyncNote(j.error);
+        setSyncNote({ tone: 'ok', text: `Connected — Interakt has ${j.found} approved template${j.found === 1 ? '' : 's'}. Importing them now…` });
+        setSyncing(false);
+        await fetchTemplates();
+        return;
+      }
+      setSyncNote({ tone: 'error', text: j.error || `Interakt refused the details (HTTP ${res.status}). Check both values and try again.` });
     } catch {
-      setSyncNote('Could not reach the server.');
+      setSyncNote({ tone: 'error', text: 'Could not reach the server. Check your connection and try again.' });
     }
     setSyncing(false);
   }
@@ -168,10 +188,9 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
     for (const r of rows) repaired += await backfill(r.name, r.body);
 
     setBulk(''); setBulkOpen(false); setBulkNote(null);
-    setSyncNote(
+    setSyncNote({ tone: 'ok', text:
       `Imported ${rows.length} template${rows.length === 1 ? '' : 's'} (${rows.map((r) => r.name).join(', ')}).` +
-      (repaired > 0 ? ` ${repaired} past message${repaired === 1 ? '' : 's'} now show the real wording.` : '')
-    );
+      (repaired > 0 ? ` ${repaired} past message${repaired === 1 ? '' : 's'} now show the real wording.` : '') });
     load();
   }
 
@@ -228,7 +247,7 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
 
     setSaving(false);
     setDraft(emptyDraft); setEditing(false);
-    if (repaired > 0) setSyncNote(`Saved. ${repaired} past message${repaired === 1 ? '' : 's'} in your chats now show the real wording.`);
+    if (repaired > 0) setSyncNote({ tone: 'ok', text: `Saved. ${repaired} past message${repaired === 1 ? '' : 's'} in your chats now show the real wording.` });
     load();
   }
 
@@ -275,12 +294,13 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
           {!editing && (
             <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
               <button
-                onClick={() => (connected === false ? setConnectOpen(true) : fetchTemplates())}
-                disabled={syncing}
-                style={{ ...primaryBtn, background: 'var(--teal)' }}
+                onClick={() => (connected === false ? setConnectOpen((v) => !v) : fetchTemplates())}
+                disabled={syncing || checking}
+                title={checking ? 'Checking whether Interakt is connected…' : connected === false ? 'Interakt is not connected yet' : 'Import every approved template from Interakt'}
+                style={{ ...primaryBtn, background: 'var(--teal)', opacity: syncing || checking ? 0.7 : 1 }}
               >
-                {syncing ? <Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> : <RefreshCw size={14} />}
-                {connected === false ? 'Connect Interakt' : 'Fetch templates'}
+                {syncing || checking ? <Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> : <RefreshCw size={14} />}
+                {checking ? 'Checking…' : syncing ? (connectOpen ? 'Connecting…' : 'Fetching…') : connected === false ? 'Connect Interakt' : 'Fetch templates'}
               </button>
               <button onClick={() => { setBulkOpen((v) => !v); setBulkNote(null); }} style={ghostBtn}>
                 <ClipboardPaste size={14} /> Paste many
@@ -323,12 +343,22 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
               style={{ ...input, resize: 'vertical', fontFamily: 'ui-monospace, SFMono-Regular, monospace', fontSize: 11.5 }}
             />
 
-            <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
-              <button onClick={saveConnection} disabled={syncing || !orgId.trim() || !token.trim()} style={primaryBtn}>
-                {syncing ? <Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> : null} Connect
+            <div style={{ display: 'flex', gap: 8, marginTop: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+              <button
+                onClick={saveConnection}
+                disabled={syncing || !orgId.trim() || !token.trim()}
+                title={!orgId.trim() || !token.trim() ? 'Paste both values first' : undefined}
+                style={{ ...primaryBtn, opacity: syncing || !orgId.trim() || !token.trim() ? 0.6 : 1 }}
+              >
+                {syncing ? <Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> : null}
+                {syncing ? 'Checking with Interakt…' : 'Connect'}
               </button>
-              <button onClick={() => setConnectOpen(false)} style={ghostBtn}>Cancel</button>
+              <button onClick={() => { setConnectOpen(false); setSyncNote(null); }} disabled={syncing} style={ghostBtn}>Cancel</button>
+              {!orgId.trim() || !token.trim() ? (
+                <span style={{ fontSize: 11.6, color: 'var(--muted)' }}>Both boxes are needed.</span>
+              ) : null}
             </div>
+            {syncNote && <SyncBanner note={syncNote} style={{ marginTop: 12, marginBottom: 0 }} />}
             <div style={{ fontSize: 11.3, color: 'var(--muted)', marginTop: 11, lineHeight: 1.6 }}>
               Interakt expires this connection every so often. When it does, the button says so and you
               repeat these three steps — nothing else breaks in the meantime.
@@ -336,11 +366,7 @@ export function TemplatesPanel({ workspaceId }: { workspaceId: string }) {
           </section>
         )}
 
-        {syncNote && (
-          <div style={{ background: 'var(--amber-bg)', color: 'var(--ink)', padding: '11px 13px', borderRadius: 10, fontSize: 12.3, lineHeight: 1.55, marginBottom: 14 }}>
-            {syncNote}
-          </div>
-        )}
+        {syncNote && !connectOpen && <SyncBanner note={syncNote} />}
 
         {bulkOpen && (
           <section className="animate-pop-in" style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 14, padding: 18, marginBottom: 20, boxShadow: 'var(--shadow)' }}>
@@ -447,3 +473,22 @@ const input: React.CSSProperties = { width: '100%', padding: '9px 12px', borderR
 const primaryBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 15px', borderRadius: 9, border: 0, background: 'var(--teal)', color: '#fff', fontSize: 12.5, fontWeight: 700, cursor: 'pointer' };
 const ghostBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 15px', borderRadius: 9, border: '1px solid var(--line)', background: 'transparent', color: 'var(--ink-2)', fontSize: 12.5, fontWeight: 600, cursor: 'pointer' };
 const rowBtn: React.CSSProperties = { width: 30, height: 30, borderRadius: 8, border: 0, background: 'var(--surface-2)', color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flex: 'none' };
+
+function SyncBanner({ note, style }: { note: { tone: 'info' | 'ok' | 'error'; text: string }; style?: React.CSSProperties }) {
+  const tone = note.tone === 'ok'
+    ? { bg: 'var(--green-bg)', border: 'var(--green)', fg: 'var(--green)' }
+    : note.tone === 'error'
+      ? { bg: 'rgba(239,68,68,.10)', border: 'var(--red)', fg: 'var(--red)' }
+      : { bg: 'var(--bg)', border: 'var(--line)', fg: 'var(--muted)' };
+  return (
+    <div role="status" aria-live="polite" style={{
+      display: 'flex', gap: 9, alignItems: 'flex-start', background: tone.bg, border: `1px solid ${tone.border}`,
+      padding: '10px 13px', borderRadius: 10, fontSize: 12.4, lineHeight: 1.55, marginBottom: 14, ...(style || {}),
+    }}>
+      {note.tone === 'info'
+        ? <Loader2 size={14} style={{ flexShrink: 0, marginTop: 2, color: tone.fg, animation: 'spin .8s linear infinite' }} />
+        : <span style={{ width: 8, height: 8, borderRadius: 99, background: tone.fg, flexShrink: 0, marginTop: 6 }} />}
+      <span style={{ color: 'var(--ink)' }}>{note.text}</span>
+    </div>
+  );
+}

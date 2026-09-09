@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
+import { sendTemplateToLead } from '@/lib/send-template';
 import { sendText, sendTemplate, sendMedia, windowState, isConfigured, mediaTypeFrom } from '@/lib/interakt';
 import { toE164 } from '@/lib/phone';
 import { runSequences } from '@/lib/sequence-engine';
@@ -94,7 +95,8 @@ export async function POST(req: NextRequest) {
   if (workspaceId) q = q.eq('workspace_id', workspaceId);
   const { data: rules, error: ruleErr } = await q;
   if (ruleErr) return NextResponse.json({ ok: false, error: ruleErr.message }, { status: 500 });
-  if (!rules?.length) return NextResponse.json({ ok: true, ran: 0, note: 'Rule is off.' });
+  // The new-lead rule being off no longer ends the tick: the meeting rules
+  // below and the sequence engine still need their turn.
 
   const report: Record<string, unknown>[] = [];
 
@@ -262,6 +264,175 @@ export async function POST(req: NextRequest) {
       await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claim.id);
       if (ok) { out.sent = (out.sent as number) + 1; donePhones.add(phoneE164); }
       else (out.skipped as string[]).push(`${phoneE164}: ${errText}`);
+    }
+  }
+
+  // ==========================================================================
+  // MEETING MESSAGES — PC1 when a call is booked, PC2 when it is completed.
+  // --------------------------------------------------------------------------
+  // Driven by the meetings table, not by the CRM UI, so it fires however a
+  // meeting came to exist or be completed: the public booking page, a staff
+  // booking, the drawer, a bulk edit. The CRM does not need to know this code
+  // exists.
+  //
+  // PHONE RESOLUTION, in order — "ensure you send WhatsApp to everyone":
+  //   1. the number typed on the booking form (client_phone), if it dials
+  //   2. the linked lead's number (lead_id)
+  //   3. a lead found by the booking email, then that lead's number
+  // Only when all three fail is the meeting recorded as unreachable, by name,
+  // so it shows up on the Meetings tab instead of silently not happening.
+  //
+  // One message per meeting per rule, enforced by a unique index on
+  // (automation_key, meeting_id). The claim row is written BEFORE the send, so
+  // two overlapping ticks cannot both message the same person.
+  // ==========================================================================
+  {
+    let mq = admin.from('relay_automations').select('*')
+      .in('key', ['meeting_booked', 'meeting_completed']).eq('enabled', true);
+    if (workspaceId) mq = mq.eq('workspace_id', workspaceId);
+    const { data: meetingRules } = await mq;
+
+    for (const rule of meetingRules || []) {
+      const ws = rule.workspace_id as string;
+      const out: Record<string, unknown> = { workspace: ws, key: rule.key, sent: 0, skipped: [] as string[] };
+      report.push(out);
+
+      if (!rule.activated_at) { out.note = 'Rule has no activation time — switch it off and on once.'; continue; }
+      if (!rule.template_name) { out.note = 'No template chosen.'; continue; }
+      if (!isConfigured() && !dryRun) { out.note = 'INTERAKT_API_KEY is not set.'; continue; }
+
+      const dayStartIst = new Date(`${istDate()}T00:00:00+05:30`).toISOString();
+      const { count: sentToday } = await admin
+        .from('relay_automation_sent')
+        .select('id', { count: 'exact', head: true })
+        .eq('workspace_id', ws).eq('automation_key', rule.key)
+        .eq('ok', true).gte('sent_at', dayStartIst);
+      let room = Math.max(0, (rule.daily_cap ?? 200) - (sentToday ?? 0));
+      if (room === 0) { out.note = `Daily cap of ${rule.daily_cap} reached.`; continue; }
+
+      const cutoff = new Date(Date.now() - (rule.delay_seconds ?? 30) * 1_000).toISOString();
+      const booked = rule.key === 'meeting_booked';
+
+      let q = admin.from('meetings')
+        .select('id, lead_id, client_name, client_email, client_phone, status, starts_at, created_at, completed_at')
+        .eq('workspace_id', ws);
+      q = booked
+        ? q.gte('created_at', rule.activated_at).lte('created_at', cutoff).neq('status', 'cancelled')
+            .order('created_at', { ascending: true })
+        : q.eq('status', 'completed').gte('completed_at', rule.activated_at).lte('completed_at', cutoff)
+            .order('completed_at', { ascending: true });
+      const { data: meetings } = await q.limit(100);
+      if (!meetings?.length) { out.note = booked ? 'No new bookings waiting.' : 'No newly completed calls waiting.'; continue; }
+
+      const [{ data: done }, { data: suppressed }] = await Promise.all([
+        admin.from('relay_automation_sent').select('meeting_id')
+          .eq('workspace_id', ws).eq('automation_key', rule.key).not('meeting_id', 'is', null),
+        admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws),
+      ]);
+      const doneMeetings = new Set((done || []).map((d) => d.meeting_id as string));
+      const stopPhones = new Set((suppressed || []).map((x) => x.phone_e164 as string));
+
+      for (const m of meetings) {
+        if (doneMeetings.has(m.id)) continue;
+        if (room <= 0) { (out.skipped as string[]).push('daily cap reached mid-run'); break; }
+        const who = m.client_name || m.client_email || m.id;
+
+        // A thank-you that says "today" must not go to someone whose call was
+        // three weeks ago and got marked completed during a tidy-up.
+        if (!booked) {
+          const startedMs = new Date(m.starts_at).getTime();
+          const completedMs = new Date(m.completed_at).getTime();
+          const tooOld = completedMs - startedMs > 3 * 86_400_000;
+          const notYet = startedMs > completedMs + 86_400_000;
+          if (tooOld || notYet) {
+            if (!dryRun) {
+              await admin.from('relay_automation_sent').insert({
+                workspace_id: ws, automation_key: rule.key, lead_id: m.lead_id, phone_e164: 'n/a',
+                meeting_id: m.id, method: 'template', detail: rule.template_name, ok: false,
+                error: tooOld ? 'call was more than 3 days before it was marked completed' : 'call is still in the future',
+              });
+            }
+            (out.skipped as string[]).push(`${who}: ${tooOld ? 'call too old for a same-day thank-you' : 'call has not happened yet'}`);
+            continue;
+          }
+        }
+
+        // ---- who are they, and which number actually dials? ----------------
+        let lead: { id: string; full_name: string | null; phone: string | null; visa_type: string | null } | null = null;
+        if (m.lead_id) {
+          const { data } = await admin.from('leads').select('id, full_name, phone, visa_type').eq('id', m.lead_id).maybeSingle();
+          lead = data;
+        }
+        if (!lead && m.client_email) {
+          const { data } = await admin.from('leads').select('id, full_name, phone, visa_type')
+            .eq('workspace_id', ws).ilike('email', m.client_email.trim()).order('updated_at', { ascending: false }).limit(1).maybeSingle();
+          lead = data;
+        }
+        const phoneE164 = toE164(m.client_phone) || (lead ? toE164(lead.phone) : null);
+
+        if (!phoneE164) {
+          if (!dryRun) {
+            await admin.from('relay_automation_sent').insert({
+              workspace_id: ws, automation_key: rule.key, lead_id: lead?.id ?? m.lead_id ?? null, phone_e164: 'n/a',
+              meeting_id: m.id, method: 'template', detail: rule.template_name, ok: false,
+              error: 'no usable phone on the booking or the lead',
+            });
+          }
+          (out.skipped as string[]).push(`${who}: no usable phone number anywhere`);
+          continue;
+        }
+        if (stopPhones.has(phoneE164)) {
+          if (!dryRun) {
+            await admin.from('relay_automation_sent').insert({
+              workspace_id: ws, automation_key: rule.key, lead_id: lead?.id ?? m.lead_id ?? null, phone_e164: phoneE164,
+              meeting_id: m.id, method: 'template', detail: rule.template_name, ok: false, error: 'opted out',
+            });
+          }
+          (out.skipped as string[]).push(`${who}: opted out`);
+          continue;
+        }
+
+        if (dryRun) {
+          (out.skipped as string[]).push(`would send ${rule.template_name} to ${who} (${phoneE164})`);
+          room--;
+          continue;
+        }
+
+        // ---- claim first, send second -------------------------------------
+        const { data: claim, error: claimErr } = await admin.from('relay_automation_sent')
+          .insert({
+            workspace_id: ws, automation_key: rule.key, lead_id: lead?.id ?? m.lead_id ?? null, phone_e164: phoneE164,
+            meeting_id: m.id, method: 'template', detail: rule.template_name, ok: false,
+          })
+          .select('id').maybeSingle();
+        if (claimErr || !claim) continue;   // another tick got here first
+
+        let ok = false; let errText: string | null = null;
+        try {
+          const { data: convId } = await admin.rpc('relay_get_or_create_conversation', {
+            p_workspace_id: ws, p_phone_e164: phoneE164,
+          });
+          if (!convId) throw new Error('could not open a conversation');
+          // The booking form's name is what they typed to us; that is the
+          // name the message should use.
+          if (lead?.id) {
+            await admin.from('relay_conversations').update({ lead_id: lead.id, updated_at: new Date().toISOString() })
+              .eq('id', convId as string).is('lead_id', null);
+          }
+          const r = await sendTemplateToLead(admin, {
+            workspaceId: ws, conversationId: convId as string, phoneE164,
+            templateName: rule.template_name, language: rule.template_language || 'en',
+            lead: { full_name: m.client_name || lead?.full_name || null, visa_type: lead?.visa_type ?? null },
+          });
+          ok = r.ok; errText = r.error;
+        } catch (e) {
+          errText = e instanceof Error ? e.message : String(e);
+        }
+
+        await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claim.id);
+        if (ok) { out.sent = (out.sent as number) + 1; room--; }
+        else (out.skipped as string[]).push(`${who}: ${errText}`);
+      }
     }
   }
 
