@@ -240,7 +240,7 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: 'var(--ink)' }}>
               <span>Wait</span>
               <select style={select} value={rule.delay_seconds} onChange={(e) => patch({ delay_seconds: Number(e.target.value) })}>
-                {[10, 30, 60].map((sec) => (
+                {[5, 10, 30, 60].map((sec) => (
                   <option key={sec} value={sec}>{sec < 60 ? `${sec} seconds` : '1 minute'}</option>
                 ))}
               </select>
@@ -248,10 +248,14 @@ export function AutomationPanel({ workspaceId }: { workspaceId: string }) {
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: 'var(--ink)', marginTop: 14 }}>
               <span>Never send more than</span>
-              <select style={select} value={rule.daily_cap} onChange={(e) => patch({ daily_cap: Number(e.target.value) })}>
+              <select style={select} value={rule.daily_cap ?? 0} onChange={(e) => patch({ daily_cap: Number(e.target.value) })}>
+                <option value={0}>no limit</option>
                 {[10, 20, 50, 100, 200, 500].map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
-              <span style={{ color: 'var(--muted)' }}>messages a day — a brake in case something goes wrong.</span>
+              <span style={{ color: 'var(--muted)' }}>
+                {rule.daily_cap ? 'messages a day — a brake in case something goes wrong.'
+                                : '— every new lead is answered, however many arrive.'}
+              </span>
             </div>
           </section>
         )}

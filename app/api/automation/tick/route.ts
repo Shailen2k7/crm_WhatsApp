@@ -90,6 +90,12 @@ export async function POST(req: NextRequest) {
 
   const dryRun = req.nextUrl.searchParams.get('dry') === '1';
 
+  // ?scope=new_leads — the fast lane. A new enquiry must be answered in
+  // seconds, but the C1–C8 chase and the campaigns are hourly-paced work that
+  // would be wasteful to repeat every few seconds. A second cron job hits this
+  // scope on a short interval and skips straight past them.
+  const fastLane = req.nextUrl.searchParams.get('scope') === 'new_leads';
+
   // ---- the rule ------------------------------------------------------------
   let q = admin.from('relay_automations').select('*').eq('key', 'new_lead_first').eq('enabled', true);
   if (workspaceId) q = q.eq('workspace_id', workspaceId);
@@ -108,38 +114,112 @@ export async function POST(req: NextRequest) {
     if (!rule.activated_at) { out.note = 'Rule has no activation time — switch it off and on once.'; continue; }
     if (!isConfigured() && !dryRun) { out.note = 'INTERAKT_API_KEY is not set.'; continue; }
 
-    // ---- daily cap (counted from the audit log, IST day) -------------------
-    const dayStartIst = new Date(`${istDate()}T00:00:00+05:30`).toISOString();
-    const { count: sentToday } = await admin
-      .from('relay_automation_sent')
-      .select('id', { count: 'exact', head: true })
-      .eq('workspace_id', ws).eq('automation_key', rule.key)
-      .eq('ok', true).gte('sent_at', dayStartIst);
-    const room = Math.max(0, (rule.daily_cap ?? 50) - (sentToday ?? 0));
-    if (room === 0) { out.note = `Daily cap of ${rule.daily_cap} reached.`; continue; }
-
-    // ---- eligible leads: created after activation, older than the delay ----
-    const cutoff = new Date(Date.now() - (rule.delay_seconds ?? 60) * 1_000).toISOString();
-    const { data: leads } = await admin
-      .from('leads')
-      .select('id, full_name, phone, visa_type, created_at, is_sample')
-      .eq('workspace_id', ws)
-      .gte('created_at', rule.activated_at)
-      .lte('created_at', cutoff)
-      .order('created_at', { ascending: true })
-      .limit(200);
-
-    const candidates = (leads || []).filter((l) => !l.is_sample && (l.phone || '').trim());
-    if (!candidates.length) { out.note = 'No new leads waiting.'; continue; }
+    // ---- how many may go out on this pass ----------------------------------
+    // Every fresh lead gets answered, full stop — this is not the backlog
+    // chase and it has no daily quota. The only ceiling is how many sends fit
+    // in one serverless invocation; the tick runs every 2 minutes, so a
+    // backlog drains within minutes rather than being dropped.
+    //
+    // daily_cap stays honoured when it is deliberately set above zero, as an
+    // emergency brake. Null or 0 means what it says: no limit.
+    const BATCH_PER_TICK = 25;
+    let room = BATCH_PER_TICK;
+    const hardCap = Number(rule.daily_cap) || 0;
+    if (hardCap > 0) {
+      const dayStartIst = new Date(`${istDate()}T00:00:00+05:30`).toISOString();
+      const { count: sentToday } = await admin
+        .from('relay_automation_sent')
+        .select('id', { count: 'exact', head: true })
+        .eq('workspace_id', ws).eq('automation_key', rule.key)
+        .eq('ok', true).gte('sent_at', dayStartIst);
+      const left = Math.max(0, hardCap - (sentToday ?? 0));
+      if (left === 0) { out.note = `Daily cap of ${hardCap} reached.`; continue; }
+      room = Math.min(room, left);
+    }
 
     // ---- already handled / suppressed --------------------------------------
+    // "Handled" means the message actually went, or we have tried enough times.
+    // A rejected send left on this list is a person who silently never hears
+    // from us, so those rows come back as retries instead.
+    const MAX_ATTEMPTS = 3;
     const [{ data: done }, { data: suppressed }] = await Promise.all([
-      admin.from('relay_automation_sent').select('lead_id, phone_e164').eq('workspace_id', ws).eq('automation_key', rule.key),
+      admin.from('relay_automation_sent')
+        .select('id, lead_id, phone_e164, ok, attempts').eq('workspace_id', ws).eq('automation_key', rule.key),
       admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws),
     ]);
-    const doneLeads = new Set((done || []).map((d) => d.lead_id).filter(Boolean));
-    const donePhones = new Set((done || []).map((d) => d.phone_e164));
+    const settled = (done || []).filter((d) => d.ok || (d.attempts ?? 1) >= MAX_ATTEMPTS);
+    const doneLeads = new Set(settled.map((d) => d.lead_id).filter(Boolean));
+    const donePhones = new Set(settled.map((d) => d.phone_e164));
     const stopPhones = new Set((suppressed || []).map((s) => s.phone_e164));
+
+    const retryable = (done || []).filter((d) => !d.ok && (d.attempts ?? 1) < MAX_ATTEMPTS);
+    const retryByLead = new Map(retryable.filter((d) => d.lead_id).map((d) => [d.lead_id as string, d]));
+    const retryByPhone = new Map(retryable.map((d) => [d.phone_e164 as string, d]));
+
+    /**
+     * Take ownership of one person's first message.
+     *
+     * A fresh person gets a new row; someone whose earlier attempt failed has
+     * theirs re-armed. Either way the write is the lock: the `ok = false`
+     * condition means a parallel tick that got there first wins and this one
+     * steps away, exactly as the unique indexes do for the insert.
+     */
+    const claimSend = async (
+      leadId: string | null, phone: string, method: string, detail: string | null,
+    ): Promise<string | null> => {
+      const prior = (leadId && retryByLead.get(leadId)) || retryByPhone.get(phone);
+      if (prior) {
+        const { data } = await admin.from('relay_automation_sent')
+          .update({
+            method, detail, ok: false, error: null,
+            attempts: (prior.attempts ?? 1) + 1, sent_at: new Date().toISOString(),
+          })
+          .eq('id', prior.id).eq('ok', false).select('id');
+        return data?.[0]?.id ?? null;
+      }
+      const { data, error } = await admin.from('relay_automation_sent')
+        .insert({ workspace_id: ws, automation_key: rule.key, lead_id: leadId, phone_e164: phone, method, detail, ok: false, attempts: 1 })
+        .select('id').single();
+      return error ? null : data?.id ?? null;
+    };
+
+    // ---- eligible leads: created after activation, older than the delay ----
+    // NEWEST FIRST. Someone filling the form right now is the whole point of
+    // this rule, so they are answered on this pass and never queue behind a
+    // backlog. Reading newest-first also means the unanswered leads are on the
+    // first page, so a pass normally costs one query.
+    //
+    // This is deliberately NOT the oldest-first walk the C1–C8 chase uses:
+    // that rationing exists to work through a cold database at a safe rate.
+    // Here there is nothing to ration — every fresh lead gets its message.
+    const cutoff = new Date(Date.now() - (rule.delay_seconds ?? 60) * 1_000).toISOString();
+    const LEAD_PAGE = 200;
+    const LEAD_MAX_PAGES = 50;   // 10,000 leads deep, so a backlog is reachable
+    const candidates: { id: string; full_name: string | null; phone: string | null; visa_type: string | null }[] = [];
+
+    for (let page = 0; candidates.length < room && page < LEAD_MAX_PAGES; page++) {
+      const { data: leads } = await admin
+        .from('leads')
+        .select('id, full_name, phone, visa_type, created_at, is_sample')
+        .eq('workspace_id', ws)
+        .gte('created_at', rule.activated_at)
+        .lte('created_at', cutoff)
+        .order('created_at', { ascending: false })
+        .range(page * LEAD_PAGE, page * LEAD_PAGE + LEAD_PAGE - 1);
+      if (!leads?.length) break;
+
+      for (const l of leads) {
+        if (candidates.length >= room) break;
+        if (l.is_sample || !(l.phone || '').trim()) continue;
+        if (doneLeads.has(l.id)) continue;
+        candidates.push(l);
+      }
+      if (leads.length < LEAD_PAGE) break;   // that was the last page
+    }
+
+    if (!candidates.length) { out.note = 'No new leads waiting.'; continue; }
+    // Oldest of the batch goes out first, so a queue still clears in order.
+    candidates.reverse();
 
     for (const lead of candidates) {
       if ((out.sent as number) >= room) { (out.skipped as string[]).push('daily cap reached mid-run'); break; }
@@ -161,13 +241,8 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // claim the lead FIRST (ok=false). The unique indexes make this the
-      // atomic lock: a concurrent tick loses the insert and skips.
-      const { data: claim, error: claimErr } = await admin
-        .from('relay_automation_sent')
-        .insert({ workspace_id: ws, automation_key: rule.key, lead_id: lead.id, phone_e164: phoneE164, method, detail, ok: false })
-        .select('id').single();
-      if (claimErr || !claim) continue; // someone else claimed it
+      const claimId = await claimSend(lead.id, phoneE164, method, detail);
+      if (!claimId) continue; // someone else claimed it
 
       let ok = false; let errText: string | null = null;
 
@@ -183,7 +258,7 @@ export async function POST(req: NextRequest) {
         errText = e instanceof Error ? e.message : String(e);
       }
 
-      await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claim.id);
+      await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claimId);
       if (ok) out.sent = (out.sent as number) + 1;
       else (out.skipped as string[]).push(`${lead.full_name}: ${errText}`);
     }
@@ -242,26 +317,33 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      const { data: claim, error: claimErr } = await admin
-        .from('relay_automation_sent')
-        .insert({
-          workspace_id: ws, automation_key: rule.key, lead_id: null, phone_e164: phoneE164,
-          method: 'quick_reply', detail: rule.quick_reply_shortcut, ok: false,
-        })
-        .select('id').single();
-      if (claimErr || !claim) continue;   // another tick got there first
+      // Which form may this message legally take? The same question the pass
+      // above asks. Assuming the window is open because they wrote to us at
+      // some point is wrong the moment this rule runs late or catches up on a
+      // backlog: WhatsApp rejects the free-form send and the person gets
+      // nothing at all.
+      const strangerWin = windowState(conv.last_inbound_at);
+      const strangerMethod = strangerWin.open ? 'quick_reply' : 'template';
+
+      const claimId = await claimSend(
+        null, phoneE164, strangerMethod,
+        strangerWin.open ? rule.quick_reply_shortcut : rule.template_name);
+      if (!claimId) continue;   // another tick got there first
 
       let ok = false; let errText: string | null = null;
       try {
-        // They have just messaged us, so the 24-hour window is open and the
-        // free-form quick reply is the right thing to send.
-        ok = await sendQuickReply(admin, ws, conv.id, phoneE164, rule.quick_reply_shortcut, stranger);
-        if (!ok) errText = 'quick reply failed (see message row)';
+        if (strangerWin.open) {
+          ok = await sendQuickReply(admin, ws, conv.id, phoneE164, rule.quick_reply_shortcut, stranger);
+          if (!ok) errText = 'quick reply failed (see message row)';
+        } else {
+          const r = await sendFirstTemplate(admin, ws, conv.id, phoneE164, rule.template_name, rule.template_language || 'en', stranger);
+          ok = r.ok; errText = r.error;
+        }
       } catch (e) {
         errText = e instanceof Error ? e.message : String(e);
       }
 
-      await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claim.id);
+      await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claimId);
       if (ok) { out.sent = (out.sent as number) + 1; donePhones.add(phoneE164); }
       else (out.skipped as string[]).push(`${phoneE164}: ${errText}`);
     }
@@ -440,7 +522,7 @@ export async function POST(req: NextRequest) {
   // its own page has live counters, and a dry run must never send.
   let sequences: Awaited<ReturnType<typeof runSequences>> = [];
   let campaigns: Awaited<ReturnType<typeof runCampaigns>> = [];
-  if (!dryRun) {
+  if (!dryRun && !fastLane) {
     try { sequences = await runSequences(admin); }
     catch (e) { console.error('[sequences] tick failed', e); }
     // One-time blasts ride the same tick, in their own try so a bad campaign
@@ -449,7 +531,7 @@ export async function POST(req: NextRequest) {
     catch (e) { console.error('[campaigns] tick failed', e); }
   }
 
-  return NextResponse.json({ ok: true, dryRun, report, sequences, campaigns });
+  return NextResponse.json({ ok: true, dryRun, fastLane, report, sequences, campaigns });
 }
 
 // ---------------------------------------------------------------------------
