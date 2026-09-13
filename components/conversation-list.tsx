@@ -1,6 +1,7 @@
 'use client';
 
-import { memo, useEffect, useMemo, useState } from 'react';
+import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { Search, X, Check, CheckCheck, Star, Clock, AlertCircle } from 'lucide-react';
 import { getStageMeta, getVisaMeta } from '@/lib/types';
 import { initialsOf, avatarTint, formatPhone, matchKey } from '@/lib/phone';
@@ -82,12 +83,17 @@ export function ConversationList({
 }) {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
+  const scrollerRef = useRef<HTMLDivElement>(null);
 
   const FILTERS = mode === 'chats' ? CHAT_FILTERS : CONTACT_FILTERS;
 
+  // Typing filters thousands of contacts; deferring lets the keystroke paint
+  // first and the filtering follow, so search never stutters the input.
+  const deferredQuery = useDeferredValue(query);
+
   const visible = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    const qDigits = matchKey(query);
+    const q = deferredQuery.trim().toLowerCase();
+    const qDigits = matchKey(deferredQuery);
 
     return contacts.filter((c) => {
       if (filter === 'unread' && c.unread === 0) return false;
@@ -104,7 +110,23 @@ export function ConversationList({
         (c.lead?.email || '').toLowerCase().includes(q)
       );
     });
-  }, [contacts, query, filter]);
+  }, [contacts, deferredQuery, filter]);
+
+  // ---- WINDOWED RENDERING — the actual scroll fix --------------------------
+  // The list used to mount EVERY contact: with a couple of thousand leads that
+  // is tens of thousands of DOM nodes in one scroller. Each wheel frame laid
+  // out all of them, and any realtime update re-rendered all of them
+  // mid-gesture — the trackpad "sticking" was the main thread busy doing
+  // exactly that. WhatsApp itself only ever renders the rows on screen, so now
+  // we do too: ~20 mounted rows whatever the list size, measured from the real
+  // DOM (never an estimated height that can drift the scrollbar).
+  const virtualizer = useVirtualizer({
+    count: visible.length,
+    getScrollElement: () => scrollerRef.current,
+    estimateSize: () => (isMobile ? 74 : 64),
+    overscan: 10,
+    getItemKey: (i) => visible[i].key,
+  });
 
   // Switching between Chats and Contacts resets a filter the other mode lacks.
   // This MUST be an effect: setting state inside a useMemo re-renders during
@@ -188,7 +210,7 @@ export function ConversationList({
         )}
       </div>
 
-      <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
+      <div ref={scrollerRef} style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
         {!loading && visible.length === 0 && (
           <div style={{ padding: '38px 24px', textAlign: 'center', color: 'var(--muted)' }}>
             <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 5 }}>
@@ -204,15 +226,21 @@ export function ConversationList({
           </div>
         )}
 
-        {visible.map((c) => (
-          <Row
-            key={c.key}
-            c={c}
-            on={selectedKey === c.key}
-            isMobile={!!isMobile}
-            onSelect={onSelect}
-          />
-        ))}
+        <div style={{ height: virtualizer.getTotalSize(), width: '100%', position: 'relative' }}>
+          {virtualizer.getVirtualItems().map((vi) => {
+            const c = visible[vi.index];
+            return (
+              <div
+                key={vi.key}
+                data-index={vi.index}
+                ref={virtualizer.measureElement}
+                style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${vi.start}px)` }}
+              >
+                <Row c={c} on={selectedKey === c.key} isMobile={!!isMobile} onSelect={onSelect} />
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );

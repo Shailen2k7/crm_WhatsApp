@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { openLiveChannel } from '@/lib/live';
 import type { Lead, RelayUser, Workspace } from '@/lib/types';
 import { LEAD_COLUMNS } from '@/lib/types';
 import type { RelayConversation, RelayMessage, QuickReply, RelayTemplate } from '@/lib/messages';
@@ -175,18 +176,23 @@ export function RelayShell({
       if (tpl.data) setTemplates(tpl.data as RelayTemplate[]);
     })();
 
-    const ch = supabase
-      .channel('relay-qr-tpl-' + workspace.id)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'relay_quick_replies', filter: `workspace_id=eq.${workspace.id}` }, async () => {
-        const { data } = await supabase.from('relay_quick_replies').select('*').eq('workspace_id', workspace.id).order('sort_order').order('title');
-        if (data) setQuickReplies(data as QuickReply[]);
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'relay_templates', filter: `workspace_id=eq.${workspace.id}` }, async () => {
-        const { data } = await supabase.from('relay_templates').select('*').eq('workspace_id', workspace.id).order('sort_order').order('name');
-        if (data) setTemplates(data as RelayTemplate[]);
-      })
-      .subscribe();
-    return () => { cancelled = true; supabase.removeChannel(ch); };
+    const reloadQr = async () => {
+      const { data } = await supabase.from('relay_quick_replies').select('*').eq('workspace_id', workspace.id).order('sort_order').order('title');
+      if (data) setQuickReplies(data as QuickReply[]);
+    };
+    const reloadTpl = async () => {
+      const { data } = await supabase.from('relay_templates').select('*').eq('workspace_id', workspace.id).order('sort_order').order('name');
+      if (data) setTemplates(data as RelayTemplate[]);
+    };
+    const close = openLiveChannel(
+      supabase,
+      'relay-qr-tpl-' + workspace.id,
+      (ch) => ch
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'relay_quick_replies', filter: `workspace_id=eq.${workspace.id}` }, reloadQr)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'relay_templates', filter: `workspace_id=eq.${workspace.id}` }, reloadTpl),
+      () => { reloadQr(); reloadTpl(); },
+    );
+    return () => { cancelled = true; close(); };
   }, [supabase, workspace.id]);
 
   // ---- the REST of the leads, fetched in the background --------------------
@@ -250,7 +256,10 @@ export function RelayShell({
   // ---- conversations + live updates ----------------------------------------
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    // Snapshot from the database — also the catch-up after any realtime gap,
+    // because events missed while a phone slept are gone and only a refetch
+    // can bring the unread counts and previews back to the truth.
+    const loadConversations = async () => {
       const { data } = await supabase
         .from('relay_conversations')
         .select('*')
@@ -258,11 +267,13 @@ export function RelayShell({
         .order('last_message_at', { ascending: false, nullsFirst: false })
         .limit(1000);
       if (!cancelled && data) setConversations(data as RelayConversation[]);
-    })();
+    };
+    loadConversations();
 
-    const channel = supabase
-      .channel('relay-convs-' + workspace.id)
-      .on(
+    const close = openLiveChannel(
+      supabase,
+      'relay-convs-' + workspace.id,
+      (ch) => ch.on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'relay_conversations', filter: `workspace_id=eq.${workspace.id}` },
         (payload) => {
@@ -281,19 +292,21 @@ export function RelayShell({
             return copy;
           });
         }
-      )
-      .subscribe();
+      ),
+      loadConversations,
+    );
 
-    return () => { cancelled = true; supabase.removeChannel(channel); };
+    return () => { cancelled = true; close(); };
   }, [supabase, workspace.id]);
 
   // ---- THE RINGTONE: any inbound message, any conversation -----------------
   // The chat panel has its own per-thread subscription for rendering; this one
   // exists solely so a message in a thread you are NOT looking at still rings.
   useEffect(() => {
-    const channel = supabase
-      .channel('relay-inbound-' + workspace.id)
-      .on(
+    const close = openLiveChannel(
+      supabase,
+      'relay-inbound-' + workspace.id,
+      (ch) => ch.on(
         'postgres_changes',
         { event: 'INSERT', schema: 'public', table: 'relay_messages', filter: `workspace_id=eq.${workspace.id}` },
         (payload) => {
@@ -314,16 +327,19 @@ export function RelayShell({
             }
           }
         }
-      )
-      .subscribe();
-    return () => { supabase.removeChannel(channel); };
+      ),
+      // A ringtone cannot be replayed for a missed message, and the
+      // conversations catch-up already restores the unread badges.
+    );
+    return close;
   }, [supabase, workspace.id]);
 
   // ---- leads live ----------------------------------------------------------
   useEffect(() => {
-    const channel = supabase
-      .channel('relay-leads-' + workspace.id)
-      .on(
+    const close = openLiveChannel(
+      supabase,
+      'relay-leads-' + workspace.id,
+      (ch) => ch.on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'leads', filter: `workspace_id=eq.${workspace.id}` },
         (payload) => {
@@ -342,9 +358,30 @@ export function RelayShell({
             return copy;
           });
         }
-      )
-      .subscribe((status) => setLive(status === 'SUBSCRIBED'));
-    return () => { supabase.removeChannel(channel); };
+      ),
+      // Catch-up: only what changed while we were away — the full list is
+      // thousands of rows and must never be refetched on a wake-up.
+      async () => {
+        const since = new Date(Date.now() - 6 * 3_600_000).toISOString();
+        const { data } = await supabase
+          .from('leads')
+          .select('id, workspace_id, full_name, phone, stage, visa_type, updated_at, created_at, is_sample')
+          .eq('workspace_id', workspace.id)
+          .gte('updated_at', since)
+          .order('updated_at', { ascending: false })
+          .limit(500);
+        if (!data?.length) return;
+        setLeads((prev) => {
+          const byId = new Map(prev.map((l) => [l.id, l]));
+          for (const row of data as unknown as Lead[]) {
+            byId.set(row.id, { ...(byId.get(row.id) || {}), ...row } as Lead);
+          }
+          return [...byId.values()];
+        });
+      },
+      (up) => setLive(up),
+    );
+    return close;
   }, [supabase, workspace.id]);
 
   // ---- the lists -----------------------------------------------------------

@@ -2,6 +2,7 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { openLiveChannel } from '@/lib/live';
 import {
   Search, Star, PanelRight, Paperclip, Send, MessageSquare, ArrowLeft,
   AlertCircle, Loader2, RotateCw, Lock, FileText, Download, X, Trash2,
@@ -166,9 +167,10 @@ export function ChatPanel({
   // ---- realtime ------------------------------------------------------------
   useEffect(() => {
     if (!conversationId) return;
-    const channel = supabase
-      .channel('relay-msgs-' + conversationId)
-      .on(
+    const close = openLiveChannel(
+      supabase,
+      'relay-msgs-' + conversationId,
+      (ch) => ch.on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'relay_messages', filter: `conversation_id=eq.${conversationId}` },
         (payload) => {
@@ -187,9 +189,26 @@ export function ChatPanel({
           });
           if (row.direction === 'in') setLastInboundAt(row.created_at);
         }
-      )
-      .subscribe();
-    return () => { supabase.removeChannel(channel); };
+      ),
+      // Catch-up: messages that arrived while the phone slept were never
+      // delivered as events and never will be. Refetch the tail of the thread
+      // so the open chat is exactly what the database has.
+      async () => {
+        const { data } = await supabase
+          .from('relay_messages')
+          .select('*')
+          .eq('conversation_id', conversationId)
+          .order('created_at', { ascending: false })
+          .limit(200);
+        if (!data) return;
+        const ordered = (data as RelayMessage[]).reverse();
+        messageCache.set(conversationId, ordered);
+        setMessages(ordered);
+        const lastIn = [...ordered].reverse().find((m) => m.direction === 'in');
+        if (lastIn) setLastInboundAt(lastIn.created_at);
+      },
+    );
+    return close;
   }, [supabase, conversationId]);
 
   useEffect(() => {
@@ -633,10 +652,14 @@ export function ChatPanel({
       >
         {/* Quick replies popover */}
         {qrOpen && qrMatches.length > 0 && (
-          <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 280, overflowY: 'auto', zIndex: 20 }}>
+          <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 280, overflowY: 'auto', overscrollBehavior: 'contain', zIndex: 20 }}>
             <div style={{ padding: '9px 14px 5px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>Quick replies · ↑↓ then ⏎</div>
+            {/* Hover styling is pure CSS. The old onMouseEnter wrote React
+                state for every row the cursor crossed — and scrolling moves
+                rows UNDER the cursor, so each wheel tick re-rendered this
+                whole panel several times over. That was the freeze. */}
             {qrMatches.map((q, qi) => (
-              <button key={q.id} onClick={() => applyQuickReply(q)} onMouseEnter={() => setQrIndex(qi)} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 14px', border: 0, borderTop: '1px solid var(--line-2)', background: qi === qrIndex ? 'var(--surface-3)' : 'transparent', cursor: 'pointer' }}>
+              <button key={q.id} onClick={() => applyQuickReply(q)} className="qr-item" style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 14px', border: 0, borderTop: '1px solid var(--line-2)', background: qi === qrIndex ? 'var(--surface-3)' : 'transparent', cursor: 'pointer' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                   <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--teal-ink)' }}>/{q.shortcut}</span>
                   <span style={{ fontSize: 12.5, fontWeight: 600 }}>{q.title}</span>
@@ -653,7 +676,7 @@ export function ChatPanel({
         )}
 
         {tplOpen && (
-          <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 320, overflowY: 'auto', zIndex: 21 }}>
+          <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 320, overflowY: 'auto', overscrollBehavior: 'contain', zIndex: 21 }}>
             <div style={{ padding: '10px 14px 6px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>
               Templates — tap to send{!win.open ? ' (works with the window closed)' : ''}
             </div>

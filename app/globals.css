@@ -193,3 +193,7 @@ select:disabled { opacity: .55; cursor: default; }
 
 /* The options list is painted by the OS, so give it readable colours too. */
 select option { background: var(--surface); color: var(--ink); }
+
+/* Quick-reply picker rows highlight on hover in CSS alone — a state write per
+   crossed row re-rendered the whole chat panel while scrolling the picker. */
+.qr-item:hover { background: var(--surface-3) !important; }
