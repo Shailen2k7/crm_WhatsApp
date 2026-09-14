@@ -41,17 +41,49 @@ export interface SendResult {
  * fallback assumes a 10-digit subscriber number, which is right for India and
  * a sane default elsewhere.
  */
+// Every assigned ITU E.164 calling code. A hand-picked shortlist here cost
+// real leads: +31 (Netherlands), +48 (Poland), +60 (Malaysia), +966 (Saudi)
+// and +968 (Oman) all fell through to a guess that chopped the number in the
+// wrong place, Interakt rejected the mangled result, and those people never
+// got their first message.
+const CALLING_CODES = new Set([
+  '1', '7', '20', '27', '30', '31', '32', '33', '34', '36', '39', '40', '41',
+  '43', '44', '45', '46', '47', '48', '49', '51', '52', '53', '54', '55', '56',
+  '57', '58', '60', '61', '62', '63', '64', '65', '66', '81', '82', '84', '86',
+  '90', '91', '92', '93', '94', '95', '98',
+  '211', '212', '213', '216', '218', '220', '221', '222', '223', '224', '225',
+  '226', '227', '228', '229', '230', '231', '232', '233', '234', '235', '236',
+  '237', '238', '239', '240', '241', '242', '243', '244', '245', '246', '247',
+  '248', '249', '250', '251', '252', '253', '254', '255', '256', '257', '258',
+  '260', '261', '262', '263', '264', '265', '266', '267', '268', '269', '290',
+  '291', '297', '298', '299',
+  '350', '351', '352', '353', '354', '355', '356', '357', '358', '359', '370',
+  '371', '372', '373', '374', '375', '376', '377', '378', '379', '380', '381',
+  '382', '383', '385', '386', '387', '389',
+  '420', '421', '423',
+  '500', '501', '502', '503', '504', '505', '506', '507', '508', '509', '590',
+  '591', '592', '593', '594', '595', '596', '597', '598', '599',
+  '670', '672', '673', '674', '675', '676', '677', '678', '679', '680', '681',
+  '682', '683', '685', '686', '687', '688', '689', '690', '691', '692',
+  '850', '852', '853', '855', '856', '880', '886',
+  '960', '961', '962', '963', '964', '965', '966', '967', '968', '970', '971',
+  '972', '973', '974', '975', '976', '977', '992', '993', '994', '995', '996',
+  '998',
+]);
+
 export function splitE164(e164: string): { countryCode: string; phoneNumber: string } | null {
   const digits = String(e164 || '').replace(/\D/g, '');
   if (digits.length < 8) return null;
 
-  const KNOWN = ['91', '44', '1', '971', '61', '65', '353', '49', '33'];
-  const cc = KNOWN.find((c) => digits.startsWith(c) && digits.length - c.length >= 6);
-  if (cc) return { countryCode: '+' + cc, phoneNumber: digits.slice(cc.length).replace(/^0+/, '') };
-
-  const guess = digits.slice(0, digits.length - 10);
-  if (!guess) return null;
-  return { countryCode: '+' + guess, phoneNumber: digits.slice(-10) };
+  // Longest assigned code wins. The set is prefix-free, so trying 3 then 2
+  // then 1 digits can never pick the wrong country.
+  for (const len of [3, 2, 1]) {
+    const cc = digits.slice(0, len);
+    if (CALLING_CODES.has(cc) && digits.length - len >= 6) {
+      return { countryCode: '+' + cc, phoneNumber: digits.slice(len).replace(/^0+/, '') };
+    }
+  }
+  return null;   // not a real calling code — better to fail loudly than mangle
 }
 
 function apiKey(): string | null {
@@ -97,13 +129,28 @@ async function post(path: string, body: unknown): Promise<SendResult> {
     json = { nonJson: text.slice(0, 400) };
   }
 
-  const j = (json || {}) as { result?: boolean; id?: string; message?: string; error?: unknown };
+  const j = (json || {}) as {
+    result?: boolean; id?: string; message?: string; error?: unknown;
+    nonJson?: string; errors?: unknown; detail?: string;
+  };
 
   if (!res.ok || j.result === false) {
+    // Never swallow the reason. Interakt normally answers with {message}, but a
+    // rate-limiter or WAF in front of it answers with HTML, and the old code
+    // turned that into a bare "Interakt returned 400." — 31 people were never
+    // messaged and the log could not say why. Whatever shape the body is, some
+    // of it goes in the record.
+    const fallback = j.nonJson
+      ? `Non-JSON body: ${j.nonJson.slice(0, 200)}`
+      : j.errors
+        ? `errors: ${JSON.stringify(j.errors).slice(0, 200)}`
+        : json
+          ? `body: ${JSON.stringify(json).slice(0, 200)}`
+          : `Interakt returned ${res.status} with an empty body.`;
     return {
       ok: false,
       code: `http_${res.status}`,
-      detail: j.message || (typeof j.error === 'string' ? j.error : '') || `Interakt returned ${res.status}.`,
+      detail: j.message || j.detail || (typeof j.error === 'string' ? j.error : '') || fallback,
       raw: json,
     };
   }

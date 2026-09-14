@@ -144,15 +144,30 @@ export async function POST(req: NextRequest) {
     const MAX_ATTEMPTS = 3;
     const [{ data: done }, { data: suppressed }] = await Promise.all([
       admin.from('relay_automation_sent')
-        .select('id, lead_id, phone_e164, ok, attempts').eq('workspace_id', ws).eq('automation_key', rule.key),
+        .select('id, lead_id, phone_e164, ok, attempts, sent_at').eq('workspace_id', ws).eq('automation_key', rule.key),
       admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws),
     ]);
-    const settled = (done || []).filter((d) => d.ok || (d.attempts ?? 1) >= MAX_ATTEMPTS);
+    // A retry must WAIT. When 65 backlogged leads went out at once on 13 Sep
+    // the provider rate-limited the burst, and because a failed row was
+    // re-armed on the very next tick all three attempts were spent inside
+    // thirty seconds — against the same closed door. 31 people were written
+    // off for a problem that had cleared minutes later. So each attempt now
+    // stands off longer than the last.
+    const RETRY_BACKOFF_MS = [0, 15 * 60_000, 2 * 3_600_000];   // after attempt 1, 2, 3
+    const retryDue = (d: { attempts?: number; sent_at?: string }) => {
+      const waited = Date.now() - new Date(d.sent_at || 0).getTime();
+      return waited >= (RETRY_BACKOFF_MS[Math.min(d.attempts ?? 1, RETRY_BACKOFF_MS.length) - 1] ?? 0);
+    };
+    // "Leave alone" = delivered, out of attempts, OR still cooling off between
+    // attempts. Without the last one the lead looks untouched and gets claimed
+    // again immediately, which is the very hammering this backoff prevents.
+    const settled = (done || []).filter((d) => d.ok || (d.attempts ?? 1) >= MAX_ATTEMPTS || !retryDue(d));
     const doneLeads = new Set(settled.map((d) => d.lead_id).filter(Boolean));
     const donePhones = new Set(settled.map((d) => d.phone_e164));
     const stopPhones = new Set((suppressed || []).map((s) => s.phone_e164));
 
-    const retryable = (done || []).filter((d) => !d.ok && (d.attempts ?? 1) < MAX_ATTEMPTS);
+    const retryable = (done || [])
+      .filter((d) => !d.ok && (d.attempts ?? 1) < MAX_ATTEMPTS && retryDue(d));
     const retryByLead = new Map(retryable.filter((d) => d.lead_id).map((d) => [d.lead_id as string, d]));
     const retryByPhone = new Map(retryable.map((d) => [d.phone_e164 as string, d]));
 
@@ -267,15 +282,27 @@ export async function POST(req: NextRequest) {
     // They fill the form with one number and then WhatsApp from another. The
     // reply belongs on the number they actually used, so an unknown inbound
     // gets the same first message without waiting for a lead record.
-    const { data: inbound } = await admin
-      .from('relay_conversations')
-      .select('id, phone_e164, last_inbound_at')
-      .eq('workspace_id', ws)
-      .not('last_inbound_at', 'is', null)
-      .gte('last_inbound_at', rule.activated_at)
-      .lte('last_inbound_at', cutoff)
-      .order('last_inbound_at', { ascending: true })
-      .limit(100);
+    //
+    // NEWEST FIRST, in pages — the third home of the fixed-window bug. This
+    // used to read the OLDEST 100 conversations since activation; once more
+    // than 100 people had ever written in, a brand-new enquiry sat beyond the
+    // window and was never even looked at. Newest-first puts tonight's
+    // enquiry on page one; the pages behind it are walked for stragglers.
+    const inbound: { id: string; phone_e164: string; last_inbound_at: string }[] = [];
+    for (let page = 0; page < 20; page++) {
+      const { data: convPage } = await admin
+        .from('relay_conversations')
+        .select('id, phone_e164, last_inbound_at')
+        .eq('workspace_id', ws)
+        .not('last_inbound_at', 'is', null)
+        .gte('last_inbound_at', rule.activated_at)
+        .lte('last_inbound_at', cutoff)
+        .order('last_inbound_at', { ascending: false })
+        .range(page * 100, page * 100 + 99);
+      if (!convPage?.length) break;
+      inbound.push(...(convPage as typeof inbound));
+      if (convPage.length < 100) break;
+    }
 
     // Lead phones are stored however they arrived — "+91 98108 27787",
     // "9810827787", "+919810827787" — so "is this number in the CRM?" can only
@@ -301,15 +328,22 @@ export async function POST(req: NextRequest) {
       const phoneE164 = conv.phone_e164 as string;
       if (!phoneE164 || donePhones.has(phoneE164) || stopPhones.has(phoneE164)) continue;
 
-      // A number that already has a lead row was handled by the pass above, or
-      // belongs to an older contact this rule deliberately leaves alone.
-      if (knownDigits.has(phoneE164.replace(/\D/g, '').slice(-10))) continue;
-
-      // Greet them by the name in their enquiry when it carries one.
       const { data: firstMsg } = await admin
         .from('relay_messages')
         .select('body').eq('conversation_id', conv.id).eq('direction', 'in')
         .order('created_at', { ascending: true }).limit(1).maybeSingle();
+
+      // The MESSAGE decides, not the CRM. A form enquiry gets the first
+      // message on the number it came from, full stop — even if some lead row
+      // with another number, from another year, happens to exist. The only
+      // people the lead-exists check may hold back are old contacts writing
+      // ordinary texts, who belong to the sequences, not to this rule.
+      const isEnquiry =
+        /filled\s+(in|out)\s+your\s+form/i.test(firstMsg?.body || '') ||
+        /full\s*name\s*:/i.test(firstMsg?.body || '');
+      if (!isEnquiry && knownDigits.has(phoneE164.replace(/\D/g, '').slice(-10))) continue;
+
+      // Greet them by the name in their enquiry when it carries one.
       const stranger = { full_name: nameFromEnquiry(firstMsg?.body), visa_type: null };
 
       if (dryRun) {
