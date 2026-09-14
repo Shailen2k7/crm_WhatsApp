@@ -192,11 +192,32 @@ export async function POST(req: Request) {
         console.warn('[relay webhook] corrected', misfiled.length, 'misfiled message(s) to outbound');
       }
 
-      // A status event for an id we have never stored means the message was
-      // sent from INTERAKT'S OWN INBOX, not from Relay. Interakt does not
-      // include the body on status events, so we record a placeholder on the
-      // correct side rather than pretending the message never happened.
-      if ((!updated || updated.length === 0) && status === 'sent' && customer?.channel_phone_number) {
+      // Some status events echo our callbackData rather than the id we
+      // stored. callbackData IS our message row's uuid (set at send), so a
+      // zero-row update falls back to matching on it directly. This runs
+      // BEFORE the sent-from-Interakt fallback below: it used to run after,
+      // and a message of ours whose provider id did not match got a duplicate
+      // placeholder bubble inserted first — the '[template sent from
+      // Interakt]' junk in the middle of a thread we ourselves wrote.
+      let matched = (updated?.length ?? 0) > 0;
+      if (!matched) {
+        const meta = (message?.meta_data || {}) as Record<string, unknown>;
+        const cb = String(
+          meta.callback_data ?? meta.callbackData ??
+          (payload.data as Record<string, unknown> | undefined)?.callback_data ?? ''
+        );
+        if (/^[0-9a-f-]{36}$/i.test(cb)) {
+          const { data: cbHit } = await admin.from('relay_messages').update(patch).eq('id', cb).select('id');
+          matched = (cbHit?.length ?? 0) > 0;
+        }
+      }
+
+      // A status event for a message we truly never stored means it was sent
+      // from INTERAKT'S OWN INBOX, not from Relay. Record it on the correct
+      // side with the best text we can find — the payload's own text if it
+      // carries one, else the template's wording from our library — never a
+      // bracketed placeholder.
+      if (!matched && status === 'sent' && customer?.channel_phone_number) {
         const phoneE164 = toE164(customer.channel_phone_number);
         const { data: ws0 } = await admin.from('workspaces').select('id').order('created_at', { ascending: true }).limit(1).maybeSingle();
         if (phoneE164 && ws0) {
@@ -204,30 +225,31 @@ export async function POST(req: Request) {
           if (cid) {
             const { data: dupe } = await admin.from('relay_messages').select('id').eq('provider_msg_id', providerMsgId).maybeSingle();
             if (!dupe) {
+              const m = (message || {}) as Record<string, unknown>;
+              let body = typeof m.message === 'string' ? m.message.trim() : '';
+              const tplName = String(m.template_name || (m.template as Record<string, unknown> | undefined)?.name || '');
+              if (!body && tplName) {
+                const { data: tpl } = await admin
+                  .from('relay_templates').select('body')
+                  .eq('workspace_id', ws0.id).ilike('name', tplName).maybeSingle();
+                if (tpl?.body) body = tpl.body;
+              }
+              if (!body) {
+                body = m.is_template_message
+                  ? 'Template sent from the Interakt dashboard'
+                  : 'Sent from the Interakt dashboard';
+              }
               await admin.from('relay_messages').insert({
                 workspace_id: ws0.id,
                 conversation_id: cid,
                 direction: 'out',
-                body: message?.is_template_message ? '[template sent from Interakt]' : '[sent from Interakt]',
+                body,
+                template_name: tplName || null,
                 provider_msg_id: providerMsgId,
                 status: 'sent',
               });
             }
           }
-        }
-      }
-
-      // TICK FIX: some status events echo our callbackData rather than the id
-      // we stored. callbackData IS our message row's uuid (set at send), so a
-      // zero-row update falls back to matching on it directly.
-      if (!updated || updated.length === 0) {
-        const meta = (message?.meta_data || {}) as Record<string, unknown>;
-        const cb = String(
-          meta.callback_data ?? meta.callbackData ??
-          (payload.data as Record<string, unknown> | undefined)?.callback_data ?? ''
-        );
-        if (/^[0-9a-f-]{36}$/i.test(cb)) {
-          await admin.from('relay_messages').update(patch).eq('id', cb);
         }
       }
 
