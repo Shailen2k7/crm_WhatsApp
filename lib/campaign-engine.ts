@@ -1,7 +1,7 @@
 // =============================================================================
 // CAMPAIGN ENGINE — drains one-time campaigns, a few per tick.
 // -----------------------------------------------------------------------------
-// Rides the same 2-minute automation tick as the sequences. Each pass it picks
+// Rides the same automation tick as the sequences (every 5 minutes). Each pass it picks
 // up campaigns that are due and sends the next handful of queued recipients.
 //
 // Deliberately independent of the C1–C8 sequence: a campaign never reads or
@@ -10,8 +10,9 @@
 // =============================================================================
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { sendTemplateToLead } from '@/lib/send-template';
+import type { RunContext } from '@/lib/automation/run-context';
 
-/** Kept small so a serverless invocation always finishes well inside its limit. */
+/** Per campaign, per run — the run's shared budget and deadline still apply. */
 const SEND_BUDGET_PER_TICK = 8;
 
 export interface CampaignReport {
@@ -22,7 +23,7 @@ export interface CampaignReport {
   finished: boolean;
 }
 
-export async function runCampaigns(admin: SupabaseClient): Promise<CampaignReport[]> {
+export async function runCampaigns(admin: SupabaseClient, ctx?: RunContext): Promise<CampaignReport[]> {
   const nowIso = new Date().toISOString();
 
   // Anything actively sending, plus anything whose scheduled time has arrived.
@@ -36,6 +37,7 @@ export async function runCampaigns(admin: SupabaseClient): Promise<CampaignRepor
   const reports: CampaignReport[] = [];
 
   for (const c of campaigns) {
+    if (ctx && (!ctx.hasTime() || ctx.sendsLeft() <= 0)) break;   // the rest continue next run
     if (c.status === 'scheduled') {
       if (c.scheduled_at && c.scheduled_at > nowIso) continue;   // not yet
       await admin.from('relay_campaigns')
@@ -52,7 +54,7 @@ export async function runCampaigns(admin: SupabaseClient): Promise<CampaignRepor
       .select('*')
       .eq('campaign_id', c.id)
       .eq('status', 'queued')
-      .limit(SEND_BUDGET_PER_TICK);
+      .limit(Math.max(1, Math.min(SEND_BUDGET_PER_TICK, ctx ? ctx.sendsLeft() : SEND_BUDGET_PER_TICK)));
 
     // Nothing left to send — close it out.
     if (!queued?.length) {
@@ -75,12 +77,14 @@ export async function runCampaigns(admin: SupabaseClient): Promise<CampaignRepor
     const stop = new Set((suppressed || []).map((s) => s.phone_e164));
 
     for (const r of queued) {
+      if (ctx && !ctx.hasTime()) break;
       if (stop.has(r.phone_e164)) {
         await admin.from('relay_campaign_recipients')
           .update({ status: 'skipped', error: 'opted out (STOP)' }).eq('id', r.id);
         continue;
       }
 
+      if (ctx && !ctx.takeSend()) break;
       const { data: convId } = await admin.rpc('relay_get_or_create_conversation', {
         p_workspace_id: ws, p_phone_e164: r.phone_e164,
       });
@@ -99,14 +103,17 @@ export async function runCampaigns(admin: SupabaseClient): Promise<CampaignRepor
         workspaceId: ws, conversationId: convId as string, phoneE164: r.phone_e164,
         templateName: c.template_name, language: c.template_language || 'en',
         lead: lead || { full_name: r.full_name },
-      });
+      }, ctx);
 
+      // A timeout is "delivery unknown": counting it as sent means a slow
+      // provider can never cause a blast to go to the same person twice. The
+      // chat thread shows the real status once the webhook confirms it.
       await admin.from('relay_campaign_recipients').update({
-        status: res.ok ? 'sent' : 'failed',
+        status: res.ok || res.timedOut ? 'sent' : 'failed',
         error: res.error, message_id: res.messageId, sent_at: new Date().toISOString(),
       }).eq('id', r.id);
 
-      if (res.ok) report.sent++; else report.failed++;
+      if (res.ok || res.timedOut) report.sent++; else report.failed++;
     }
 
     // Roll the per-recipient outcomes up onto the campaign row.

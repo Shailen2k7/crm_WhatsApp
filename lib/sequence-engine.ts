@@ -1,14 +1,13 @@
 // =============================================================================
 // SEQUENCE ENGINE — runs the C1–C8 follow-up machine.
 // -----------------------------------------------------------------------------
-// Called from the 2-minute automation tick. Each pass, for every RUNNING
-// sequence:
+// Called from the automation tick (every 5 minutes). Each pass, for every
+// RUNNING sequence, inside the run's time and send budget:
 //
 //   1. ENROL — top up today's intake to the ramp limit (80/day -> 150 -> 200…),
 //      OLDEST leads first, so the whole database is eventually covered.
-//   2. SEND  — deliver every step that has come due, a few per tick so a
-//      serverless invocation never runs long. 2-minute ticks over a 12-hour
-//      sending window give ~1,000 messages/day of headroom at 3 per tick.
+//   2. SEND  — deliver every step that has come due, a few per run so a
+//      run never goes long; whatever is left continues on the next run.
 //
 // A lead leaves the machine by replying (webhook flips them to 'replied'),
 // finishing every step ('completed'), opting out ('stopped'), or having a
@@ -17,9 +16,15 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { toE164 } from '@/lib/phone';
 import { sendTemplateToLead } from '@/lib/send-template';
+import { forEachLimited, type RunContext } from '@/lib/automation/run-context';
 
 const IST = 'Asia/Kolkata';
-const SEND_BUDGET_PER_TICK = 3;      // stays well inside a serverless time limit
+// Per sequence, per run. The run's shared budget (20) and each sequence's
+// hourly cap still apply on top; this only stops one sequence taking all of it.
+const SEND_BUDGET_PER_TICK = 5;
+const SEND_CONCURRENCY = 3;
+/** A queued message the provider never confirmed is treated as failed after this. */
+const TIMEOUT_UNCONFIRMED_MS = 30 * 60_000;
 const ENROL_PAGE = 400;              // leads read per query when topping up
 // The oldest leads are enrolled first, so once the front of the database is in
 // the machine every page we read is full of people we have already got. Walking
@@ -81,6 +86,28 @@ export function retryAtFrom(failedAtIso: string): string {
     return new Date(`${istDate(nextDay)}T${String(RETRY_EARLIEST_HOUR).padStart(2, '0')}:00:00+05:30`).toISOString();
   }
   return earliest.toISOString();   // already a sensible time of day
+}
+
+/**
+ * Reads every row, a page at a time. A single query returns at most 1000 rows,
+ * and the cold sequence alone is past 900 — reading "everyone already enrolled"
+ * in one go would quietly drop the rest, and enrolment would then retry those
+ * people (and fail on the unique index) on every run.
+ */
+async function readAllPages<T>(
+  page: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+  ctx?: RunContext,
+  maxPages = 20,
+): Promise<T[]> {
+  const rows: T[] = [];
+  for (let p = 0; p < maxPages; p++) {
+    if (ctx && ctx.signal.aborted) break;
+    const { data, error } = await page(p * 1000, p * 1000 + 999);
+    if (error) throw new Error(error.message);
+    rows.push(...(data || []));
+    if (!data || data.length < 1000) break;
+  }
+  return rows;
 }
 
 /** Today's intake limit from the ramp schedule. */
@@ -159,8 +186,13 @@ async function repairBouncedSends(
   const toRetry: { phone: string; step: number; at: string }[] = [];
   for (const [k, s] of latest) {
     const m = byId.get(s.message_id as string);
-    if (!m || m.status !== 'failed') continue;
-    if (!RETRYABLE_CODES.has(String(m.error_code || ''))) continue;
+    if (!m) continue;
+    const bounced = m.status === 'failed' && RETRYABLE_CODES.has(String(m.error_code || ''));
+    // Sent into a timeout and never confirmed by the webhook in half an hour:
+    // it almost certainly never reached WhatsApp, so it gets another go.
+    const unconfirmed = m.status === 'queued' && m.error_code === 'timeout'
+      && Date.now() - new Date(s.sent_at).getTime() > TIMEOUT_UNCONFIRMED_MS;
+    if (!bounced && !unconfirmed) continue;
     if ((attempts.get(k) || 0) >= MAX_ATTEMPTS_PER_STEP) continue;
     toRetry.push({ phone: s.phone_e164, step: s.step_no, at: retryAtFrom(s.sent_at) });
   }
@@ -180,36 +212,82 @@ async function repairBouncedSends(
   return repaired;
 }
 
-export async function runSequences(admin: SupabaseClient): Promise<SequenceReport[]> {
-  const { data: sequences } = await admin
-    .from('relay_sequences')
-    .select('*')
-    .eq('status', 'running');
+export interface RunSequencesOptions {
+  /** Only these sequences (the tick passes the ones with work). Default: all running. */
+  sequenceIds?: string[];
+  /** Enrol new people this run. The tick does this every 15 minutes. Default true. */
+  enrol?: boolean;
+  /** Re-queue bounced messages this run. The tick does this hourly. Default true. */
+  repair?: boolean;
+}
+
+export async function runSequences(
+  admin: SupabaseClient,
+  ctx?: RunContext,
+  opts: RunSequencesOptions = {},
+): Promise<SequenceReport[]> {
+  let q = admin.from('relay_sequences').select('*').eq('status', 'running');
+  if (opts.sequenceIds) {
+    if (!opts.sequenceIds.length) return [];
+    q = q.in('id', opts.sequenceIds);
+  }
+  const { data: sequences } = await q;
   if (!sequences?.length) return [];
 
   const reports: SequenceReport[] = [];
-  for (const seq of sequences) {
+  // Sequences are independent, so they run side by side; the run's shared
+  // send budget and deadline still hold across all of them.
+  const runOne = async (seq: (typeof sequences)[number]) => {
     const report: SequenceReport = { sequence: seq.name, enrolled: 0, sent: 0, completed: 0, retried: 0, skipped: [] };
     reports.push(report);
+    if (ctx && !ctx.hasTime()) { report.note = 'Deferred to the next run.'; return; }
 
     const ws = seq.workspace_id as string;
     const [{ data: steps }, { data: ramp }] = await Promise.all([
       admin.from('relay_sequence_steps').select('*').eq('sequence_id', seq.id).order('step_no'),
       admin.from('relay_sequence_ramp').select('*').eq('sequence_id', seq.id).order('stage_no'),
     ]);
-    if (!steps?.length) { report.note = 'No steps configured.'; continue; }
+    if (!steps?.length) { report.note = 'No steps configured.'; return; }
 
     // ---- 1. ENROL: top up today's intake, oldest leads first ---------------
     const day = rampDay(seq.started_at || new Date().toISOString());
     const limit = intakeLimitFor(day, (ramp || []) as Ramp[]);
     const dayStartIst = new Date(`${istDate()}T00:00:00+05:30`).toISOString();
 
-    const { count: enrolledToday } = await admin
-      .from('relay_lead_sequences')
-      .select('id', { count: 'exact', head: true })
-      .eq('sequence_id', seq.id)
-      .gte('enrolled_at', dayStartIst);
-    let room = Math.max(0, limit - (enrolledToday ?? 0));
+    const { count: enrolledToday } = opts.enrol === false
+      ? { count: 0 }
+      : await admin
+          .from('relay_lead_sequences')
+          .select('id', { count: 'exact', head: true })
+          .eq('sequence_id', seq.id)
+          .gte('enrolled_at', dayStartIst);
+    let room = opts.enrol === false ? 0 : Math.max(0, limit - (enrolledToday ?? 0));
+
+    // ---- do not enrol faster than we can send ------------------------------
+    // The ramp says how many people to TAKE IN a day; per_hour_cap says how
+    // many messages may GO OUT. Nothing connected the two, so an intake of
+    // 100/day against a send rate of 50/day quietly built a permanent queue:
+    // 465 people were overdue, the oldest by four days, and every promise the
+    // schedule makes ("C2 three days after C1") was being broken by the
+    // backlog rather than by the settings.
+    //
+    // So intake pauses while more people are already overdue than a day of
+    // sending can clear. The queue drains, then intake resumes.
+    if (room > 0 && Number(seq.per_hour_cap) > 0) {
+      const windowHours = seq.hours_enabled
+        ? Math.max(1, (seq.send_end_hour ?? 24) - (seq.send_start_hour ?? 0))
+        : 24;
+      const dailyCapacity = Number(seq.per_hour_cap) * windowHours;
+      const { count: overdue } = await admin
+        .from('relay_lead_sequences')
+        .select('id', { count: 'exact', head: true })
+        .eq('sequence_id', seq.id).eq('status', 'active')
+        .lte('next_send_at', new Date().toISOString());
+      if ((overdue ?? 0) >= dailyCapacity) {
+        report.note = `Intake paused: ${overdue} already waiting, more than one day of sending (${dailyCapacity}).`;
+        room = 0;
+      }
+    }
 
     const stages = seq.audience === 'both' ? ['cold', 'hot'] : [seq.audience];
     const noReply = seq.trigger_mode === 'no_reply';
@@ -221,15 +299,24 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
       !industries || industries.includes((ind || '').trim() || '(none)');
 
     if (room > 0) {
-      const [{ data: already }, { data: suppressed }, { data: busyElsewhere }] = await Promise.all([
-        admin.from('relay_lead_sequences').select('lead_id, phone_e164').eq('sequence_id', seq.id),
+      type Enrolled = { lead_id: string | null; phone_e164: string };
+      const [already, { data: suppressed }, busyElsewhere] = await Promise.all([
+        readAllPages<Enrolled>((from, to) => admin.from('relay_lead_sequences')
+          .select('lead_id, phone_e164').eq('sequence_id', seq.id).order('id').range(from, to), ctx),
         admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws),
         // Someone mid-way through another machine is already hearing from us.
         // Two sequences messaging the same person on the same day is the
         // fastest way to look like a robot, so they wait their turn.
-        admin.from('relay_lead_sequences')
-          .select('lead_id, phone_e164').eq('workspace_id', ws)
-          .eq('status', 'active').neq('sequence_id', seq.id),
+        //
+        // The no-reply chase is the exception, and must be: it is not a
+        // separate campaign but the direct continuation of the first message
+        // we sent minutes ago. Holding T2 back because some other sequence
+        // has the same person queued is how a fresh enquiry goes unanswered.
+        noReply
+          ? Promise.resolve([] as Enrolled[])
+          : readAllPages<Enrolled>((from, to) => admin.from('relay_lead_sequences')
+              .select('lead_id, phone_e164').eq('workspace_id', ws)
+              .eq('status', 'active').neq('sequence_id', seq.id).order('id').range(from, to), ctx),
       ]);
       const doneLeads = new Set([
         ...(already || []).map((a) => a.lead_id),
@@ -249,7 +336,7 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
         // chase reads as spam, not follow-up.
         const horizon = new Date(Date.now() - 14 * 86_400_000).toISOString();
 
-        for (let page = 0; room > 0 && page < ENROL_MAX_PAGES; page++) {
+        for (let page = 0; room > 0 && page < ENROL_MAX_PAGES && (!ctx || ctx.hasTime()); page++) {
           const { data: firstSends } = await admin
             .from('relay_automation_sent')
             .select('lead_id, phone_e164, sent_at')
@@ -312,7 +399,7 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
         // Pages forward until today's room is filled. The first pages are
         // people already enrolled; walking past them is what keeps the intake
         // running once the front of the database is covered.
-        for (let page = 0; room > 0 && page < ENROL_MAX_PAGES; page++) {
+        for (let page = 0; room > 0 && page < ENROL_MAX_PAGES && (!ctx || ctx.hasTime()); page++) {
           const { data: leads } = await admin
             .from('leads')
             .select('id, full_name, phone, visa_type, industry, created_at, is_sample')
@@ -342,21 +429,24 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
     }
 
     // ---- 2. Give bounced messages another go -------------------------------
-    report.retried = await repairBouncedSends(admin, seq.id, ws);
+    if (opts.repair !== false && (!ctx || ctx.hasTime())) {
+      report.retried = await repairBouncedSends(admin, seq.id, ws);
+    }
 
     // ---- 3. SEND what is due, inside sending hours -------------------------
     if (seq.hours_enabled) {
       const h = istHour();
       if (h < seq.send_start_hour || h >= seq.send_end_hour) {
         report.note = `Outside sending hours (${seq.send_start_hour}:00–${seq.send_end_hour}:00 IST).`;
-        continue;
+        return;
       }
     }
 
     // Spread the day out instead of emptying the queue in the first ten
     // minutes: at 5 an hour over a 9am–7pm window that is 50 a day, arriving
     // like a person sending them rather than a machine dumping them.
-    let budget = SEND_BUDGET_PER_TICK;
+    let budget = Math.min(SEND_BUDGET_PER_TICK, ctx ? ctx.sendsLeft() : SEND_BUDGET_PER_TICK);
+    if (budget <= 0 || (ctx && !ctx.hasTime())) { report.note = 'Send budget used — continues next run.'; return; }
     const perHour = Number(seq.per_hour_cap) || 0;
     if (perHour > 0) {
       const hourStart = new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000).toISOString();
@@ -367,7 +457,7 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
       budget = Math.min(budget, Math.max(0, perHour - (sentThisHour ?? 0)));
       if (budget === 0) {
         report.note = `This hour's ${perHour} already sent — next batch at the top of the hour.`;
-        continue;
+        return;
       }
     }
 
@@ -379,102 +469,118 @@ export async function runSequences(admin: SupabaseClient): Promise<SequenceRepor
       .lte('next_send_at', new Date().toISOString())
       .order('next_send_at', { ascending: true })
       .limit(budget);
+    if (!due?.length) return;
 
-    for (const row of due || []) {
-      const step = (steps as Step[]).find((s) => s.step_no === row.current_step + 1);
+    // Everything each send needs to check, fetched once for the whole batch —
+    // not three queries per person.
+    const dueLeadIds = [...new Set(due.map((r) => r.lead_id).filter(Boolean) as string[])];
+    const duePhones = [...new Set(due.map((r) => r.phone_e164 as string))];
+    const [{ data: dueLeads }, { data: dueSupp }] = await Promise.all([
+      dueLeadIds.length
+        ? admin.from('leads').select('id, stage, full_name, visa_type').in('id', dueLeadIds)
+        : Promise.resolve({ data: [] as { id: string; stage: string; full_name: string | null; visa_type: string | null }[] }),
+      admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws).in('phone_e164', duePhones),
+    ]);
+    const leadById = new Map((dueLeads || []).map((l) => [l.id, l]));
+    const optedOut = new Set((dueSupp || []).map((x) => x.phone_e164 as string));
+    const stamp = () => new Date().toISOString();
+
+    await forEachLimited(due, SEND_CONCURRENCY, () => !ctx || ctx.hasTime(), async (row) => {
+      const step = (steps as Step[]).find((st) => st.step_no === row.current_step + 1);
       if (!step) {
         await admin.from('relay_lead_sequences').update({
-          status: 'completed', exit_reason: 'done', exited_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+          status: 'completed', exit_reason: 'done', exited_at: stamp(), updated_at: stamp(),
         }).eq('id', row.id);
         report.completed++;
-        continue;
+        return;
       }
 
       // Did this lead move out of the audience since enrolling? Someone who
       // has turned hot, converted, or been marked junk should not keep getting
       // cold follow-ups — that is the embarrassing kind of automation.
-      if (row.lead_id) {
-        const { data: cur } = await admin.from('leads').select('stage').eq('id', row.lead_id).maybeSingle();
+      const cur = row.lead_id ? leadById.get(row.lead_id) : undefined;
+      if (cur) {
         const out = noReply
-          ? ['junk', 'won', 'lost'].includes(cur?.stage || '')   // chase: only these disqualify
-          : !!cur && !stages.includes(cur.stage);                // backlog: must match audience
-        if (cur && out) {
+          ? ['junk', 'won', 'lost'].includes(cur.stage || '')   // chase: only these disqualify
+          : !stages.includes(cur.stage);                          // backlog: must match audience
+        if (out) {
           await admin.from('relay_lead_sequences').update({
-            status: 'stopped', exit_reason: `stage changed to ${cur.stage}`,
-            exited_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+            status: 'stopped', exit_reason: `stage changed to ${cur.stage}`, exited_at: stamp(), updated_at: stamp(),
           }).eq('id', row.id);
           report.skipped.push(`${row.phone_e164}: now ${cur.stage}`);
-          continue;
+          return;
         }
       }
 
       // A STOP that arrived after enrolment still wins.
-      const { data: sup } = await admin
-        .from('relay_suppressions')
-        .select('id').eq('workspace_id', ws).eq('phone_e164', row.phone_e164).maybeSingle();
-      if (sup) {
+      if (optedOut.has(row.phone_e164)) {
         await admin.from('relay_lead_sequences').update({
-          status: 'stopped', exit_reason: 'stop_optout', exited_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+          status: 'stopped', exit_reason: 'stop_optout', exited_at: stamp(), updated_at: stamp(),
         }).eq('id', row.id);
         report.skipped.push(`${row.phone_e164}: opted out`);
-        continue;
+        return;
       }
 
-      const { data: lead } = row.lead_id
-        ? await admin.from('leads').select('full_name, visa_type').eq('id', row.lead_id).maybeSingle()
-        : { data: null };
+      if (ctx && !ctx.takeSend()) return;   // out of time or budget: next run
 
       const { data: convId } = await admin.rpc('relay_get_or_create_conversation', {
         p_workspace_id: ws, p_phone_e164: row.phone_e164,
       });
       if (!convId) {
+        ctx?.giveBackSend();
         await admin.from('relay_lead_sequences').update({
-          status: 'skipped', exit_reason: 'bad_phone', exited_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+          status: 'skipped', exit_reason: 'bad_phone', exited_at: stamp(), updated_at: stamp(),
         }).eq('id', row.id);
         report.skipped.push(`${row.phone_e164}: no conversation`);
-        continue;
+        return;
       }
 
       const r = await sendTemplateToLead(admin, {
         workspaceId: ws, conversationId: convId as string, phoneE164: row.phone_e164,
         templateName: step.template_name, language: step.template_language || 'en',
-        lead: lead || {},
-      });
+        lead: cur ? { full_name: cur.full_name, visa_type: cur.visa_type } : {},
+      }, ctx);
+
+      // A timeout is "delivery unknown", not a failure: the provider usually
+      // did send it. Advancing keeps the lead in the sequence and avoids a
+      // duplicate; if the webhook never confirms it within half an hour, the
+      // repair pass sends it again.
+      const counted = r.ok || r.timedOut;
 
       await admin.from('relay_sequence_sends').insert({
         workspace_id: ws, sequence_id: seq.id, lead_id: row.lead_id,
         phone_e164: row.phone_e164, step_no: step.step_no,
         template_name: step.template_name, message_id: r.messageId,
-        ok: r.ok, error: r.error,
+        ok: counted, error: r.error,
       });
 
-      if (!r.ok) {
+      if (!counted) {
         // A hard provider rejection would fail identically tomorrow; keep the
         // reason and move on rather than hammering the same wall every tick.
         await admin.from('relay_lead_sequences').update({
           status: 'skipped', exit_reason: `send_failed: ${(r.error || '').slice(0, 160)}`,
-          exited_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+          exited_at: stamp(), updated_at: stamp(),
         }).eq('id', row.id);
         report.skipped.push(`${row.phone_e164}: ${r.error}`);
-        continue;
+        return;
       }
 
       report.sent++;
-      const next = (steps as Step[]).find((s) => s.step_no === step.step_no + 1);
+      const next = (steps as Step[]).find((st) => st.step_no === step.step_no + 1);
       if (next) {
-        const nextAt = new Date(Date.now() + gapMs(next)).toISOString();
         await admin.from('relay_lead_sequences').update({
-          current_step: step.step_no, last_sent_at: new Date().toISOString(),
-          next_send_at: nextAt, updated_at: new Date().toISOString(),
+          current_step: step.step_no, last_sent_at: stamp(),
+          next_send_at: new Date(Date.now() + gapMs(next)).toISOString(), updated_at: stamp(),
         }).eq('id', row.id);
       } else {
         await admin.from('relay_lead_sequences').update({
-          current_step: step.step_no, last_sent_at: new Date().toISOString(),
-          status: 'completed', exit_reason: 'done', exited_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+          current_step: step.step_no, last_sent_at: stamp(),
+          status: 'completed', exit_reason: 'done', exited_at: stamp(), updated_at: stamp(),
         }).eq('id', row.id);
         report.completed++;
       }
-    }
-  }
+    });
+  };
+  await forEachLimited(sequences, 3, () => !ctx || ctx.hasTime(), runOne);
   return reports;
 }

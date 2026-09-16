@@ -10,7 +10,8 @@
 //   * body rendered from the registered wording so the thread shows real text
 // =============================================================================
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { sendTemplate } from '@/lib/interakt';
+import { sendTemplate, type CallLimits } from '@/lib/interakt';
+import { CALL_TIMEOUT_MS, type RunContext } from '@/lib/automation/run-context';
 
 export function firstNameOf(fullName: string | null | undefined): string {
   const n = (fullName || '').trim().split(/\s+/)[0];
@@ -32,18 +33,31 @@ export async function sendTemplateToLead(
     language: string;
     lead: { full_name?: string | null; visa_type?: string | null };
   },
-): Promise<{ ok: boolean; messageId: string | null; error: string | null }> {
+  /** The automation run, when called from one: bounds the provider call and caches wording. */
+  ctx?: RunContext,
+): Promise<{ ok: boolean; messageId: string | null; error: string | null; timedOut: boolean }> {
   const { workspaceId: ws, conversationId, phoneE164, templateName, language, lead } = args;
+  const limits: CallLimits | undefined = ctx ? { timeoutMs: CALL_TIMEOUT_MS, signal: ctx.signal } : undefined;
 
   const candidates = [firstNameOf(lead.full_name), visaLabelOf(lead.visa_type), 'Migrizo'];
   const pad = (n: number) => Array.from({ length: n }, (_, i) => candidates[i] || candidates[0] || 'Migrizo');
 
-  const { data: tplRow } = await admin
-    .from('relay_templates')
-    .select('id, body, variable_count')
-    .eq('workspace_id', ws)
-    .eq('name', templateName)
-    .maybeSingle();
+  // A run sending twenty C1s used to read the same template row twenty times.
+  type TplRow = { id: string; body: string | null; variable_count: number | null } | null;
+  const cacheKey = `tpl:${ws}:${templateName}`;
+  let tplRow: TplRow;
+  if (ctx?.cache.has(cacheKey)) {
+    tplRow = ctx.cache.get(cacheKey) as TplRow;
+  } else {
+    const { data } = await admin
+      .from('relay_templates')
+      .select('id, body, variable_count')
+      .eq('workspace_id', ws)
+      .eq('name', templateName)
+      .maybeSingle();
+    tplRow = data as TplRow;
+    ctx?.cache.set(cacheKey, tplRow);
+  }
 
   let values = pad(tplRow?.variable_count ?? 0);
   const renderBody = (vals: string[]) =>
@@ -60,9 +74,9 @@ export async function sendTemplateToLead(
     })
     .select('id')
     .single();
-  if (!msg) return { ok: false, messageId: null, error: 'Could not save the message row.' };
+  if (!msg) return { ok: false, messageId: null, error: 'Could not save the message row.', timedOut: false };
 
-  let result = await sendTemplate({ phoneE164, templateName, languageCode: language, bodyValues: values, callbackData: msg.id });
+  let result = await sendTemplate({ phoneE164, templateName, languageCode: language, bodyValues: values, callbackData: msg.id, limits });
 
   // Wrong number of values? Interakt names the right one — learn it, retry once.
   if (!result.ok) {
@@ -73,21 +87,30 @@ export async function sendTemplateToLead(
         await admin.from('relay_templates')
           .update({ variable_count: Number(m[1]), updated_at: new Date().toISOString() })
           .eq('id', tplRow.id);
+        ctx?.cache.set(cacheKey, { ...tplRow, variable_count: Number(m[1]) });
       }
       await admin.from('relay_messages')
         .update({ body: renderBody(values), template_values: { bodyValues: values } })
         .eq('id', msg.id);
-      result = await sendTemplate({ phoneE164, templateName, languageCode: language, bodyValues: values, callbackData: msg.id });
+      result = await sendTemplate({ phoneE164, templateName, languageCode: language, bodyValues: values, callbackData: msg.id, limits });
     }
   }
 
+  // A TIMEOUT IS NOT A FAILURE. Interakt may have accepted the message and
+  // simply answered slowly, in which case WhatsApp delivers it and the webhook
+  // later stamps this row sent/delivered (it matches on callbackData = this
+  // row's id). Recording it as 'failed' would invite a retry and a duplicate
+  // message to the customer. So it stays 'queued', tagged 'timeout', until the
+  // webhook tells us the truth.
+  const timedOut = !result.ok && result.code === 'timeout';
+
   await admin.from('relay_messages').update({
-    status: result.ok ? 'sent' : 'failed',
+    status: result.ok ? 'sent' : timedOut ? 'queued' : 'failed',
     provider_msg_id: result.providerMsgId || null,
     error_code: result.ok ? null : result.code || 'unknown',
     error_detail: result.ok ? null : (result.detail || '').slice(0, 500),
     updated_at: new Date().toISOString(),
   }).eq('id', msg.id);
 
-  return { ok: result.ok, messageId: msg.id, error: result.ok ? null : result.detail || 'send failed' };
+  return { ok: result.ok, messageId: msg.id, error: result.ok ? null : result.detail || 'send failed', timedOut };
 }

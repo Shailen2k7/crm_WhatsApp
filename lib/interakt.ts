@@ -19,6 +19,7 @@
 // after we have already written an optimistic row.
 // =============================================================================
 
+import { linkedSignal } from '@/lib/automation/signals';
 const BASE = 'https://api.interakt.ai/v1/public';
 
 export interface SendResult {
@@ -94,11 +95,34 @@ export function isConfigured(): boolean {
   return !!apiKey();
 }
 
-async function post(path: string, body: unknown): Promise<SendResult> {
+/**
+ * Optional limits for a send. Only the automation passes these; the manual send
+ * and webhook routes pass nothing and keep the original 20-second behaviour.
+ */
+export interface CallLimits {
+  /** Give up after this long. */
+  timeoutMs?: number;
+  /** Abort early when this fires (the automation run's hard stop). */
+  signal?: AbortSignal;
+}
+
+async function post(path: string, body: unknown, limits?: CallLimits): Promise<SendResult> {
   const key = apiKey();
   if (!key) return { ok: false, code: 'not_configured', detail: 'INTERAKT_API_KEY is not set.' };
 
+  // No limits given → exactly the original single 20s timeout.
+  let signal: AbortSignal = AbortSignal.timeout(20_000);
+  let limitMs = 20_000;
+  let done = () => {};
+  if (limits) {
+    limitMs = limits.timeoutMs ?? 20_000;
+    const linked = linkedSignal([limits.signal], limitMs);
+    signal = linked.signal;
+    done = linked.done;
+  }
+
   let res: Response;
+  let text: string;
   try {
     res = await fetch(`${BASE}${path}`, {
       method: 'POST',
@@ -109,20 +133,24 @@ async function post(path: string, body: unknown): Promise<SendResult> {
       },
       body: JSON.stringify(body),
       // A hung provider must not hang the agent's UI.
-      signal: AbortSignal.timeout(20_000),
+      signal,
     });
+    text = await res.text();
   } catch (e) {
-    const aborted = e instanceof Error && e.name === 'TimeoutError';
+    done();
+    const aborted = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
     return {
       ok: false,
       code: aborted ? 'timeout' : 'network_error',
-      detail: aborted ? 'Interakt did not respond within 20s.' : 'Could not reach Interakt.',
+      detail: aborted
+        ? `Interakt did not respond within ${Math.round(limitMs / 1000)}s — delivery unknown.`
+        : 'Could not reach Interakt.',
       raw: String(e),
     };
   }
+  done();
 
   let json: unknown = null;
-  const text = await res.text();
   try {
     json = text ? JSON.parse(text) : null;
   } catch {
@@ -166,6 +194,7 @@ export async function sendTemplate(opts: {
   bodyValues?: string[];
   headerValues?: string[];
   callbackData?: string;
+  limits?: CallLimits;
 }): Promise<SendResult> {
   const split = splitE164(opts.phoneE164);
   if (!split) return { ok: false, code: 'bad_phone', detail: `Not a usable number: ${opts.phoneE164}` };
@@ -181,7 +210,7 @@ export async function sendTemplate(opts: {
       headerValues: opts.headerValues,
       bodyValues: opts.bodyValues || [],
     },
-  });
+  }, opts.limits);
 }
 
 /**
@@ -197,6 +226,7 @@ export async function sendText(opts: {
   phoneE164: string;
   message: string;
   callbackData?: string;
+  limits?: CallLimits;
 }): Promise<SendResult> {
   const split = splitE164(opts.phoneE164);
   if (!split) return { ok: false, code: 'bad_phone', detail: `Not a usable number: ${opts.phoneE164}` };
@@ -207,7 +237,7 @@ export async function sendText(opts: {
     type: 'Text',
     callbackData: opts.callbackData,
     data: { message: opts.message },
-  });
+  }, opts.limits);
 }
 
 /**
@@ -223,6 +253,7 @@ export async function sendMedia(opts: {
   fileName?: string;
   caption?: string;
   callbackData?: string;
+  limits?: CallLimits;
 }): Promise<SendResult> {
   const split = splitE164(opts.phoneE164);
   if (!split) return { ok: false, code: 'bad_phone', detail: `Not a usable number: ${opts.phoneE164}` };
@@ -240,7 +271,7 @@ export async function sendMedia(opts: {
       // Documents keep the human's filename; other types ignore it harmlessly.
       fileName: opts.fileName,
     },
-  });
+  }, opts.limits);
 }
 
 // --- the 24-hour window ------------------------------------------------------

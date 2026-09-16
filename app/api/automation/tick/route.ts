@@ -1,12 +1,22 @@
+import { timingSafeEqual } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { createClient } from '@/lib/supabase/server';
-import { createAdminClient } from '@/lib/supabase/admin';
 import { sendTemplateToLead } from '@/lib/send-template';
-import { sendText, sendTemplate, sendMedia, windowState, isConfigured, mediaTypeFrom } from '@/lib/interakt';
+import { sendText, sendMedia, windowState, isConfigured, mediaTypeFrom } from '@/lib/interakt';
 import { toE164 } from '@/lib/phone';
 import { runSequences } from '@/lib/sequence-engine';
 import { runCampaigns } from '@/lib/campaign-engine';
 import { RELAY_BUCKET } from '@/lib/files';
+import {
+  CALL_TIMEOUT_MS, MAX_SENDS_PER_RUN, createAutomationAdminClient, createRunContext, forEachLimited, isTimeoutError,
+  type RunContext,
+} from '@/lib/automation/run-context';
+import { acquireTickLock, releaseTickLock } from '@/lib/automation/lock';
+import {
+  planFirstMessages, isEnquiry, RECENT_WINDOW_HOURS,
+  type ConvRow, type HistoryRow, type Job, type LeadRow,
+} from '@/lib/automation/first-message';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,24 +24,47 @@ export const dynamic = 'force-dynamic';
 // =============================================================================
 // AUTOMATION TICK — the worker behind the workflow module.
 //
-// Called two ways, both idempotent:
-//   * pg_cron every 2 minutes (header  x-cron-secret: AUTOMATION_CRON_SECRET)
-//   * the Automation panel's "Run now" / dry-run button (signed-in user)
+// Called two ways:
+//   * the Netlify Scheduled Function `automation-tick`, every 5 minutes, with
+//     `Authorization: Bearer <CRON_SECRET>`
+//   * the Automation panel's "Run it now" / dry-run button (signed-in user)
 //
-// Rule 'new_lead_first': every NEW lead (created after the rule was switched
-// on) gets exactly one first message asking for CV + LinkedIn.
-//   window OPEN  -> the quick reply (free-form, with attachments if any)
-//   window CLOSED-> the approved template
+// One run does, within a fixed budget (see lib/automation/run-context.ts):
+//   1. the first CV + LinkedIn message to every new lead / unknown enquiry
+//   2. meeting booked / completed messages
+//   3. the C1–C8, no-reply and hot sequences
+//   4. one-time campaigns
 //
-// A lead is only ever messaged ONCE by this rule — enforced by two unique
-// indexes (per lead id AND per phone), so even duplicate CRM rows for the
-// same person cannot cause a second send.
+// WHY IT LOOKS LIKE THIS — a run with nothing to send used to make ~108
+// sequential round trips to the Singapore database (one per recent
+// conversation) and take 15–25s. Called every 10s by pg_cron it ran into the
+// ~27s platform timeout, overlapped itself, and pushed the bill from ~30 to
+// ~590 credits a day. Now:
+//   * a lock means two runs never overlap
+//   * everything a run needs is read in two PARALLEL rounds, then planned in
+//     memory — an idle run is ~3 round trips and returns in well under a second
+//     on a warm function
+//   * every call times out at 5s, nothing new starts after 6s, everything is
+//     aborted at 9s, and at most 20 messages go out per run; the rest continue
+//     next run
+//
+// A lead is only ever messaged ONCE by the first-message rule — enforced by two
+// unique indexes (per lead id AND per phone), so even overlapping or duplicate
+// work cannot send twice.
 // =============================================================================
 
 const IST = 'Asia/Kolkata';
+const SEND_CONCURRENCY = 4;
+/** Marks a send whose outcome is unknown because the provider did not answer in time. */
+const TIMEOUT_NOTE = 'timeout — delivery unknown';
+
+type Admin = SupabaseClient;
 
 function istDate(d = new Date()): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: IST }).format(d); // YYYY-MM-DD
+}
+function istHour(d = new Date()): number {
+  return Number(new Intl.DateTimeFormat('en-GB', { timeZone: IST, hour: 'numeric', hour12: false }).format(d));
 }
 function firstNameOf(fullName: string | null | undefined): string {
   const n = (fullName || '').trim().split(/\s+/)[0];
@@ -41,38 +74,42 @@ function visaLabelOf(visaType: string | null | undefined): string {
   const v = (visaType || '').toLowerCase();
   return v.includes('ifv') || v.includes('innovator') ? 'Innovator Founder Visa' : 'Global Talent Visa';
 }
-/**
- * The Meta lead form arrives as a message that spells the name out. When the
- * number is not in the CRM that line is all we have to greet them by.
- */
-function nameFromEnquiry(body: string | null | undefined): string | null {
-  const m = (body || '').match(/full\s*name\s*:\s*(.+)/i);
-  const n = m?.[1]?.split('\n')[0]?.trim();
-  return n || null;
-}
 /** {{name}} / {{first_name}} / {{visa}} tokens in quick-reply bodies. */
 function personalise(body: string, lead: { full_name?: string | null; visa_type?: string | null }): string {
   return body
     .replace(/\{\{\s*(?:name|first_name|firstname)\s*\}\}/gi, firstNameOf(lead.full_name))
     .replace(/\{\{\s*visa\s*\}\}/gi, visaLabelOf(lead.visa_type));
 }
+const chunk = <T,>(xs: T[], n: number) => Array.from({ length: Math.ceil(xs.length / n) }, (_, i) => xs.slice(i * n, i * n + n));
+
+/** Constant-time comparison, so the secret cannot be guessed byte by byte. */
+function secretMatches(presented: string, expected: string): boolean {
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 export async function POST(req: NextRequest) {
   // ---- who is calling? -----------------------------------------------------
-  const cronSecret = process.env.AUTOMATION_CRON_SECRET || '';
-  const viaCron = !!cronSecret && req.headers.get('x-cron-secret') === cronSecret;
+  // Machine callers must present CRON_SECRET, as a Bearer token or the
+  // x-cron-secret header. This check touches no database, so a caller with a
+  // wrong or retired secret — such as the old pg_cron jobs — costs a few
+  // milliseconds, not a run.
+  const auth = req.headers.get('authorization') || '';
+  const presented = auth.toLowerCase().startsWith('bearer ')
+    ? auth.slice(7).trim()
+    : req.headers.get('x-cron-secret');
 
-  // A caller that PRESENTED a cron secret but failed the check must be told
-  // exactly why, or a missing environment variable looks identical to a
-  // logged-out browser and the automation dies silently every 2 minutes.
-  const presented = req.headers.get('x-cron-secret');
-  if (presented && !viaCron) {
-    return NextResponse.json({
-      ok: false,
-      error: cronSecret
-        ? 'The x-cron-secret header does not match AUTOMATION_CRON_SECRET on the server.'
-        : 'AUTOMATION_CRON_SECRET is not set on the server. Add it in Netlify and redeploy.',
-    }, { status: 401 });
+  let viaCron = false;
+  if (presented) {
+    const expected = process.env.CRON_SECRET || '';
+    if (!expected) {
+      return NextResponse.json({ ok: false, error: 'CRON_SECRET is not set on the server. Add it in Netlify and redeploy.' }, { status: 500 });
+    }
+    if (!secretMatches(presented, expected)) {
+      return NextResponse.json({ ok: false, error: 'Invalid cron secret.' }, { status: 401 });
+    }
+    viaCron = true;
   }
 
   let workspaceId: string | null = null;
@@ -85,524 +122,557 @@ export async function POST(req: NextRequest) {
     if (!workspaceId) return NextResponse.json({ ok: false, error: 'No workspace.' }, { status: 403 });
   }
 
-  const admin = createAdminClient();
-  if (!admin) return NextResponse.json({ ok: false, error: 'Server is not configured.' }, { status: 500 });
-
   const dryRun = req.nextUrl.searchParams.get('dry') === '1';
-
-  // ?scope=new_leads — the fast lane. A new enquiry must be answered in
-  // seconds, but the C1–C8 chase and the campaigns are hourly-paced work that
-  // would be wasteful to repeat every few seconds. A second cron job hits this
-  // scope on a short interval and skips straight past them.
+  // ?scope=new_leads — first messages and meetings only; skips the sequences
+  // and campaigns. Kept for manual use; the schedule runs the full tick.
   const fastLane = req.nextUrl.searchParams.get('scope') === 'new_leads';
 
-  // ---- the rule ------------------------------------------------------------
-  let q = admin.from('relay_automations').select('*').eq('key', 'new_lead_first').eq('enabled', true);
-  if (workspaceId) q = q.eq('workspace_id', workspaceId);
-  const { data: rules, error: ruleErr } = await q;
-  if (ruleErr) return NextResponse.json({ ok: false, error: ruleErr.message }, { status: 500 });
-  // The new-lead rule being off no longer ends the tick: the meeting rules
-  // below and the sequence engine still need their turn.
-
-  const report: Record<string, unknown>[] = [];
-
-  for (const rule of rules) {
-    const ws = rule.workspace_id as string;
-    const out: Record<string, unknown> = { workspace: ws, key: rule.key, sent: 0, skipped: [] as string[] };
-    report.push(out);
-
-    if (!rule.activated_at) { out.note = 'Rule has no activation time — switch it off and on once.'; continue; }
-    if (!isConfigured() && !dryRun) { out.note = 'INTERAKT_API_KEY is not set.'; continue; }
-
-    // ---- how many may go out on this pass ----------------------------------
-    // Every fresh lead gets answered, full stop — this is not the backlog
-    // chase and it has no daily quota. The only ceiling is how many sends fit
-    // in one serverless invocation; the tick runs every 2 minutes, so a
-    // backlog drains within minutes rather than being dropped.
-    //
-    // daily_cap stays honoured when it is deliberately set above zero, as an
-    // emergency brake. Null or 0 means what it says: no limit.
-    const BATCH_PER_TICK = 25;
-    let room = BATCH_PER_TICK;
-    const hardCap = Number(rule.daily_cap) || 0;
-    if (hardCap > 0) {
-      const dayStartIst = new Date(`${istDate()}T00:00:00+05:30`).toISOString();
-      const { count: sentToday } = await admin
-        .from('relay_automation_sent')
-        .select('id', { count: 'exact', head: true })
-        .eq('workspace_id', ws).eq('automation_key', rule.key)
-        .eq('ok', true).gte('sent_at', dayStartIst);
-      const left = Math.max(0, hardCap - (sentToday ?? 0));
-      if (left === 0) { out.note = `Daily cap of ${hardCap} reached.`; continue; }
-      room = Math.min(room, left);
-    }
-
-    // ---- already handled / suppressed --------------------------------------
-    // "Handled" means the message actually went, or we have tried enough times.
-    // A rejected send left on this list is a person who silently never hears
-    // from us, so those rows come back as retries instead.
-    const MAX_ATTEMPTS = 3;
-    const [{ data: done }, { data: suppressed }] = await Promise.all([
-      admin.from('relay_automation_sent')
-        .select('id, lead_id, phone_e164, ok, attempts, sent_at').eq('workspace_id', ws).eq('automation_key', rule.key),
-      admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws),
-    ]);
-    // A retry must WAIT. When 65 backlogged leads went out at once on 13 Sep
-    // the provider rate-limited the burst, and because a failed row was
-    // re-armed on the very next tick all three attempts were spent inside
-    // thirty seconds — against the same closed door. 31 people were written
-    // off for a problem that had cleared minutes later. So each attempt now
-    // stands off longer than the last.
-    const RETRY_BACKOFF_MS = [0, 15 * 60_000, 2 * 3_600_000];   // after attempt 1, 2, 3
-    const retryDue = (d: { attempts?: number; sent_at?: string }) => {
-      const waited = Date.now() - new Date(d.sent_at || 0).getTime();
-      return waited >= (RETRY_BACKOFF_MS[Math.min(d.attempts ?? 1, RETRY_BACKOFF_MS.length) - 1] ?? 0);
-    };
-    // "Leave alone" = delivered, out of attempts, OR still cooling off between
-    // attempts. Without the last one the lead looks untouched and gets claimed
-    // again immediately, which is the very hammering this backoff prevents.
-    const settled = (done || []).filter((d) => d.ok || (d.attempts ?? 1) >= MAX_ATTEMPTS || !retryDue(d));
-    const doneLeads = new Set(settled.map((d) => d.lead_id).filter(Boolean));
-    const donePhones = new Set(settled.map((d) => d.phone_e164));
-    const stopPhones = new Set((suppressed || []).map((s) => s.phone_e164));
-
-    const retryable = (done || [])
-      .filter((d) => !d.ok && (d.attempts ?? 1) < MAX_ATTEMPTS && retryDue(d));
-    const retryByLead = new Map(retryable.filter((d) => d.lead_id).map((d) => [d.lead_id as string, d]));
-    const retryByPhone = new Map(retryable.map((d) => [d.phone_e164 as string, d]));
-
-    /**
-     * Take ownership of one person's first message.
-     *
-     * A fresh person gets a new row; someone whose earlier attempt failed has
-     * theirs re-armed. Either way the write is the lock: the `ok = false`
-     * condition means a parallel tick that got there first wins and this one
-     * steps away, exactly as the unique indexes do for the insert.
-     */
-    const claimSend = async (
-      leadId: string | null, phone: string, method: string, detail: string | null,
-    ): Promise<string | null> => {
-      const prior = (leadId && retryByLead.get(leadId)) || retryByPhone.get(phone);
-      if (prior) {
-        const { data } = await admin.from('relay_automation_sent')
-          .update({
-            method, detail, ok: false, error: null,
-            attempts: (prior.attempts ?? 1) + 1, sent_at: new Date().toISOString(),
-          })
-          .eq('id', prior.id).eq('ok', false).select('id');
-        return data?.[0]?.id ?? null;
-      }
-      const { data, error } = await admin.from('relay_automation_sent')
-        .insert({ workspace_id: ws, automation_key: rule.key, lead_id: leadId, phone_e164: phone, method, detail, ok: false, attempts: 1 })
-        .select('id').single();
-      return error ? null : data?.id ?? null;
-    };
-
-    // ---- eligible leads: created after activation, older than the delay ----
-    // NEWEST FIRST. Someone filling the form right now is the whole point of
-    // this rule, so they are answered on this pass and never queue behind a
-    // backlog. Reading newest-first also means the unanswered leads are on the
-    // first page, so a pass normally costs one query.
-    //
-    // This is deliberately NOT the oldest-first walk the C1–C8 chase uses:
-    // that rationing exists to work through a cold database at a safe rate.
-    // Here there is nothing to ration — every fresh lead gets its message.
-    const cutoff = new Date(Date.now() - (rule.delay_seconds ?? 60) * 1_000).toISOString();
-    const LEAD_PAGE = 200;
-    const LEAD_MAX_PAGES = 50;   // 10,000 leads deep, so a backlog is reachable
-    const candidates: { id: string; full_name: string | null; phone: string | null; visa_type: string | null }[] = [];
-
-    for (let page = 0; candidates.length < room && page < LEAD_MAX_PAGES; page++) {
-      const { data: leads } = await admin
-        .from('leads')
-        .select('id, full_name, phone, visa_type, created_at, is_sample')
-        .eq('workspace_id', ws)
-        .gte('created_at', rule.activated_at)
-        .lte('created_at', cutoff)
-        .order('created_at', { ascending: false })
-        .range(page * LEAD_PAGE, page * LEAD_PAGE + LEAD_PAGE - 1);
-      if (!leads?.length) break;
-
-      for (const l of leads) {
-        if (candidates.length >= room) break;
-        if (l.is_sample || !(l.phone || '').trim()) continue;
-        if (doneLeads.has(l.id)) continue;
-        candidates.push(l);
-      }
-      if (leads.length < LEAD_PAGE) break;   // that was the last page
-    }
-
-    if (!candidates.length) { out.note = 'No new leads waiting.'; continue; }
-    // Oldest of the batch goes out first, so a queue still clears in order.
-    candidates.reverse();
-
-    for (const lead of candidates) {
-      if ((out.sent as number) >= room) { (out.skipped as string[]).push('daily cap reached mid-run'); break; }
-
-      const phoneE164 = toE164(lead.phone);
-      if (!phoneE164) { (out.skipped as string[]).push(`${lead.full_name}: unusable phone`); continue; }
-      if (doneLeads.has(lead.id) || donePhones.has(phoneE164)) continue;   // dedup
-      if (stopPhones.has(phoneE164)) { (out.skipped as string[]).push(`${lead.full_name}: opted out (STOP)`); continue; }
-
-      // ---- window open or closed? ------------------------------------------
-      const { data: convId } = await admin.rpc('relay_get_or_create_conversation', { p_workspace_id: ws, p_phone_e164: phoneE164 });
-      const { data: conv } = await admin.from('relay_conversations').select('id, last_inbound_at').eq('id', convId as string).maybeSingle();
-      const win = windowState(conv?.last_inbound_at);
-      const method = win.open ? 'quick_reply' : 'template';
-      const detail = win.open ? rule.quick_reply_shortcut : rule.template_name;
-
-      if (dryRun) {
-        (out.skipped as string[]).push(`DRY RUN — would send ${method} "${detail}" to ${lead.full_name} (${phoneE164})`);
-        continue;
-      }
-
-      const claimId = await claimSend(lead.id, phoneE164, method, detail);
-      if (!claimId) continue; // someone else claimed it
-
-      let ok = false; let errText: string | null = null;
-
-      try {
-        if (win.open) {
-          ok = await sendQuickReply(admin, ws, conv!.id, phoneE164, rule.quick_reply_shortcut, lead);
-          if (!ok) errText = 'quick reply failed (see message row)';
-        } else {
-          const r = await sendFirstTemplate(admin, ws, conv!.id, phoneE164, rule.template_name, rule.template_language || 'en', lead);
-          ok = r.ok; errText = r.error;
-        }
-      } catch (e) {
-        errText = e instanceof Error ? e.message : String(e);
-      }
-
-      await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claimId);
-      if (ok) out.sent = (out.sent as number) + 1;
-      else (out.skipped as string[]).push(`${lead.full_name}: ${errText}`);
-    }
-
-    // ---- people who message us from a number that is not in the CRM -------
-    // They fill the form with one number and then WhatsApp from another. The
-    // reply belongs on the number they actually used, so an unknown inbound
-    // gets the same first message without waiting for a lead record.
-    //
-    // NEWEST FIRST, in pages — the third home of the fixed-window bug. This
-    // used to read the OLDEST 100 conversations since activation; once more
-    // than 100 people had ever written in, a brand-new enquiry sat beyond the
-    // window and was never even looked at. Newest-first puts tonight's
-    // enquiry on page one; the pages behind it are walked for stragglers.
-    const inbound: { id: string; phone_e164: string; last_inbound_at: string }[] = [];
-    for (let page = 0; page < 20; page++) {
-      const { data: convPage } = await admin
-        .from('relay_conversations')
-        .select('id, phone_e164, last_inbound_at')
-        .eq('workspace_id', ws)
-        .not('last_inbound_at', 'is', null)
-        .gte('last_inbound_at', rule.activated_at)
-        .lte('last_inbound_at', cutoff)
-        .order('last_inbound_at', { ascending: false })
-        .range(page * 100, page * 100 + 99);
-      if (!convPage?.length) break;
-      inbound.push(...(convPage as typeof inbound));
-      if (convPage.length < 100) break;
-    }
-
-    // Lead phones are stored however they arrived — "+91 98108 27787",
-    // "9810827787", "+919810827787" — so "is this number in the CRM?" can only
-    // be answered on digits. A LIKE against the raw column silently misses the
-    // spaced ones and would message people who are already customers.
-    const knownDigits = new Set<string>();
-    if ((inbound || []).length) {
-      for (let page = 0; page < 10; page++) {
-        const { data: phones } = await admin
-          .from('leads').select('phone').eq('workspace_id', ws)
-          .range(page * 1000, page * 1000 + 999);
-        if (!phones?.length) break;
-        for (const p of phones) {
-          const d = String(p.phone || '').replace(/\D/g, '');
-          if (d.length >= 10) knownDigits.add(d.slice(-10));
-        }
-        if (phones.length < 1000) break;
-      }
-    }
-
-    for (const conv of inbound || []) {
-      if ((out.sent as number) >= room) { (out.skipped as string[]).push('daily cap reached mid-run'); break; }
-      const phoneE164 = conv.phone_e164 as string;
-      if (!phoneE164 || donePhones.has(phoneE164) || stopPhones.has(phoneE164)) continue;
-
-      const { data: firstMsg } = await admin
-        .from('relay_messages')
-        .select('body').eq('conversation_id', conv.id).eq('direction', 'in')
-        .order('created_at', { ascending: true }).limit(1).maybeSingle();
-
-      // The MESSAGE decides, not the CRM. A form enquiry gets the first
-      // message on the number it came from, full stop — even if some lead row
-      // with another number, from another year, happens to exist. The only
-      // people the lead-exists check may hold back are old contacts writing
-      // ordinary texts, who belong to the sequences, not to this rule.
-      const isEnquiry =
-        /filled\s+(in|out)\s+your\s+form/i.test(firstMsg?.body || '') ||
-        /full\s*name\s*:/i.test(firstMsg?.body || '');
-      if (!isEnquiry && knownDigits.has(phoneE164.replace(/\D/g, '').slice(-10))) continue;
-
-      // Greet them by the name in their enquiry when it carries one.
-      const stranger = { full_name: nameFromEnquiry(firstMsg?.body), visa_type: null };
-
-      if (dryRun) {
-        (out.skipped as string[]).push(`DRY RUN — would send the first message to ${phoneE164} (not in CRM)`);
-        continue;
-      }
-
-      // Which form may this message legally take? The same question the pass
-      // above asks. Assuming the window is open because they wrote to us at
-      // some point is wrong the moment this rule runs late or catches up on a
-      // backlog: WhatsApp rejects the free-form send and the person gets
-      // nothing at all.
-      const strangerWin = windowState(conv.last_inbound_at);
-      const strangerMethod = strangerWin.open ? 'quick_reply' : 'template';
-
-      const claimId = await claimSend(
-        null, phoneE164, strangerMethod,
-        strangerWin.open ? rule.quick_reply_shortcut : rule.template_name);
-      if (!claimId) continue;   // another tick got there first
-
-      let ok = false; let errText: string | null = null;
-      try {
-        if (strangerWin.open) {
-          ok = await sendQuickReply(admin, ws, conv.id, phoneE164, rule.quick_reply_shortcut, stranger);
-          if (!ok) errText = 'quick reply failed (see message row)';
-        } else {
-          const r = await sendFirstTemplate(admin, ws, conv.id, phoneE164, rule.template_name, rule.template_language || 'en', stranger);
-          ok = r.ok; errText = r.error;
-        }
-      } catch (e) {
-        errText = e instanceof Error ? e.message : String(e);
-      }
-
-      await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claimId);
-      if (ok) { out.sent = (out.sent as number) + 1; donePhones.add(phoneE164); }
-      else (out.skipped as string[]).push(`${phoneE164}: ${errText}`);
-    }
+  const ctx = createRunContext();
+  const admin = createAutomationAdminClient(ctx);
+  // Releasing the lock must still work after the run's hard stop has fired.
+  const lockAdmin = createAutomationAdminClient();
+  if (!admin || !lockAdmin) {
+    ctx.dispose();
+    return NextResponse.json({ ok: false, error: 'Server is not configured.' }, { status: 500 });
   }
 
-  // ==========================================================================
-  // MEETING MESSAGES — PC1 when a call is booked, PC2 when it is completed.
-  // --------------------------------------------------------------------------
-  // Driven by the meetings table, not by the CRM UI, so it fires however a
-  // meeting came to exist or be completed: the public booking page, a staff
-  // booking, the drawer, a bulk edit. The CRM does not need to know this code
-  // exists.
-  //
-  // PHONE RESOLUTION, in order — "ensure you send WhatsApp to everyone":
-  //   1. the number typed on the booking form (client_phone), if it dials
-  //   2. the linked lead's number (lead_id)
-  //   3. a lead found by the booking email, then that lead's number
-  // Only when all three fail is the meeting recorded as unreachable, by name,
-  // so it shows up on the Meetings tab instead of silently not happening.
-  //
-  // One message per meeting per rule, enforced by a unique index on
-  // (automation_key, meeting_id). The claim row is written BEFORE the send, so
-  // two overlapping ticks cannot both message the same person.
-  // ==========================================================================
-  {
-    let mq = admin.from('relay_automations').select('*')
-      .in('key', ['meeting_booked', 'meeting_completed']).eq('enabled', true);
-    if (workspaceId) mq = mq.eq('workspace_id', workspaceId);
-    const { data: meetingRules } = await mq;
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const sinceIso = new Date(now - RECENT_WINDOW_HOURS * 3_600_000).toISOString();
+  const report: Record<string, unknown>[] = [];
+  const minute = new Date(now).getMinutes();
+  // Enrolling new people into sequences and repairing bounces are not urgent:
+  // doing them every 15 min / hourly instead of every run saves most of the
+  // database work. A manual run does everything.
+  const enrolDue = !viaCron || minute % 15 < 5;
+  const repairDue = !viaCron || minute < 5;
 
-    for (const rule of meetingRules || []) {
-      const ws = rule.workspace_id as string;
+  let lockToken: string | null = null;
+  try {
+    // ==== ROUND 1: the lock, and everything cheap, in parallel ===============
+    // Narrow to the caller's workspace for a manual run; the schedule covers all.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const scope = <Q,>(q: Q): Q => (workspaceId ? (q as any).eq('workspace_id', workspaceId) : q);
+
+    // The lock runs alongside the reads, but is awaited on its own first so its
+    // token is kept — and released — even if one of the reads fails.
+    const lockPromise = dryRun ? Promise.resolve({ acquired: true as const, token: '' }) : acquireTickLock(admin);
+    const readsPromise = Promise.all([
+      scope(admin.from('relay_automations').select('*')
+        .in('key', ['new_lead_first', 'meeting_booked', 'meeting_completed']).eq('enabled', true)),
+      scope(admin.from('leads')
+        .select('id, workspace_id, full_name, phone, visa_type, created_at, is_sample')
+        .gte('created_at', sinceIso).order('created_at', { ascending: false }).limit(1000)),
+      // Each conversation arrives WITH its first inbound message — the one
+      // query that replaces ~92 separate per-conversation lookups.
+      scope(admin.from('relay_conversations')
+        .select('id, workspace_id, phone_e164, last_inbound_at, lead_id, relay_messages(body, created_at)')
+        .gte('last_inbound_at', sinceIso)
+        .eq('relay_messages.direction', 'in')
+        .order('created_at', { referencedTable: 'relay_messages', ascending: true })
+        .limit(1, { referencedTable: 'relay_messages' })
+        .order('last_inbound_at', { ascending: false }).limit(1000)),
+      scope(admin.from('relay_suppressions').select('workspace_id, phone_e164')),
+      scope(admin.from('leads').select('id', { count: 'exact', head: true })),
+      fastLane ? Promise.resolve({ data: [] }) :
+        admin.from('relay_sequences')
+          .select('id, workspace_id, hours_enabled, send_start_hour, send_end_hour, per_hour_cap')
+          .eq('status', 'running'),
+      fastLane ? Promise.resolve({ data: [] }) :
+        admin.from('relay_campaigns').select('id, status, scheduled_at').in('status', ['sending', 'scheduled']),
+    ]);
+    readsPromise.catch(() => {});   // observed below; never an unhandled rejection
+
+    const lock = await lockPromise;
+    if (!lock.acquired) {
+      return NextResponse.json({ ok: true, skipped: 'locked', reason: lock.reason, ms: ctx.elapsedMs() });
+    }
+    lockToken = lock.token || null;
+    const [rulesRes, leadsRes, convsRes, suppRes, leadCountRes, seqRes, campRes] = await readsPromise;
+    if (rulesRes.error) throw new Error(`rules: ${rulesRes.error.message}`);
+
+    const rules = (rulesRes.data || []) as Record<string, any>[];   // eslint-disable-line @typescript-eslint/no-explicit-any
+    const leadRuleByWs = new Map(rules.filter((r) => r.key === 'new_lead_first').map((r) => [r.workspace_id as string, r]));
+    const meetingRules = rules.filter((r) => r.key !== 'new_lead_first');
+
+    const recentLeads = (leadsRes.data || []) as (LeadRow & { workspace_id: string })[];
+    const recentConvs: (ConvRow & { workspace_id: string })[] = ((convsRes.data || []) as {
+      id: string; workspace_id: string; phone_e164: string; last_inbound_at: string; lead_id: string | null;
+      relay_messages: { body: string | null }[] | null;
+    }[]).map((c) => ({
+      id: c.id, workspace_id: c.workspace_id, phone_e164: c.phone_e164,
+      last_inbound_at: c.last_inbound_at, lead_id: c.lead_id,
+      first_inbound_body: c.relay_messages?.[0]?.body ?? null,
+    }));
+    const suppressed = (suppRes.data || []) as { workspace_id: string; phone_e164: string }[];
+    const convByKey = new Map(recentConvs.map((c) => [`${c.workspace_id}|${c.phone_e164}`, c]));
+    if ((leadsRes.data?.length ?? 0) >= 1000 || (convsRes.data?.length ?? 0) >= 1000) {
+      report.push({ key: 'new_lead_first', note: `More than 1000 leads or conversations in ${RECENT_WINDOW_HOURS}h — newest 1000 handled first, the rest next run.` });
+    }
+
+    // ==== ROUND 2: history for exactly the people in view, in parallel =======
+    const leadIds = recentLeads.map((l) => l.id);
+    const phones = [...new Set([
+      ...recentLeads.map((l) => toE164(l.phone)).filter(Boolean) as string[],
+      ...recentConvs.map((c) => c.phone_e164),
+    ])];
+    // Lead phones are only needed to tell an unlinked stranger's ordinary text
+    // from a customer typed in another format — load them only when that
+    // question actually arises.
+    const needLeadPhones = recentConvs.some((c) => !c.lead_id && !isEnquiry(c.first_inbound_body));
+    const leadPages = needLeadPhones ? Math.ceil((leadCountRes.count ?? 0) / 1000) : 0;
+
+    const running = (seqRes.data || []) as {
+      id: string; workspace_id: string; hours_enabled: boolean; send_start_hour: number; send_end_hour: number; per_hour_cap: number | null;
+    }[];
+    const hourStartIso = new Date(Math.floor(now / 3_600_000) * 3_600_000).toISOString();
+    const hourIst = istHour(new Date(now));
+    const inHours = running.filter((s) => !s.hours_enabled || (hourIst >= s.send_start_hour && hourIst < s.send_end_hour));
+
+    const histCols = 'id, workspace_id, lead_id, phone_e164, ok, attempts, sent_at, error';
+    const [histParts, leadPhoneParts, seqDue, seqSentThisHour] = await Promise.all([
+      Promise.all([
+        ...chunk(leadIds, 100).map((ids) => admin.from('relay_automation_sent').select(histCols)
+          .eq('automation_key', 'new_lead_first').in('lead_id', ids)),
+        ...chunk(phones, 100).map((ps) => admin.from('relay_automation_sent').select(histCols)
+          .eq('automation_key', 'new_lead_first').in('phone_e164', ps)),
+      ]),
+      Promise.all(Array.from({ length: leadPages }, (_, p) =>
+        scope(admin.from('leads').select('workspace_id, phone')).order('id').range(p * 1000, p * 1000 + 999))),
+      Promise.all(inHours.map((s) => admin.from('relay_lead_sequences').select('id')
+        .eq('sequence_id', s.id).eq('status', 'active').lte('next_send_at', nowIso).limit(1))),
+      Promise.all(inHours.map((s) => Number(s.per_hour_cap) > 0
+        ? admin.from('relay_sequence_sends').select('id', { count: 'exact', head: true })
+            .eq('sequence_id', s.id).gte('sent_at', hourStartIso)
+        : Promise.resolve({ count: 0 }))),
+    ]);
+
+    const historyById = new Map<string, HistoryRow & { workspace_id: string }>();
+    for (const part of histParts) {
+      if (part.error) throw new Error(`history: ${part.error.message}`);
+      for (const h of (part.data || []) as (HistoryRow & { workspace_id: string })[]) historyById.set(h.id, h);
+    }
+    const knownDigitsByWs = new Map<string, Set<string>>();
+    for (const part of leadPhoneParts) {
+      for (const l of (part.data || []) as { workspace_id: string; phone: string | null }[]) {
+        const d = String(l.phone || '').replace(/\D/g, '');
+        if (d.length < 10) continue;
+        if (!knownDigitsByWs.has(l.workspace_id)) knownDigitsByWs.set(l.workspace_id, new Set());
+        knownDigitsByWs.get(l.workspace_id)!.add(d.slice(-10));
+      }
+    }
+
+    // ==== 1. FIRST MESSAGES ==================================================
+    for (const [ws, rule] of leadRuleByWs) {
       const out: Record<string, unknown> = { workspace: ws, key: rule.key, sent: 0, skipped: [] as string[] };
       report.push(out);
+      const skipped = out.skipped as string[];
 
       if (!rule.activated_at) { out.note = 'Rule has no activation time — switch it off and on once.'; continue; }
-      if (!rule.template_name) { out.note = 'No template chosen.'; continue; }
       if (!isConfigured() && !dryRun) { out.note = 'INTERAKT_API_KEY is not set.'; continue; }
 
-      const dayStartIst = new Date(`${istDate()}T00:00:00+05:30`).toISOString();
-      const { count: sentToday } = await admin
-        .from('relay_automation_sent')
-        .select('id', { count: 'exact', head: true })
-        .eq('workspace_id', ws).eq('automation_key', rule.key)
-        .eq('ok', true).gte('sent_at', dayStartIst);
-      let room = Math.max(0, (rule.daily_cap ?? 200) - (sentToday ?? 0));
-      if (room === 0) { out.note = `Daily cap of ${rule.daily_cap} reached.`; continue; }
+      const plan = planFirstMessages({
+        now,
+        rule: { activated_at: rule.activated_at, delay_seconds: rule.delay_seconds },
+        leads: recentLeads.filter((l) => l.workspace_id === ws),
+        convs: recentConvs.filter((c) => c.workspace_id === ws),
+        history: [...historyById.values()].filter((h) => h.workspace_id === ws),
+        suppressedPhones: new Set(suppressed.filter((s) => s.workspace_id === ws).map((s) => s.phone_e164)),
+        knownLeadDigits: needLeadPhones ? (knownDigitsByWs.get(ws) || new Set()) : new Set(),
+      });
+      skipped.push(...plan.skipped);
 
-      const cutoff = new Date(Date.now() - (rule.delay_seconds ?? 30) * 1_000).toISOString();
-      const booked = rule.key === 'meeting_booked';
+      // Daily cap stays an optional emergency brake: 0 / null = no limit.
+      const hardCap = Number(rule.daily_cap) || 0;
+      let jobs = plan.jobs;
+      if (hardCap > 0 && jobs.length) {
+        const { count: sentToday } = await admin.from('relay_automation_sent')
+          .select('id', { count: 'exact', head: true })
+          .eq('workspace_id', ws).eq('automation_key', rule.key).eq('ok', true)
+          .gte('sent_at', new Date(`${istDate()}T00:00:00+05:30`).toISOString());
+        const left = Math.max(0, hardCap - (sentToday ?? 0));
+        if (left === 0) { out.note = `Daily cap of ${hardCap} reached.`; continue; }
+        jobs = jobs.slice(0, left);
+      }
 
-      let q = admin.from('meetings')
-        .select('id, lead_id, client_name, client_email, client_phone, status, starts_at, created_at, completed_at')
-        .eq('workspace_id', ws);
-      q = booked
-        ? q.gte('created_at', rule.activated_at).lte('created_at', cutoff).neq('status', 'cancelled')
-            .order('created_at', { ascending: true })
-        : q.eq('status', 'completed').gte('completed_at', rule.activated_at).lte('completed_at', cutoff)
-            .order('completed_at', { ascending: true });
-      const { data: meetings } = await q.limit(100);
-      if (!meetings?.length) { out.note = booked ? 'No new bookings waiting.' : 'No newly completed calls waiting.'; continue; }
+      if (!jobs.length) { out.note = 'No new leads waiting.'; continue; }
+      out.waiting = jobs.length;
 
-      const [{ data: done }, { data: suppressed }] = await Promise.all([
-        admin.from('relay_automation_sent').select('meeting_id')
-          .eq('workspace_id', ws).eq('automation_key', rule.key).not('meeting_id', 'is', null),
-        admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws),
-      ]);
-      const doneMeetings = new Set((done || []).map((d) => d.meeting_id as string));
-      const stopPhones = new Set((suppressed || []).map((x) => x.phone_e164 as string));
+      if (dryRun) {
+        for (const j of jobs) skipped.push(`DRY RUN — would send the first message to ${j.name || j.phoneE164} (${j.phoneE164}, ${j.kind})`);
+        continue;
+      }
 
-      for (const m of meetings) {
-        if (doneMeetings.has(m.id)) continue;
-        if (room <= 0) { (out.skipped as string[]).push('daily cap reached mid-run'); break; }
-        const who = m.client_name || m.client_email || m.id;
+      await forEachLimited(jobs, SEND_CONCURRENCY, () => ctx.hasTime() && ctx.sendsLeft() > 0, async (job) => {
+        const outcome = await sendFirstMessage(admin, lockAdmin, ctx, ws, rule, job, convByKey);
+        if (outcome === 'sent') out.sent = (out.sent as number) + 1;
+        else if (outcome !== 'skip') skipped.push(`${job.name || job.phoneE164}: ${outcome}`);
+      });
+      const left = jobs.length - (out.sent as number);
+      if (left > 0 && !ctx.hasTime()) out.note = `${left} continue on the next run.`;
+    }
 
-        // A thank-you that says "today" must not go to someone whose call was
-        // three weeks ago and got marked completed during a tidy-up.
-        if (!booked) {
-          const startedMs = new Date(m.starts_at).getTime();
-          const completedMs = new Date(m.completed_at).getTime();
-          const tooOld = completedMs - startedMs > 3 * 86_400_000;
-          const notYet = startedMs > completedMs + 86_400_000;
-          if (tooOld || notYet) {
-            if (!dryRun) {
-              await admin.from('relay_automation_sent').insert({
-                workspace_id: ws, automation_key: rule.key, lead_id: m.lead_id, phone_e164: 'n/a',
-                meeting_id: m.id, method: 'template', detail: rule.template_name, ok: false,
-                error: tooOld ? 'call was more than 3 days before it was marked completed' : 'call is still in the future',
-              });
-            }
-            (out.skipped as string[]).push(`${who}: ${tooOld ? 'call too old for a same-day thank-you' : 'call has not happened yet'}`);
-            continue;
-          }
-        }
+    // ==== 2. MEETING MESSAGES — PC1 when booked, PC2 when completed ==========
+    // Driven by the meetings table, so it fires however a meeting came to
+    // exist. One message per meeting per rule (unique index on automation_key,
+    // meeting_id), claimed before sending.
+    for (const rule of meetingRules) {
+      if (!ctx.hasTime()) break;
+      const out = await runMeetingRule(admin, ctx, rule, dryRun);
+      report.push(out);
+    }
 
-        // ---- who are they, and which number actually dials? ----------------
-        let lead: { id: string; full_name: string | null; phone: string | null; visa_type: string | null } | null = null;
-        if (m.lead_id) {
-          const { data } = await admin.from('leads').select('id, full_name, phone, visa_type').eq('id', m.lead_id).maybeSingle();
-          lead = data;
-        }
-        if (!lead && m.client_email) {
-          const { data } = await admin.from('leads').select('id, full_name, phone, visa_type')
-            .eq('workspace_id', ws).ilike('email', m.client_email.trim()).order('updated_at', { ascending: false }).limit(1).maybeSingle();
-          lead = data;
-        }
-        const phoneE164 = toE164(m.client_phone) || (lead ? toE164(lead.phone) : null);
-
-        if (!phoneE164) {
-          if (!dryRun) {
-            await admin.from('relay_automation_sent').insert({
-              workspace_id: ws, automation_key: rule.key, lead_id: lead?.id ?? m.lead_id ?? null, phone_e164: 'n/a',
-              meeting_id: m.id, method: 'template', detail: rule.template_name, ok: false,
-              error: 'no usable phone on the booking or the lead',
-            });
-          }
-          (out.skipped as string[]).push(`${who}: no usable phone number anywhere`);
-          continue;
-        }
-        if (stopPhones.has(phoneE164)) {
-          if (!dryRun) {
-            await admin.from('relay_automation_sent').insert({
-              workspace_id: ws, automation_key: rule.key, lead_id: lead?.id ?? m.lead_id ?? null, phone_e164: phoneE164,
-              meeting_id: m.id, method: 'template', detail: rule.template_name, ok: false, error: 'opted out',
-            });
-          }
-          (out.skipped as string[]).push(`${who}: opted out`);
-          continue;
-        }
-
-        if (dryRun) {
-          (out.skipped as string[]).push(`would send ${rule.template_name} to ${who} (${phoneE164})`);
-          room--;
-          continue;
-        }
-
-        // ---- claim first, send second -------------------------------------
-        const { data: claim, error: claimErr } = await admin.from('relay_automation_sent')
-          .insert({
-            workspace_id: ws, automation_key: rule.key, lead_id: lead?.id ?? m.lead_id ?? null, phone_e164: phoneE164,
-            meeting_id: m.id, method: 'template', detail: rule.template_name, ok: false,
-          })
-          .select('id').maybeSingle();
-        if (claimErr || !claim) continue;   // another tick got here first
-
-        let ok = false; let errText: string | null = null;
+    // ==== 3 + 4. SEQUENCES AND CAMPAIGNS =====================================
+    let sequences: Awaited<ReturnType<typeof runSequences>> = [];
+    let campaigns: Awaited<ReturnType<typeof runCampaigns>> = [];
+    if (!dryRun && !fastLane) {
+      // Only wake the engine when it has something to do: a sequence with
+      // someone due, in sending hours, under its hourly cap — or an enrolment
+      // or repair pass is due.
+      const busyIds = inHours
+        .filter((s, i) => (seqDue[i]?.data?.length ?? 0) > 0 &&
+          (!(Number(s.per_hour_cap) > 0) || (seqSentThisHour[i]?.count ?? 0) < Number(s.per_hour_cap)))
+        .map((s) => s.id);
+      if (running.length && (busyIds.length || enrolDue || repairDue) && ctx.hasTime()) {
         try {
-          const { data: convId } = await admin.rpc('relay_get_or_create_conversation', {
-            p_workspace_id: ws, p_phone_e164: phoneE164,
+          sequences = await runSequences(admin, ctx, {
+            sequenceIds: enrolDue || repairDue ? running.map((s) => s.id) : busyIds,
+            enrol: enrolDue,
+            repair: repairDue,
           });
-          if (!convId) throw new Error('could not open a conversation');
-          // The booking form's name is what they typed to us; that is the
-          // name the message should use.
-          if (lead?.id) {
-            await admin.from('relay_conversations').update({ lead_id: lead.id, updated_at: new Date().toISOString() })
-              .eq('id', convId as string).is('lead_id', null);
-          }
-          const r = await sendTemplateToLead(admin, {
-            workspaceId: ws, conversationId: convId as string, phoneE164,
-            templateName: rule.template_name, language: rule.template_language || 'en',
-            lead: { full_name: m.client_name || lead?.full_name || null, visa_type: lead?.visa_type ?? null },
-          });
-          ok = r.ok; errText = r.error;
-        } catch (e) {
-          errText = e instanceof Error ? e.message : String(e);
-        }
-
-        await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claim.id);
-        if (ok) { out.sent = (out.sent as number) + 1; room--; }
-        else (out.skipped as string[]).push(`${who}: ${errText}`);
+        } catch (e) { console.error('[sequences] tick failed', e); }
+      }
+      const campaignsDue = ((campRes.data || []) as { status: string; scheduled_at: string | null }[])
+        .some((c) => c.status === 'sending' || !c.scheduled_at || c.scheduled_at <= nowIso);
+      if (campaignsDue && ctx.hasTime()) {
+        try { campaigns = await runCampaigns(admin, ctx); }
+        catch (e) { console.error('[campaigns] tick failed', e); }
       }
     }
-  }
 
-  // The C1–C8 follow-up machine rides the same tick. Dry runs skip it —
-  // its own page has live counters, and a dry run must never send.
-  let sequences: Awaited<ReturnType<typeof runSequences>> = [];
-  let campaigns: Awaited<ReturnType<typeof runCampaigns>> = [];
-  if (!dryRun && !fastLane) {
-    try { sequences = await runSequences(admin); }
-    catch (e) { console.error('[sequences] tick failed', e); }
-    // One-time blasts ride the same tick, in their own try so a bad campaign
-    // can never stop the follow-up machine.
-    try { campaigns = await runCampaigns(admin); }
-    catch (e) { console.error('[campaigns] tick failed', e); }
+    return NextResponse.json({
+      ok: true, dryRun, fastLane,
+      ms: ctx.elapsedMs(), sendsUsed: MAX_SENDS_PER_RUN - ctx.sendsLeft(),
+      enrolDue, repairDue,
+      report, sequences, campaigns,
+    });
+  } catch (e) {
+    const timedOut = isTimeoutError(e);
+    console.error('[automation tick] run failed', e);
+    return NextResponse.json({
+      ok: false,
+      error: timedOut ? `A call exceeded its ${CALL_TIMEOUT_MS / 1000}s limit; the next run continues.` : (e instanceof Error ? e.message : String(e)),
+      ms: ctx.elapsedMs(), report,
+    }, { status: timedOut ? 200 : 500 });
+  } finally {
+    ctx.dispose();
+    if (lockToken) await releaseTickLock(lockAdmin, lockToken).catch(() => {});
   }
-
-  return NextResponse.json({ ok: true, dryRun, fastLane, report, sequences, campaigns });
 }
 
 // ---------------------------------------------------------------------------
-// The two send paths. Both write normal relay_messages rows, so the sends
-// appear in the chat thread exactly like a human send (ticks, retries, all).
+// One first message: resolve the conversation, claim, send, record.
+// Returns 'sent', 'skip' (nothing to do / someone else has it), or a reason.
 // ---------------------------------------------------------------------------
+async function sendFirstMessage(
+  admin: Admin,
+  /** Not bound to the run's hard stop: the outcome must be written even if it fires. */
+  durable: Admin,
+  ctx: RunContext, ws: string,
+  rule: Record<string, any>,                                          // eslint-disable-line @typescript-eslint/no-explicit-any
+  job: Job,
+  convByKey: Map<string, { id: string; last_inbound_at: string }>,
+): Promise<string> {
+  if (!ctx.takeSend()) return 'skip';
+  let spent = false;
+  try {
+    // ---- which conversation, and is the 24h window open? ------------------
+    const recent = convByKey.get(`${ws}|${job.phoneE164}`);
+    let conversationId = job.conversationId || recent?.id || null;
+    // No inbound in the recent window means the 24h window is closed.
+    const lastInbound = recent?.last_inbound_at ?? null;
+    if (!conversationId) {
+      const { data } = await admin.rpc('relay_get_or_create_conversation', { p_workspace_id: ws, p_phone_e164: job.phoneE164 });
+      conversationId = (data as string) || null;
+    }
+    if (!conversationId) return 'could not open a conversation';
 
+    // ---- a retry after a TIMEOUT: did the first try arrive after all? -----
+    // A provider that answers slowly may still have delivered. The webhook
+    // stamps our message row when it does, so check before sending again —
+    // otherwise the customer gets the message twice.
+    if (job.prior?.error?.includes('delivery unknown')) {
+      const since = new Date(new Date(job.prior.sent_at).getTime() - 60_000).toISOString();
+      const { data: arrived } = await admin.from('relay_messages').select('id')
+        .eq('conversation_id', conversationId).eq('direction', 'out')
+        .in('status', ['sent', 'delivered', 'read']).gte('created_at', since).limit(1);
+      if (arrived?.length) {
+        await admin.from('relay_automation_sent').update({ ok: true, error: null }).eq('id', job.prior.id);
+        return 'skip';
+      }
+    }
+
+    const open = windowState(lastInbound).open;
+    const method = open ? 'quick_reply' : 'template';
+    const detail = open ? rule.quick_reply_shortcut : rule.template_name;
+
+    // ---- claim: the write is the lock ------------------------------------
+    // A retry re-arms its own row only while it is still failed; a fresh
+    // person gets a new row, and the unique indexes (lead, phone) reject a
+    // second claim. Either way only one run can own this person.
+    //
+    // The claim is written already saying "delivery unknown". If the run is
+    // killed between sending and recording, the next attempt therefore checks
+    // whether the message actually arrived before sending it again.
+    const IN_FLIGHT = `in flight — ${TIMEOUT_NOTE}`;
+    let claimId: string | null = null;
+    if (job.prior) {
+      const { data } = await admin.from('relay_automation_sent')
+        .update({ method, detail, ok: false, error: IN_FLIGHT, attempts: (job.prior.attempts ?? 1) + 1, sent_at: new Date().toISOString() })
+        .eq('id', job.prior.id).eq('ok', false).select('id');
+      claimId = data?.[0]?.id ?? null;
+    } else {
+      const { data, error } = await admin.from('relay_automation_sent')
+        .insert({ workspace_id: ws, automation_key: rule.key, lead_id: job.leadId, phone_e164: job.phoneE164, method, detail, ok: false, error: IN_FLIGHT, attempts: 1 })
+        .select('id').single();
+      claimId = error ? null : data?.id ?? null;
+    }
+    if (!claimId) return 'skip';
+    spent = true;
+
+    // ---- send ------------------------------------------------------------
+    const person = { full_name: job.name, visa_type: job.visaType };
+    let ok = false;
+    let errText: string | null = null;
+    try {
+      if (open) {
+        const r = await sendQuickReply(admin, ctx, ws, conversationId, job.phoneE164, rule.quick_reply_shortcut, person);
+        ok = r.ok;
+        errText = r.ok ? null : r.timedOut ? TIMEOUT_NOTE : 'quick reply failed (see message row)';
+      } else if (!rule.template_name) {
+        errText = 'No template chosen for the closed-window path.';
+      } else {
+        const r = await sendTemplateToLead(admin, {
+          workspaceId: ws, conversationId, phoneE164: job.phoneE164,
+          templateName: rule.template_name, language: rule.template_language || 'en', lead: person,
+        }, ctx);
+        ok = r.ok;
+        errText = r.ok ? null : r.timedOut ? TIMEOUT_NOTE : r.error;
+      }
+    } catch (e) {
+      errText = isTimeoutError(e) ? TIMEOUT_NOTE : e instanceof Error ? e.message : String(e);
+    }
+
+    // Written on the durable client, so a hard stop that fired mid-send cannot
+    // stop the outcome being recorded.
+    await durable.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claimId);
+    return ok ? 'sent' : errText || 'send failed';
+  } finally {
+    if (!spent) ctx.giveBackSend();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Meeting rules — unchanged logic, now inside the run's time and send budget.
+// ---------------------------------------------------------------------------
+async function runMeetingRule(
+  admin: Admin, ctx: RunContext,
+  rule: Record<string, any>,                                          // eslint-disable-line @typescript-eslint/no-explicit-any
+  dryRun: boolean,
+): Promise<Record<string, unknown>> {
+  const ws = rule.workspace_id as string;
+  const out: Record<string, unknown> = { workspace: ws, key: rule.key, sent: 0, skipped: [] as string[] };
+  const skipped = out.skipped as string[];
+
+  if (!rule.activated_at) { out.note = 'Rule has no activation time — switch it off and on once.'; return out; }
+  if (!rule.template_name) { out.note = 'No template chosen.'; return out; }
+  if (!isConfigured() && !dryRun) { out.note = 'INTERAKT_API_KEY is not set.'; return out; }
+
+  const dayStartIst = new Date(`${istDate()}T00:00:00+05:30`).toISOString();
+  const { count: sentToday } = await admin
+    .from('relay_automation_sent')
+    .select('id', { count: 'exact', head: true })
+    .eq('workspace_id', ws).eq('automation_key', rule.key)
+    .eq('ok', true).gte('sent_at', dayStartIst);
+  let room = Math.max(0, (rule.daily_cap ?? 200) - (sentToday ?? 0));
+  if (room === 0) { out.note = `Daily cap of ${rule.daily_cap} reached.`; return out; }
+
+  const cutoff = new Date(Date.now() - (rule.delay_seconds ?? 30) * 1_000).toISOString();
+  const booked = rule.key === 'meeting_booked';
+  const sortCol = booked ? 'created_at' : 'completed_at';
+
+  // Newest first, in pages, so today's booking is never outside the window.
+  const meetings: {
+    id: string; lead_id: string | null; client_name: string | null;
+    client_email: string | null; client_phone: string | null;
+    status: string; starts_at: string; created_at: string; completed_at: string | null;
+  }[] = [];
+  for (let page = 0; page < 20 && ctx.hasTime(); page++) {
+    let q = admin.from('meetings')
+      .select('id, lead_id, client_name, client_email, client_phone, status, starts_at, created_at, completed_at')
+      .eq('workspace_id', ws);
+    q = booked
+      ? q.gte('created_at', rule.activated_at).lte('created_at', cutoff).neq('status', 'cancelled')
+      : q.eq('status', 'completed').gte('completed_at', rule.activated_at).lte('completed_at', cutoff);
+    const { data: pageRows } = await q.order(sortCol, { ascending: false }).range(page * 100, page * 100 + 99);
+    if (!pageRows?.length) break;
+    meetings.push(...(pageRows as typeof meetings));
+    if (pageRows.length < 100) break;
+  }
+  if (!meetings.length) { out.note = booked ? 'No new bookings waiting.' : 'No newly completed calls waiting.'; return out; }
+
+  // Only the history for THESE meetings — in batches, because up to 2,000 ids
+  // in a single request would exceed the URL length limit.
+  const [doneParts, { data: supp }] = await Promise.all([
+    Promise.all(chunk(meetings.map((m) => m.id), 100).map((ids) =>
+      admin.from('relay_automation_sent').select('meeting_id')
+        .eq('workspace_id', ws).eq('automation_key', rule.key).in('meeting_id', ids))),
+    admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws),
+  ]);
+  const doneMeetings = new Set(doneParts.flatMap((part) => (part.data || []).map((d) => d.meeting_id as string)));
+  const stopPhones = new Set((supp || []).map((x) => x.phone_e164 as string));
+
+  for (const m of meetings) {
+    if (doneMeetings.has(m.id)) continue;
+    if (room <= 0) { skipped.push('daily cap reached mid-run'); break; }
+    if (!ctx.hasTime() || ctx.sendsLeft() <= 0) { out.note = 'Continues on the next run.'; break; }
+    const who = m.client_name || m.client_email || m.id;
+
+    // A same-day thank-you must not go to a call from weeks ago.
+    if (!booked) {
+      const startedMs = new Date(m.starts_at).getTime();
+      const completedMs = new Date(m.completed_at || m.starts_at).getTime();
+      const tooOld = completedMs - startedMs > 3 * 86_400_000;
+      const notYet = startedMs > completedMs + 86_400_000;
+      if (tooOld || notYet) {
+        if (!dryRun) {
+          await admin.from('relay_automation_sent').insert({
+            workspace_id: ws, automation_key: rule.key, lead_id: m.lead_id, phone_e164: 'n/a',
+            meeting_id: m.id, method: 'template', detail: rule.template_name, ok: false,
+            error: tooOld ? 'call was more than 3 days before it was marked completed' : 'call is still in the future',
+          });
+        }
+        skipped.push(`${who}: ${tooOld ? 'call too old for a same-day thank-you' : 'call has not happened yet'}`);
+        continue;
+      }
+    }
+
+    // Which number dials: booking form, then linked lead, then lead by email.
+    let lead: { id: string; full_name: string | null; phone: string | null; visa_type: string | null } | null = null;
+    if (m.lead_id) {
+      const { data } = await admin.from('leads').select('id, full_name, phone, visa_type').eq('id', m.lead_id).maybeSingle();
+      lead = data;
+    }
+    if (!lead && m.client_email) {
+      const { data } = await admin.from('leads').select('id, full_name, phone, visa_type')
+        .eq('workspace_id', ws).ilike('email', m.client_email.trim()).order('updated_at', { ascending: false }).limit(1).maybeSingle();
+      lead = data;
+    }
+    const phoneE164 = toE164(m.client_phone) || (lead ? toE164(lead.phone) : null);
+
+    if (!phoneE164 || stopPhones.has(phoneE164)) {
+      if (!dryRun) {
+        await admin.from('relay_automation_sent').insert({
+          workspace_id: ws, automation_key: rule.key, lead_id: lead?.id ?? m.lead_id ?? null, phone_e164: phoneE164 || 'n/a',
+          meeting_id: m.id, method: 'template', detail: rule.template_name, ok: false,
+          error: phoneE164 ? 'opted out' : 'no usable phone on the booking or the lead',
+        });
+      }
+      skipped.push(`${who}: ${phoneE164 ? 'opted out' : 'no usable phone number anywhere'}`);
+      continue;
+    }
+
+    if (dryRun) { skipped.push(`would send ${rule.template_name} to ${who} (${phoneE164})`); room--; continue; }
+    if (!ctx.takeSend()) { out.note = 'Continues on the next run.'; break; }
+
+    const { data: claim, error: claimErr } = await admin.from('relay_automation_sent')
+      .insert({
+        workspace_id: ws, automation_key: rule.key, lead_id: lead?.id ?? m.lead_id ?? null, phone_e164: phoneE164,
+        meeting_id: m.id, method: 'template', detail: rule.template_name, ok: false,
+      })
+      .select('id').maybeSingle();
+    if (claimErr || !claim) { ctx.giveBackSend(); continue; }   // another run got here first
+
+    let ok = false; let errText: string | null = null;
+    try {
+      const { data: convId } = await admin.rpc('relay_get_or_create_conversation', { p_workspace_id: ws, p_phone_e164: phoneE164 });
+      if (!convId) throw new Error('could not open a conversation');
+      if (lead?.id) {
+        await admin.from('relay_conversations').update({ lead_id: lead.id, updated_at: new Date().toISOString() })
+          .eq('id', convId as string).is('lead_id', null);
+      }
+      const r = await sendTemplateToLead(admin, {
+        workspaceId: ws, conversationId: convId as string, phoneE164,
+        templateName: rule.template_name, language: rule.template_language || 'en',
+        lead: { full_name: m.client_name || lead?.full_name || null, visa_type: lead?.visa_type ?? null },
+      }, ctx);
+      ok = r.ok; errText = r.ok ? null : r.timedOut ? TIMEOUT_NOTE : r.error;
+    } catch (e) {
+      errText = isTimeoutError(e) ? TIMEOUT_NOTE : e instanceof Error ? e.message : String(e);
+    }
+
+    await admin.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claim.id);
+    if (ok) { out.sent = (out.sent as number) + 1; room--; }
+    else skipped.push(`${who}: ${errText}`);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// The quick reply: text plus any attachments, each a normal message row so it
+// appears in the thread exactly like a human send.
+// ---------------------------------------------------------------------------
 async function sendQuickReply(
-  admin: NonNullable<ReturnType<typeof createAdminClient>>,
+  admin: Admin, ctx: RunContext,
   ws: string, conversationId: string, phoneE164: string,
   shortcut: string | null,
   lead: { full_name?: string | null; visa_type?: string | null },
-): Promise<boolean> {
-  if (!shortcut) return false;
-  const { data: qr } = await admin
-    .from('relay_quick_replies')
-    .select('body, attachments')
-    .eq('workspace_id', ws).eq('shortcut', shortcut).maybeSingle();
-  if (!qr) return false;
+): Promise<{ ok: boolean; timedOut: boolean }> {
+  if (!shortcut) return { ok: false, timedOut: false };
+  const limits = { timeoutMs: CALL_TIMEOUT_MS, signal: ctx.signal };
+
+  type Qr = { body: string | null; attachments: { path: string; name: string; mime: string; size: number }[] | null } | null;
+  const cacheKey = `qr:${ws}:${shortcut}`;
+  let qr: Qr;
+  if (ctx.cache.has(cacheKey)) qr = ctx.cache.get(cacheKey) as Qr;
+  else {
+    const { data } = await admin.from('relay_quick_replies').select('body, attachments')
+      .eq('workspace_id', ws).eq('shortcut', shortcut).maybeSingle();
+    qr = data as Qr;
+    ctx.cache.set(cacheKey, qr);
+  }
+  if (!qr) return { ok: false, timedOut: false };
+
+  let allOk = true;
+  let anyTimeout = false;
+  // A slow provider may still have delivered: leave the row 'queued' and let
+  // the webhook stamp the truth, rather than calling it failed.
+  const record = async (id: string, r: { ok: boolean; code?: string; detail?: string; providerMsgId?: string }) => {
+    const timedOut = !r.ok && r.code === 'timeout';
+    anyTimeout ||= timedOut;
+    await admin.from('relay_messages').update({
+      status: r.ok ? 'sent' : timedOut ? 'queued' : 'failed',
+      provider_msg_id: r.ok ? r.providerMsgId || null : null,
+      error_code: r.ok ? null : r.code || 'unknown',
+      error_detail: r.ok ? null : (r.detail || '').slice(0, 500),
+      updated_at: new Date().toISOString(),
+    }).eq('id', id);
+  };
 
   const text = personalise(qr.body || '', lead);
-  let allOk = true;
-
   if (text.trim()) {
     const { data: msg } = await admin.from('relay_messages')
       .insert({ workspace_id: ws, conversation_id: conversationId, direction: 'out', body: text, status: 'queued', sent_by: null })
       .select('id').single();
-    const r = msg ? await sendText({ phoneE164, message: text, callbackData: msg.id }) : { ok: false, detail: 'insert failed', code: 'db' };
-    if (msg) await admin.from('relay_messages').update({
-      status: r.ok ? 'sent' : 'failed', provider_msg_id: r.ok ? r.providerMsgId || null : null,
-      error_code: r.ok ? null : r.code || 'unknown', error_detail: r.ok ? null : (r.detail || '').slice(0, 500),
-      updated_at: new Date().toISOString(),
-    }).eq('id', msg.id);
-    allOk = allOk && !!msg && r.ok;
+    if (!msg) allOk = false;
+    else {
+      const r = await sendText({ phoneE164, message: text, callbackData: msg.id, limits });
+      await record(msg.id, r);
+      allOk &&= r.ok;
+    }
   }
 
-  for (const att of (qr.attachments || []) as { path: string; name: string; mime: string; size: number }[]) {
+  for (const att of qr.attachments || []) {
     const { data: signed } = await admin.storage.from(RELAY_BUCKET).createSignedUrl(att.path, 3600);
     if (!signed?.signedUrl) { allOk = false; continue; }
     const mediaType = mediaTypeFrom(att.mime) || 'document';
@@ -612,69 +682,14 @@ async function sendQuickReply(
         media_path: att.path, media_name: att.name, media_mime: att.mime, media_size: att.size,
         media_type: mediaType, status: 'queued', sent_by: null,
       }).select('id').single();
-    const r = msg ? await sendMedia({
+    if (!msg) { allOk = false; continue; }
+    const r = await sendMedia({
       phoneE164, mediaUrl: signed.signedUrl,
       mediaType: mediaType === 'sticker' ? 'image' : mediaType,
-      fileName: att.name, callbackData: msg.id,
-    }) : { ok: false, detail: 'insert failed', code: 'db' };
-    if (msg) await admin.from('relay_messages').update({
-      status: r.ok ? 'sent' : 'failed', provider_msg_id: r.ok ? r.providerMsgId || null : null,
-      error_code: r.ok ? null : r.code || 'unknown', error_detail: r.ok ? null : (r.detail || '').slice(0, 500),
-      updated_at: new Date().toISOString(),
-    }).eq('id', msg.id);
-    allOk = allOk && !!msg && r.ok;
+      fileName: att.name, callbackData: msg.id, limits,
+    });
+    await record(msg.id, r);
+    allOk &&= r.ok;
   }
-  return allOk;
-}
-
-async function sendFirstTemplate(
-  admin: NonNullable<ReturnType<typeof createAdminClient>>,
-  ws: string, conversationId: string, phoneE164: string,
-  templateName: string | null, language: string,
-  lead: { full_name?: string | null; visa_type?: string | null },
-): Promise<{ ok: boolean; error: string | null }> {
-  if (!templateName) return { ok: false, error: 'No template chosen for the closed-window path.' };
-
-  const candidates = [firstNameOf(lead.full_name), visaLabelOf(lead.visa_type), 'Migrizo'];
-  const pad = (n: number) => Array.from({ length: n }, (_, i) => candidates[i] || candidates[0] || 'Migrizo');
-
-  const { data: tplRow } = await admin.from('relay_templates')
-    .select('id, body, variable_count')
-    .eq('workspace_id', ws).eq('name', templateName).maybeSingle();
-
-  let values = pad(tplRow?.variable_count ?? 0);
-  const renderBody = (vals: string[]) =>
-    tplRow?.body
-      ? tplRow.body.replace(/\{\{\s*(\d+)\s*\}\}/g, (_m: string, n: string) => vals[Number(n) - 1] || '')
-      : `Template “${templateName}”`;
-
-  const { data: msg } = await admin.from('relay_messages')
-    .insert({
-      workspace_id: ws, conversation_id: conversationId, direction: 'out',
-      body: renderBody(values), template_name: templateName, template_language: language,
-      template_values: { bodyValues: values }, status: 'queued', sent_by: null,
-    }).select('id').single();
-  if (!msg) return { ok: false, error: 'Could not save message.' };
-
-  let result = await sendTemplate({ phoneE164, templateName, languageCode: language, bodyValues: values, callbackData: msg.id });
-
-  // learn the variable count from Interakt's rejection, exactly like manual sends
-  if (!result.ok) {
-    const m = /expected number of values (?:are|is)\s*(\d+)/i.exec(result.detail || '');
-    if (m) {
-      values = pad(Number(m[1]));
-      if (tplRow?.id) await admin.from('relay_templates').update({ variable_count: Number(m[1]), updated_at: new Date().toISOString() }).eq('id', tplRow.id);
-      await admin.from('relay_messages').update({ body: renderBody(values), template_values: { bodyValues: values } }).eq('id', msg.id);
-      result = await sendTemplate({ phoneE164, templateName, languageCode: language, bodyValues: values, callbackData: msg.id });
-    }
-  }
-
-  await admin.from('relay_messages').update({
-    status: result.ok ? 'sent' : 'failed', provider_msg_id: result.providerMsgId || null,
-    error_code: result.ok ? null : result.code || 'unknown',
-    error_detail: result.ok ? null : (result.detail || '').slice(0, 500),
-    updated_at: new Date().toISOString(),
-  }).eq('id', msg.id);
-
-  return { ok: result.ok, error: result.ok ? null : result.detail || 'send failed' };
+  return { ok: allOk, timedOut: !allOk && anyTimeout };
 }
