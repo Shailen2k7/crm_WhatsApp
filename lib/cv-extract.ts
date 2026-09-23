@@ -71,7 +71,16 @@ const CV_SIGNALS: RegExp[] = [
 ];
 const NOT_CV_SIGNALS: RegExp[] = [
   /\b(invoice|tax invoice|receipt|amount due|gst(in)?)\b/i,
-  /\b(passport|date of issue|place of issue|nationality code)\b/i,
+  // A PASSPORT DOCUMENT, NOT A CV THAT MENTIONS ONE.
+  // This used to be a bare /passport/ and it was quietly costing us real CVs:
+  // Indian CVs list "Passport No." under personal details as a matter of
+  // course, and that single word deducted enough to push a genuine resume
+  // below the bar. It was measured, not guessed — Ramadoss's CV on 22 Sep 2026
+  // matched three CV signals (0.60) and was thrown out at 0.35 for exactly
+  // this reason. A real passport scan carries the issue fields with it, so the
+  // penalty now needs the word AND the paperwork around it.
+  /\bpassport\b(?=[\s\S]{0,400}\b(date of issue|place of issue|date of expiry|nationality code|republic of india|type\s*:?\s*p\b)\b)/i,
+  /\b(place of issue|nationality code)\b/i,
   /\b(offer letter|appointment letter|salary structure|ctc)\b/i,
   /\b(bank statement|account number|ifsc)\b/i,
   /\b(aadhaar|pan card|permanent account number)\b/i,
@@ -123,7 +132,26 @@ export function cvScoreOf(text: string): number {
   // incidental word must not outvote five structural CV signals, so a full
   // house still clears both thresholds with one anti-hit against it.
   const base = Math.min(1, hits / 5);            // five signals = certain
-  return Math.max(0, base - antis * 0.25 - ours * 0.35);
+
+  // THE ANTI-SIGNALS ONLY GET A VOTE WHEN THE CV EVIDENCE IS THIN.
+  //
+  // Scoping the passport pattern was not enough, because plenty of real Indian
+  // CVs carry a full "PASSPORT DETAILS" section — number and expiry — for
+  // overseas applications. Ramadoss's CV on 22 Sep 2026 was one: three CV
+  // sections, and it was binned at 0.35 because of that section.
+  //
+  // No keyword rule can separate "a CV containing passport details" from "a
+  // passport" — but structure can. Three distinct CV sections is something a
+  // passport scan, an invoice or a bank statement simply does not have; those
+  // score zero on the positive signals regardless. So above that line the
+  // anti-signals have nothing left to protect against and are ignored.
+  //
+  // The trade is deliberate and asymmetric. A false positive here puts the
+  // wrong text on a lead's profile, which is visible and easy to undo. A false
+  // negative is what we have been living with: a real CV silently binned, and
+  // the client told they are not eligible without anyone reading it.
+  const penalty = hits >= 3 ? 0 : antis * 0.25;
+  return Math.max(0, base - penalty - ours * 0.35);
 }
 
 const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
