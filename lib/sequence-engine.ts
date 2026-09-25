@@ -485,7 +485,12 @@ export async function runSequences(
     const optedOut = new Set((dueSupp || []).map((x) => x.phone_e164 as string));
     const stamp = () => new Date().toISOString();
 
-    await forEachLimited(due, SEND_CONCURRENCY, () => !ctx || ctx.hasTime(), async (row) => {
+    // A deliberately slow sequence goes ONE AT A TIME. After a spam-rate
+    // penalty the point of a low hourly cap is a trickle, and three messages
+    // landing in the same second is not a trickle.
+    const concurrency = perHour > 0 && perHour <= 5 ? 1 : SEND_CONCURRENCY;
+
+    await forEachLimited(due, concurrency, () => !ctx || ctx.hasTime(), async (row) => {
       const step = (steps as Step[]).find((st) => st.step_no === row.current_step + 1);
       if (!step) {
         await admin.from('relay_lead_sequences').update({
