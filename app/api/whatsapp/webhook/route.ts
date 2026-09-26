@@ -93,18 +93,25 @@ async function logAttempt(row: {
 
 /**
  * Downloads inbound media from Interakt's CDN into our private bucket.
- * Returns what got stored, or nulls on failure — in which case the message
- * keeps the CDN url as a fallback and the archiver can retry later.
+ *
+ * `path` is null when the file arrived but could not be archived — too big for
+ * the bucket, or the upload failed. The bytes are still returned in that case,
+ * because a 30 MB PDF is often somebody's CV and its text belongs on the lead
+ * whether or not we keep a copy of the file. Five documents were lost this way
+ * before this was split apart: the download succeeded, the archive did not, and
+ * nothing downstream ever ran.
+ *
+ * Returns null only when there are no bytes at all.
  */
 async function archiveMedia(
   admin: SupabaseClient,
   opts: { workspaceId: string; conversationId: string; messageId: string; url: string; contentTypeHint?: string | null; mediaType?: string | null }
-): Promise<{ path: string; name: string; mime: string; size: number; buf: Buffer } | null> {
+): Promise<{ path: string | null; name: string; mime: string; size: number; buf: Buffer } | null> {
   try {
     const res = await fetch(opts.url, { signal: AbortSignal.timeout(30_000) });
     if (!res.ok) return null;
     const ab = await res.arrayBuffer();
-    if (ab.byteLength === 0 || ab.byteLength > MAX_UPLOAD_BYTES) return null;
+    if (ab.byteLength === 0) return null;
     const buf = Buffer.from(new Uint8Array(ab));
 
     // Name: last URL segment if it looks like a filename, else sniff the bytes.
@@ -116,12 +123,14 @@ async function archiveMedia(
     const mime = mimeFor(ext, declaredMime);
     const path = mediaPath(opts.workspaceId, opts.conversationId, opts.messageId, filename);
 
+    if (buf.byteLength > MAX_UPLOAD_BYTES) {
+      return { path: null, name: filename, mime, size: buf.byteLength, buf };
+    }
     const { error } = await admin.storage.from(RELAY_BUCKET).upload(path, buf, {
       contentType: mime,
       upsert: true,
     });
-    if (error) return null;
-    return { path, name: filename, mime, size: buf.byteLength, buf };
+    return { path: error ? null : path, name: filename, mime, size: buf.byteLength, buf };
   } catch {
     return null;
   }
@@ -330,7 +339,9 @@ export async function POST(req: Request) {
         });
         if (stored) {
           await admin.from('relay_messages').update({
-            media_path: stored.path,
+            // Null when the file was too big to keep: the message then falls
+            // back to the CDN url, exactly as it did before it was downloaded.
+            ...(stored.path ? { media_path: stored.path } : {}),
             media_name: stored.name,
             media_mime: stored.mime,
             media_size: stored.size,
@@ -341,6 +352,9 @@ export async function POST(req: Request) {
           // profile" without anyone touching a file. Strict threshold, no
           // matching needed (the conversation already knows its lead), and
           // never allowed to fail the webhook.
+          //
+          // Runs on the bytes, not on the archive: a CV we could not file away
+          // is still a CV, and leaving it unread is how people got missed.
           if (direction === 'in' && mediaType === 'document') {
             const cv = await captureCvFromDocument(admin, {
               workspaceId: ws.id, conversationId: convId as string, messageId: inserted.id,

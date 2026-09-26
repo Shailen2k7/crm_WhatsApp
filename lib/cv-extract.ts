@@ -47,6 +47,12 @@ async function textOf(kind: CvKind, buf: Buffer): Promise<string> {
 
 function clean(raw: string): string {
   return raw
+    // A PDF can carry a NUL byte in its text. Postgres cannot store one in a
+    // text column — it rejects the whole row with "unsupported Unicode escape
+    // sequence" — so one stray byte used to make a perfectly good CV
+    // unsavable, and the record of the failure unsavable too. Stripped here,
+    // once, so nothing downstream has to know. Tabs and newlines are kept.
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
     .replace(/\r\n?/g, '\n')
     .replace(/[ \t ]+/g, ' ')
     .replace(/^\s*(page\s+)?\d+(\s*(of|\/)\s*\d+)?\s*$/gim, '')

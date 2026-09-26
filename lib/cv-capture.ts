@@ -167,7 +167,7 @@ export async function captureCvFromDocument(
     score?: number | null; text?: string | null; phone?: string | null;
   }) => {
     try {
-      await admin.from('relay_cv_captures').upsert({
+      const entry = {
         workspace_id: opts.workspaceId,
         message_id: opts.messageId,
         conversation_id: opts.conversationId,
@@ -180,7 +180,16 @@ export async function captureCvFromDocument(
         cv_score: row.score ?? null,
         match_method: row.method ?? null,
         extracted_text: row.status === 'review' || row.status === 'unmatched' ? row.text ?? null : null,
-      }, { onConflict: 'message_id', ignoreDuplicates: true });
+      };
+      const { error } = await admin
+        .from('relay_cv_captures').upsert(entry, { onConflict: 'message_id', ignoreDuplicates: true });
+      // If the database refused the row, the copy of the text is the likely
+      // culprit. Knowing that a CV arrived matters more than keeping the text,
+      // so try again without it rather than losing the person entirely.
+      if (error && entry.extracted_text) {
+        await admin.from('relay_cv_captures')
+          .upsert({ ...entry, extracted_text: null }, { onConflict: 'message_id', ignoreDuplicates: true });
+      }
     } catch { /* the record is best-effort; the capture itself must not fail */ }
   };
 
