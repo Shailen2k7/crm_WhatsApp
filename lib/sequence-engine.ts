@@ -31,6 +31,12 @@ const ENROL_PAGE = 400;              // leads read per query when topping up
 // several pages keeps finding new ones; without this, enrolment silently stops
 // the day the enrolled count passes one page.
 const ENROL_MAX_PAGES = 30;          // up to 12,000 oldest leads scanned per tick
+/**
+ * When a backlog forces intake to hold back, anyone whose first message went
+ * out inside this window is still let in. A follow-up promised an hour after
+ * the first message is a promise to today's enquiry, not to last week's.
+ */
+const FRESH_INTAKE_HOURS = 36;
 
 function istDate(d = new Date()): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: IST }).format(d); // YYYY-MM-DD
@@ -271,8 +277,18 @@ export async function runSequences(
     // schedule makes ("C2 three days after C1") was being broken by the
     // backlog rather than by the settings.
     //
-    // So intake pauses while more people are already overdue than a day of
-    // sending can clear. The queue drains, then intake resumes.
+    // So intake holds back while more people are already overdue than a day of
+    // sending can clear. The queue drains, then intake resumes in full.
+    //
+    // But it must never close completely. It used to set room to zero, and that
+    // latched: a backlog kept the door shut, and because the door was shut the
+    // newest enquiries never entered, so nobody could see them waiting. It
+    // stayed that way for a full day and ten people who had asked us for help
+    // that night were simply never followed up.
+    //
+    // Someone who wrote to us an hour ago is the whole point of the machine, so
+    // they are always admitted. It is the old backlog that waits.
+    let freshOnlySince: string | null = null;
     if (room > 0 && Number(seq.per_hour_cap) > 0) {
       const windowHours = seq.hours_enabled
         ? Math.max(1, (seq.send_end_hour ?? 24) - (seq.send_start_hour ?? 0))
@@ -284,8 +300,8 @@ export async function runSequences(
         .eq('sequence_id', seq.id).eq('status', 'active')
         .lte('next_send_at', new Date().toISOString());
       if ((overdue ?? 0) >= dailyCapacity) {
-        report.note = `Intake paused: ${overdue} already waiting, more than one day of sending (${dailyCapacity}).`;
-        room = 0;
+        freshOnlySince = new Date(Date.now() - FRESH_INTAKE_HOURS * 3_600_000).toISOString();
+        report.note = `Backlog of ${overdue} is more than a day of sending (${dailyCapacity}), so only people from the last ${FRESH_INTAKE_HOURS}h are being taken in.`;
       }
     }
 
@@ -334,15 +350,28 @@ export async function runSequences(
         // The audit rows from the new-lead rule are the source of truth for
         // "we messaged them first". Two weeks back is plenty: beyond that the
         // chase reads as spam, not follow-up.
-        const horizon = new Date(Date.now() - 14 * 86_400_000).toISOString();
+        // While a backlog holds intake back, only the recent arrivals come in.
+        const horizon = freshOnlySince || new Date(Date.now() - 14 * 86_400_000).toISOString();
 
+        // NEWEST FIRST, and this matters more than it looks. The pass is
+        // time-limited — the tick must finish in under ten seconds — and it
+        // used to walk the fortnight oldest-first. The people messaged an hour
+        // ago were therefore always at the very end of the list, so whenever
+        // the pass ran out of time they were the ones dropped, every single
+        // time. Five leads from one night sat unenrolled while the backlog
+        // ahead of them was scanned again and again.
+        //
+        // A promise of "T2 one hour after T1" is a promise to the newest
+        // person in the database, so the newest person is served first. The
+        // backlog is still reached: it is the same list, walked from the other
+        // end, and intake room runs to hundreds a day.
         for (let page = 0; room > 0 && page < ENROL_MAX_PAGES && (!ctx || ctx.hasTime()); page++) {
           const { data: firstSends } = await admin
             .from('relay_automation_sent')
             .select('lead_id, phone_e164, sent_at')
             .eq('workspace_id', ws).eq('automation_key', 'new_lead_first')
             .eq('ok', true).gte('sent_at', horizon)
-            .order('sent_at', { ascending: true })
+            .order('sent_at', { ascending: false })
             .range(page * ENROL_PAGE, page * ENROL_PAGE + ENROL_PAGE - 1);
           if (!firstSends?.length) break;
 
@@ -394,7 +423,10 @@ export async function runSequences(
           }
           if (firstSends.length < ENROL_PAGE) break;   // that was the last page
         }
-      } else {
+      } else if (!freshOnlySince) {
+        // A backlog sequence works through a fixed list at its own pace, so
+        // when it is already behind there is nothing urgent to let in — unlike
+        // the no-reply chase above, where the newest arrival is the point.
         // ---- OLDEST FIRST through the backlog -------------------------------
         // Pages forward until today's room is filled. The first pages are
         // people already enrolled; walking past them is what keeps the intake
@@ -461,15 +493,40 @@ export async function runSequences(
       }
     }
 
-    const { data: due } = await admin
-      .from('relay_lead_sequences')
-      .select('*')
-      .eq('sequence_id', seq.id)
-      .eq('status', 'active')
-      .lte('next_send_at', new Date().toISOString())
-      .order('next_send_at', { ascending: true })
-      .limit(budget);
-    if (!due?.length) return;
+    // WHO GOES FIRST, when more people are due than this batch can carry.
+    //
+    // Strictly oldest-first is the fair answer to "who has waited longest", and
+    // it is the wrong answer here. A morning backlog of a hundred people would
+    // absorb every batch all day, so the enquiry that came in at nine would not
+    // be followed up until the evening — while the schedule claims one hour.
+    // The oldest rows are also the least likely to still be worth anything.
+    //
+    // So each batch is split: most of it clears the backlog oldest-first, and a
+    // reserved share always goes to people whose turn came up recently. Both
+    // move every single run, and neither can starve the other.
+    const nowIso = new Date().toISOString();
+    const freshSince = new Date(Date.now() - FRESH_INTAKE_HOURS * 3_600_000).toISOString();
+    const freshShare = Math.max(1, Math.round(budget / 2));
+    const [{ data: freshDue }, { data: oldDue }] = await Promise.all([
+      admin.from('relay_lead_sequences').select('*')
+        .eq('sequence_id', seq.id).eq('status', 'active')
+        .lte('next_send_at', nowIso).gte('next_send_at', freshSince)
+        .order('next_send_at', { ascending: false })
+        .limit(freshShare),
+      admin.from('relay_lead_sequences').select('*')
+        .eq('sequence_id', seq.id).eq('status', 'active')
+        .lte('next_send_at', nowIso)
+        .order('next_send_at', { ascending: true })
+        .limit(budget),
+    ]);
+    const picked = new Map<string, Record<string, any>>();          // eslint-disable-line @typescript-eslint/no-explicit-any
+    for (const r of (freshDue || [])) picked.set(r.id as string, r);
+    for (const r of (oldDue || [])) {
+      if (picked.size >= budget) break;
+      picked.set(r.id as string, r);
+    }
+    const due = [...picked.values()].slice(0, budget);
+    if (!due.length) return;
 
     // Everything each send needs to check, fetched once for the whole batch —
     // not three queries per person.

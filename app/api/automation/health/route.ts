@@ -151,6 +151,84 @@ export async function GET() {
     }
   }
 
+  // ---- 4. did everyone who ignored the first message get into the chase? ----
+  // The check that was missing. Every other check looks at people who are
+  // already inside a machine, so someone who never got in was invisible: the
+  // chase reported "all on schedule" while ten people who had asked us for help
+  // the night before sat outside it, and the only way that surfaced was a
+  // person reading the threads by hand.
+  for (const seq of (sequences || []).filter((s) => s.trigger_mode === 'no_reply')) {
+    const { data: steps } = await admin
+      .from('relay_sequence_steps').select('gap_hours, gap_days')
+      .eq('sequence_id', seq.id).order('step_no').limit(1);
+    const firstGapH = Number(steps?.[0]?.gap_hours ?? (steps?.[0]?.gap_days ?? 0) * 24) || 0;
+    // Only people whose first follow-up is already due, plus an hour of slack.
+    const dueBy = new Date(Date.now() - (firstGapH + 1) * 3_600_000).toISOString();
+    const since = new Date(Date.now() - 72 * 3_600_000).toISOString();
+
+    const [{ data: firsts }, { data: enrolled }, { data: stops }] = await Promise.all([
+      admin.from('relay_automation_sent').select('phone_e164, sent_at')
+        .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', true)
+        .gte('sent_at', since).lte('sent_at', dueBy).limit(1000),
+      admin.from('relay_lead_sequences').select('phone_e164')
+        .eq('sequence_id', seq.id).limit(5000),
+      admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws).limit(2000),
+    ]);
+    const inSeq = new Set((enrolled || []).map((e) => e.phone_e164));
+    const stopped = new Set((stops || []).map((s) => s.phone_e164));
+    const candidates = (firsts || []).filter((f) => f.phone_e164 && !inSeq.has(f.phone_e164) && !stopped.has(f.phone_e164));
+
+    let outside: { phone: string; hours: number }[] = [];
+    if (candidates.length) {
+      const { data: convs } = await admin
+        .from('relay_conversations').select('phone_e164, last_inbound_at')
+        .eq('workspace_id', ws).in('phone_e164', candidates.map((c) => c.phone_e164).slice(0, 300));
+      const replied = new Map((convs || []).map((c) => [c.phone_e164, c.last_inbound_at]));
+      outside = candidates
+        .filter((c) => {
+          const r = replied.get(c.phone_e164);
+          return !(r && r >= c.sent_at);      // replied since = nothing to chase
+        })
+        .map((c) => ({ phone: c.phone_e164, hours: hoursSince(c.sent_at) }))
+        .sort((a, b) => b.hours - a.hours);
+    }
+
+    checks.push(
+      outside.length === 0
+        ? { name: `${seq.name}: everyone is in it`, level: 'ok',
+            detail: 'Every person who ignored the first message is in the follow-up.' }
+        : { name: `${seq.name}: people left outside`, level: outside.length > 5 ? 'bad' : 'warn',
+            detail: `${outside.length} ${outside.length === 1 ? 'person' : 'people'} never replied to the first message and are not in the follow-up — the longest waiting ${outside[0].hours.toFixed(1)} hours (${outside.slice(0, 3).map((o) => o.phone).join(', ')}${outside.length > 3 ? '…' : ''}).`,
+            action: 'Press “Run it now”. If they stay outside, enrolment is not reaching them.' },
+    );
+
+    // ---- 5. can the follow-up run when the first messages actually go out? --
+    // The first message has no sending hours; the follow-up does. Every lead
+    // messaged outside that window is frozen until it opens, so a promise of
+    // "one hour later" cannot hold for them however fast the queue moves.
+    if (seq.hours_enabled) {
+      const { data: t1s } = await admin
+        .from('relay_automation_sent').select('sent_at')
+        .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', true)
+        .gte('sent_at', new Date(Date.now() - 48 * 3_600_000).toISOString()).limit(1000);
+      const istHourOf = (iso: string) =>
+        Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', hour12: false }).format(new Date(iso)));
+      const night = (t1s || []).filter((t) => {
+        const h = istHourOf(t.sent_at);
+        return h < (seq.send_start_hour ?? 0) || h >= (seq.send_end_hour ?? 24);
+      }).length;
+      const share = (t1s || []).length ? Math.round((night / (t1s || []).length) * 100) : 0;
+      if (share >= 20) {
+        checks.push({
+          name: 'First messages outside follow-up hours',
+          level: share >= 40 ? 'bad' : 'warn',
+          detail: `${share}% of first messages in the last 48 hours went out outside ${seq.send_start_hour}:00–${seq.send_end_hour}:00, so their follow-up cannot go on time.`,
+          action: `Either widen this sequence's sending hours, or stop the first message going out at night.`,
+        });
+      }
+    }
+  }
+
   const worst: Level = checks.some((c) => c.level === 'bad') ? 'bad'
     : checks.some((c) => c.level === 'warn') ? 'warn' : 'ok';
 
