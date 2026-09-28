@@ -263,6 +263,7 @@ export async function POST(req: NextRequest) {
     }
 
     // ==== 1. FIRST MESSAGES ==================================================
+    let chases: Chase[] | null = null;
     for (const [ws, rule] of leadRuleByWs) {
       const out: Record<string, unknown> = { workspace: ws, key: rule.key, sent: 0, skipped: [] as string[] };
       report.push(out);
@@ -303,8 +304,11 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
+      // Loaded once, and only when there is actually someone to message.
+      if (!chases) chases = await loadChases(admin);
+
       await forEachLimited(jobs, SEND_CONCURRENCY, () => ctx.hasTime() && ctx.sendsLeft() > 0, async (job) => {
-        const outcome = await sendFirstMessage(admin, lockAdmin, ctx, ws, rule, job, convByKey);
+        const outcome = await sendFirstMessage(admin, lockAdmin, ctx, ws, rule, job, convByKey, chases as Chase[]);
         if (outcome === 'sent') out.sent = (out.sent as number) + 1;
         else if (outcome !== 'skip') skipped.push(`${job.name || job.phoneE164}: ${outcome}`);
       });
@@ -374,6 +378,75 @@ export async function POST(req: NextRequest) {
 // One first message: resolve the conversation, claim, send, record.
 // Returns 'sent', 'skip' (nothing to do / someone else has it), or a reason.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// THE FOLLOW-UP IS PART OF THE FIRST MESSAGE, so it is booked at the same
+// moment.
+//
+// It used to be worked out later, by a pass that re-derived "who should be
+// chased" from scratch every fifteen minutes: read a fortnight of first
+// messages, filter them in memory, insert whatever was missing — all inside a
+// ten-second budget, in pages of four hundred. Every one of those limits was a
+// place to fall out of, silently, and people did. Ten of them in one night.
+//
+// A scan that has to find you again is a promise that can be broken. Being
+// written in at the instant your first message succeeds cannot be: it is one
+// insert, next to the insert that recorded the send. The scan still runs
+// afterwards, but only as a net for history, never as the way anyone normally
+// gets in.
+//
+// Replying still takes people straight back out — the webhook does that the
+// moment anything inbound arrives — so booking everyone in costs nothing.
+// ---------------------------------------------------------------------------
+interface Chase { id: string; workspaceId: string; firstGapMs: number }
+
+async function loadChases(admin: Admin): Promise<Chase[]> {
+  const { data: seqs } = await admin.from('relay_sequences')
+    .select('id, workspace_id').eq('status', 'running').eq('trigger_mode', 'no_reply');
+  if (!seqs?.length) return [];
+  const { data: steps } = await admin.from('relay_sequence_steps')
+    .select('sequence_id, gap_hours, gap_days')
+    .in('sequence_id', seqs.map((s) => s.id as string)).eq('step_no', 1);
+  const gapById = new Map((steps || []).map((s) => [
+    s.sequence_id as string,
+    ((Number(s.gap_hours ?? 0) || Number(s.gap_days ?? 0) * 24) || 0) * 3_600_000,
+  ]));
+  return seqs.map((s) => ({
+    id: s.id as string,
+    workspaceId: s.workspace_id as string,
+    firstGapMs: gapById.get(s.id as string) ?? 0,
+  }));
+}
+
+/**
+ * Book this person into every running chase. Idempotent: someone already in
+ * one is left exactly where they are, so a retry of the first message can
+ * never reset their follow-up or create a second row.
+ *
+ * Failures here are swallowed. The first message did go out, and the scan will
+ * pick up anyone this missed — losing the send's recorded outcome to a failed
+ * bookkeeping insert would be the worse trade.
+ */
+async function enrolInChases(
+  durable: Admin, chases: Chase[], ws: string, phone: string, leadId: string | null,
+): Promise<number> {
+  let booked = 0;
+  for (const c of chases) {
+    if (c.workspaceId !== ws) continue;
+    try {
+      const { data: already } = await durable.from('relay_lead_sequences')
+        .select('id').eq('sequence_id', c.id).eq('phone_e164', phone).limit(1);
+      if (already?.length) continue;
+      const { error } = await durable.from('relay_lead_sequences').insert({
+        workspace_id: ws, sequence_id: c.id, lead_id: leadId, phone_e164: phone,
+        status: 'active', current_step: 0,
+        next_send_at: new Date(Date.now() + c.firstGapMs).toISOString(),
+      });
+      if (!error) booked++;
+    } catch { /* the send is what matters; the scan is the net */ }
+  }
+  return booked;
+}
+
 async function sendFirstMessage(
   admin: Admin,
   /** Not bound to the run's hard stop: the outcome must be written even if it fires. */
@@ -382,6 +455,7 @@ async function sendFirstMessage(
   rule: Record<string, any>,                                          // eslint-disable-line @typescript-eslint/no-explicit-any
   job: Job,
   convByKey: Map<string, { id: string; last_inbound_at: string }>,
+  chases: Chase[],
 ): Promise<string> {
   if (!ctx.takeSend()) return 'skip';
   let spent = false;
@@ -466,6 +540,8 @@ async function sendFirstMessage(
     // Written on the durable client, so a hard stop that fired mid-send cannot
     // stop the outcome being recorded.
     await durable.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claimId);
+    // Booked in the same breath as the send that earned it.
+    if (ok) await enrolInChases(durable, chases, ws, job.phoneE164, job.leadId);
     return ok ? 'sent' : errText || 'send failed';
   } finally {
     if (!spent) ctx.giveBackSend();
