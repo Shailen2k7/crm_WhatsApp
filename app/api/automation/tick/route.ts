@@ -5,7 +5,7 @@ import { createClient } from '@/lib/supabase/server';
 import { sendTemplateToLead } from '@/lib/send-template';
 import { sendText, sendMedia, windowState, isConfigured, mediaTypeFrom } from '@/lib/interakt';
 import { toE164 } from '@/lib/phone';
-import { runSequences } from '@/lib/sequence-engine';
+import { runSequences, ecosystemBlockedPhones } from '@/lib/sequence-engine';
 import { runCampaigns } from '@/lib/campaign-engine';
 import { RELAY_BUCKET } from '@/lib/files';
 import {
@@ -294,6 +294,18 @@ export async function POST(req: NextRequest) {
         const left = Math.max(0, hardCap - (sentToday ?? 0));
         if (left === 0) { out.note = `Daily cap of ${hardCap} reached.`; continue; }
         jobs = jobs.slice(0, left);
+      }
+
+      // Meta has already refused to deliver to some of these people twice over.
+      // Whatever we send next would be refused too, so they are left alone.
+      if (jobs.length) {
+        const blocked = await ecosystemBlockedPhones(admin, ws, jobs.map((j) => j.phoneE164));
+        if (blocked.size) {
+          const before = jobs.length;
+          jobs = jobs.filter((j) => !blocked.has(j.phoneE164));
+          const held = before - jobs.length;
+          if (held) skipped.push(`${held} left alone: blocked by Meta's per-person cap`);
+        }
       }
 
       if (!jobs.length) { out.note = 'No new leads waiting.'; continue; }

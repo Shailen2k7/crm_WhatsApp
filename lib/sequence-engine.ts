@@ -31,6 +31,54 @@ const ENROL_PAGE = 400;              // leads read per query when topping up
 // several pages keeps finding new ones; without this, enrolment silently stops
 // the day the enrolled count passes one page.
 const ENROL_MAX_PAGES = 30;          // up to 12,000 oldest leads scanned per tick
+
+/**
+ * "This message was not delivered to maintain healthy ecosystem engagement."
+ *
+ * Meta's per-person marketing cap. It is not a fault at our end and not a fault
+ * in the number — it is that person, personally, being sent more marketing than
+ * Meta thinks they want, by us and by everyone else. One of these is noise.
+ * TWO is the platform telling us plainly to leave someone alone, and carrying
+ * on regardless is how a number gets its reputation burned.
+ *
+ * So after the second one, every automated message to that person stops. A
+ * human can still write to them by hand — this closes the machine, not the
+ * conversation.
+ */
+export const ECOSYSTEM_CODE = '131049';
+export const ECOSYSTEM_LIMIT = 2;
+
+/** Phones that have had ECOSYSTEM_LIMIT or more undelivered-for-ecosystem replies. */
+export async function ecosystemBlockedPhones(
+  admin: SupabaseClient, ws: string, phones: string[],
+): Promise<Set<string>> {
+  const blocked = new Set<string>();
+  const wanted = [...new Set(phones.filter(Boolean))];
+  if (!wanted.length) return blocked;
+
+  const convs: { id: string; phone_e164: string }[] = [];
+  for (let i = 0; i < wanted.length; i += 100) {
+    const { data } = await admin.from('relay_conversations')
+      .select('id, phone_e164').eq('workspace_id', ws).in('phone_e164', wanted.slice(i, i + 100));
+    convs.push(...((data || []) as { id: string; phone_e164: string }[]));
+  }
+  if (!convs.length) return blocked;
+
+  const phoneByConv = new Map(convs.map((c) => [c.id, c.phone_e164]));
+  const ids = convs.map((c) => c.id);
+  const hits = new Map<string, number>();
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data } = await admin.from('relay_messages')
+      .select('conversation_id').eq('direction', 'out')
+      .eq('error_code', ECOSYSTEM_CODE).in('conversation_id', ids.slice(i, i + 100)).limit(2000);
+    for (const m of (data || []) as { conversation_id: string }[]) {
+      const p = phoneByConv.get(m.conversation_id);
+      if (p) hits.set(p, (hits.get(p) || 0) + 1);
+    }
+  }
+  for (const [p, n] of hits) if (n >= ECOSYSTEM_LIMIT) blocked.add(p);
+  return blocked;
+}
 /**
  * When a backlog forces intake to hold back, anyone whose first message went
  * out inside this window is still let in. A follow-up promised an hour after
@@ -532,11 +580,12 @@ export async function runSequences(
     // not three queries per person.
     const dueLeadIds = [...new Set(due.map((r) => r.lead_id).filter(Boolean) as string[])];
     const duePhones = [...new Set(due.map((r) => r.phone_e164 as string))];
-    const [{ data: dueLeads }, { data: dueSupp }] = await Promise.all([
+    const [{ data: dueLeads }, { data: dueSupp }, ecosystemBlocked] = await Promise.all([
       dueLeadIds.length
         ? admin.from('leads').select('id, stage, full_name, visa_type').in('id', dueLeadIds)
         : Promise.resolve({ data: [] as { id: string; stage: string; full_name: string | null; visa_type: string | null }[] }),
       admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws).in('phone_e164', duePhones),
+      ecosystemBlockedPhones(admin, ws, duePhones),
     ]);
     const leadById = new Map((dueLeads || []).map((l) => [l.id, l]));
     const optedOut = new Set((dueSupp || []).map((x) => x.phone_e164 as string));
@@ -572,6 +621,18 @@ export async function runSequences(
           report.skipped.push(`${row.phone_e164}: now ${cur.stage}`);
           return;
         }
+      }
+
+      // Twice told by Meta that this person is getting too much marketing.
+      // Stop, and stay stopped — no further step, no retry.
+      if (ecosystemBlocked.has(row.phone_e164)) {
+        await admin.from('relay_lead_sequences').update({
+          status: 'stopped',
+          exit_reason: `ecosystem: ${ECOSYSTEM_LIMIT}+ messages undelivered by Meta`,
+          exited_at: stamp(), updated_at: stamp(),
+        }).eq('id', row.id);
+        report.skipped.push(`${row.phone_e164}: blocked by Meta's per-person cap`);
+        return;
       }
 
       // A STOP that arrived after enrolment still wins.
