@@ -19,6 +19,7 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
+import { CHASE_START } from '@/lib/sequence-engine';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -164,7 +165,8 @@ export async function GET() {
     const firstGapH = Number(steps?.[0]?.gap_hours ?? (steps?.[0]?.gap_days ?? 0) * 24) || 0;
     // Only people whose first follow-up is already due, plus an hour of slack.
     const dueBy = new Date(Date.now() - (firstGapH + 1) * 3_600_000).toISOString();
-    const since = new Date(Date.now() - 72 * 3_600_000).toISOString();
+    // Never earlier than the chase's start date: the backlog before it was left alone on purpose.
+    const since = new Date(Math.max(Date.now() - 72 * 3_600_000, new Date(CHASE_START).getTime())).toISOString();
 
     const [{ data: firsts }, { data: enrolled }, { data: stops }] = await Promise.all([
       admin.from('relay_automation_sent').select('phone_e164, sent_at')

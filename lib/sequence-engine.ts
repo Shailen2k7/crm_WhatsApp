@@ -33,28 +33,148 @@ const ENROL_PAGE = 400;              // leads read per query when topping up
 const ENROL_MAX_PAGES = 30;          // up to 12,000 oldest leads scanned per tick
 
 /**
+ * The follow-up counts from 29 September 2026, 00:00 IST.
+ *
+ * Everyone whose first message went out before then was deliberately left
+ * alone — Shailen's decision, after days of backlog, repair and re-chasing:
+ * start clean, and make certain that nobody from that day on is missed. So
+ * nothing older is ever enrolled, and anything older that finds its way back
+ * into the queue by any route is stopped at the moment it would have been sent.
+ */
+export const CHASE_START = '2026-09-28T18:30:00.000Z';   // 29 Sep 2026, 00:00 IST
+
+/** Phones whose first message went out before CHASE_START (or, lacking one, who joined before it). */
+async function beforeChaseStart(
+  admin: SupabaseClient, ws: string,
+  rows: { phone_e164: string; enrolled_at: string | null }[],
+): Promise<Set<string>> {
+  const old = new Set<string>();
+  const phones = [...new Set(rows.map((r) => r.phone_e164).filter(Boolean))];
+  if (!phones.length) return old;
+  const { data } = await admin.from('relay_automation_sent').select('phone_e164, sent_at')
+    .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', true)
+    .in('phone_e164', phones).order('sent_at', { ascending: true });
+  const firstAt = new Map<string, string>();
+  for (const f of (data || []) as { phone_e164: string; sent_at: string }[]) {
+    if (!firstAt.has(f.phone_e164)) firstAt.set(f.phone_e164, f.sent_at);
+  }
+  const start = new Date(CHASE_START).getTime();
+  for (const r of rows) {
+    const since = firstAt.get(r.phone_e164) || r.enrolled_at;
+    if (since && new Date(since).getTime() < start) old.add(r.phone_e164);
+  }
+  return old;
+}
+
+/**
+ * Has this person written to us since their first message went out?
+ *
+ * The chase exists only for people who ignored the first message. Replying
+ * was supposed to take them out — the webhook flips their row the moment
+ * anything inbound arrives — and for a long time that was the ONLY guard. It
+ * is not enough on its own: it only touches rows that already exist, so anyone
+ * put into the chase after they had replied (a backfill, a late enrolment, a
+ * phone stored in another format) sailed straight through. People who had sent
+ * their CV, taken a call, and received our PDF were then asked for their CV
+ * again. Sixty-five times.
+ *
+ * So the question is asked again at the last possible moment, against the
+ * conversation itself, immediately before every single reminder.
+ */
+export async function repliedSinceFirstMessage(
+  admin: SupabaseClient, ws: string,
+  rows: { phone_e164: string; enrolled_at: string | null }[],
+): Promise<Set<string>> {
+  const replied = new Set<string>();
+  const phones = [...new Set(rows.map((r) => r.phone_e164).filter(Boolean))];
+  if (!phones.length) return replied;
+
+  const [{ data: firsts }, { data: convs }] = await Promise.all([
+    admin.from('relay_automation_sent').select('phone_e164, sent_at')
+      .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', true)
+      .in('phone_e164', phones).order('sent_at', { ascending: true }),
+    admin.from('relay_conversations').select('phone_e164, last_inbound_at')
+      .eq('workspace_id', ws).in('phone_e164', phones),
+  ]);
+  const firstAt = new Map<string, string>();
+  for (const f of (firsts || []) as { phone_e164: string; sent_at: string }[]) {
+    if (!firstAt.has(f.phone_e164)) firstAt.set(f.phone_e164, f.sent_at);
+  }
+  const lastIn = new Map((convs || []).map((c) => [c.phone_e164 as string, c.last_inbound_at as string | null]));
+
+  for (const r of rows) {
+    const inbound = lastIn.get(r.phone_e164);
+    if (!inbound) continue;
+    // Their first message, or failing that when they joined the chase.
+    const since = firstAt.get(r.phone_e164) || r.enrolled_at;
+    // Compared as times, not strings: the two columns need not be formatted alike.
+    if (since && new Date(inbound).getTime() >= new Date(since).getTime()) replied.add(r.phone_e164);
+  }
+  return replied;
+}
+
+/**
  * "This message was not delivered to maintain healthy ecosystem engagement."
  *
- * Meta's per-person marketing cap. It is not a fault at our end and not a fault
- * in the number — it is that person, personally, being sent more marketing than
- * Meta thinks they want, by us and by everyone else. One of these is noise.
- * TWO is the platform telling us plainly to leave someone alone, and carrying
- * on regardless is how a number gets its reputation burned.
+ * Meta's per-person marketing cap (131049). Not a fault at our end and not a
+ * bad number — that person, personally, is being sent more marketing than Meta
+ * thinks they want, by us and by everyone else. It usually passes. So the
+ * answer is to back off and come back, and only give up when backing off
+ * clearly has not worked:
  *
- * So after the second one, every automated message to that person stops. A
- * human can still write to them by hand — this closes the machine, not the
- * conversation.
+ *   1st strike → leave them alone for 4 days, then try again
+ *   2nd strike → leave them alone for 10 days, then try again
+ *   3rd strike → stop for good
+ *
+ * A refusal only counts as a NEW strike if it arrives after the previous pause
+ * has ended. Before this rule, one bad day could bring back T2, T3 and T4 all
+ * refused within hours; counting those as three strikes would retire someone
+ * who never once got the pause they were owed.
+ *
+ * Every automated message obeys this — the first message and the follow-up
+ * alike. A human can still write to them by hand.
  */
 export const ECOSYSTEM_CODE = '131049';
-export const ECOSYSTEM_LIMIT = 2;
+export const ECOSYSTEM_PAUSE_DAYS = [4, 10] as const;   // after strike 1, after strike 2; strike 3 is final
 
-/** Phones that have had ECOSYSTEM_LIMIT or more undelivered-for-ecosystem replies. */
-export async function ecosystemBlockedPhones(
+export interface EcosystemState {
+  strikes: number;
+  /** While in the future, send nothing automated to this person. */
+  pausedUntil: string | null;
+  /** Three strikes: never again. */
+  stopped: boolean;
+}
+
+/** Pure: the refusal times of one person → where they stand now. */
+export function ecosystemStateFrom(refusedAt: number[], now: number = Date.now()): EcosystemState {
+  let strikes = 0;
+  let pauseEnd = -Infinity;
+  for (const t of [...refusedAt].sort((a, b) => a - b)) {
+    if (t < pauseEnd) continue;                         // inside a pause: not a new strike
+    strikes++;
+    if (strikes > ECOSYSTEM_PAUSE_DAYS.length) { pauseEnd = Infinity; break; }
+    pauseEnd = t + ECOSYSTEM_PAUSE_DAYS[strikes - 1] * 86_400_000;
+  }
+  const stopped = strikes > ECOSYSTEM_PAUSE_DAYS.length;
+  return {
+    strikes,
+    stopped,
+    pausedUntil: !stopped && pauseEnd > now ? new Date(pauseEnd).toISOString() : null,
+  };
+}
+
+/** True when nothing automated may go to this person right now. */
+export function heldByEcosystem(s: EcosystemState | undefined, now: number = Date.now()): boolean {
+  return !!s && (s.stopped || (!!s.pausedUntil && new Date(s.pausedUntil).getTime() > now));
+}
+
+/** Where every one of these people stands under the three-strike rule. */
+export async function ecosystemStates(
   admin: SupabaseClient, ws: string, phones: string[],
-): Promise<Set<string>> {
-  const blocked = new Set<string>();
+): Promise<Map<string, EcosystemState>> {
+  const out = new Map<string, EcosystemState>();
   const wanted = [...new Set(phones.filter(Boolean))];
-  if (!wanted.length) return blocked;
+  if (!wanted.length) return out;
 
   const convs: { id: string; phone_e164: string }[] = [];
   for (let i = 0; i < wanted.length; i += 100) {
@@ -62,22 +182,25 @@ export async function ecosystemBlockedPhones(
       .select('id, phone_e164').eq('workspace_id', ws).in('phone_e164', wanted.slice(i, i + 100));
     convs.push(...((data || []) as { id: string; phone_e164: string }[]));
   }
-  if (!convs.length) return blocked;
+  if (!convs.length) return out;
 
   const phoneByConv = new Map(convs.map((c) => [c.id, c.phone_e164]));
   const ids = convs.map((c) => c.id);
-  const hits = new Map<string, number>();
+  const times = new Map<string, number[]>();
   for (let i = 0; i < ids.length; i += 100) {
     const { data } = await admin.from('relay_messages')
-      .select('conversation_id').eq('direction', 'out')
+      .select('conversation_id, created_at').eq('direction', 'out')
       .eq('error_code', ECOSYSTEM_CODE).in('conversation_id', ids.slice(i, i + 100)).limit(2000);
-    for (const m of (data || []) as { conversation_id: string }[]) {
+    for (const m of (data || []) as { conversation_id: string; created_at: string }[]) {
       const p = phoneByConv.get(m.conversation_id);
-      if (p) hits.set(p, (hits.get(p) || 0) + 1);
+      if (!p) continue;
+      if (!times.has(p)) times.set(p, []);
+      times.get(p)!.push(new Date(m.created_at).getTime());
     }
   }
-  for (const [p, n] of hits) if (n >= ECOSYSTEM_LIMIT) blocked.add(p);
-  return blocked;
+  const now = Date.now();
+  for (const [p, t] of times) out.set(p, ecosystemStateFrom(t, now));
+  return out;
 }
 /**
  * When a backlog forces intake to hold back, anyone whose first message went
@@ -237,7 +360,7 @@ async function repairBouncedSends(
     if (!latest.has(k)) latest.set(k, s);          // sends came back newest first
   }
 
-  const toRetry: { phone: string; step: number; at: string }[] = [];
+  const toRetry: { phone: string; step: number; at: string; reopen: boolean }[] = [];
   for (const [k, s] of latest) {
     const m = byId.get(s.message_id as string);
     if (!m) continue;
@@ -248,19 +371,34 @@ async function repairBouncedSends(
       && Date.now() - new Date(s.sent_at).getTime() > TIMEOUT_UNCONFIRMED_MS;
     if (!bounced && !unconfirmed) continue;
     if ((attempts.get(k) || 0) >= MAX_ATTEMPTS_PER_STEP) continue;
-    toRetry.push({ phone: s.phone_e164, step: s.step_no, at: retryAtFrom(s.sent_at) });
+    toRetry.push({
+      phone: s.phone_e164, step: s.step_no, at: retryAtFrom(s.sent_at),
+      // A refused LAST message used to be the end: the lead was already marked
+      // finished, so it was never retried. Under the pause-and-retry rule for
+      // Meta's per-person cap it is owed another go like any other step. The
+      // send path moves it to the end of the pause.
+      reopen: bounced && String(m.error_code) === ECOSYSTEM_CODE,
+    });
   }
   if (!toRetry.length) return 0;
 
   let repaired = 0;
+  const now = () => new Date().toISOString();
   for (let i = 0; i < toRetry.length; i += 25) {
-    const results = await Promise.all(toRetry.slice(i, i + 25).map((r) =>
-      admin.from('relay_lead_sequences')
-        .update({ current_step: r.step - 1, next_send_at: r.at, updated_at: new Date().toISOString() })
-        .eq('sequence_id', seqId).eq('phone_e164', r.phone)
-        .eq('status', 'active')
-        .eq('current_step', r.step)      // only if they are still sitting where that send left them
-        .select('id')));
+    const results = await Promise.all(toRetry.slice(i, i + 25).map((r) => r.reopen
+      ? admin.from('relay_lead_sequences')
+          .update({ status: 'active', exit_reason: null, exited_at: null,
+                    current_step: r.step - 1, next_send_at: r.at, updated_at: now() })
+          .eq('sequence_id', seqId).eq('phone_e164', r.phone)
+          .in('status', ['active', 'completed'])   // never someone who replied or was stopped
+          .eq('current_step', r.step)
+          .select('id')
+      : admin.from('relay_lead_sequences')
+          .update({ current_step: r.step - 1, next_send_at: r.at, updated_at: now() })
+          .eq('sequence_id', seqId).eq('phone_e164', r.phone)
+          .eq('status', 'active')
+          .eq('current_step', r.step)      // only if they are still sitting where that send left them
+          .select('id')));
     repaired += results.reduce((n, r) => n + (r.data?.length || 0), 0);
   }
   return repaired;
@@ -303,7 +441,24 @@ export async function runSequences(
     ]);
     if (!steps?.length) { report.note = 'No steps configured.'; return; }
 
-    // ---- 1. ENROL: top up today's intake, oldest leads first ---------------
+    const stages = seq.audience === 'both' ? ['cold', 'hot'] : [seq.audience];
+    const noReply = seq.trigger_mode === 'no_reply';
+
+    // ORDER MATTERS. Each run has a few seconds, and whatever comes last gets
+    // what is left. Sending used to come last — after topping up the intake
+    // and repairing bounces — so on every run where those two were busy, not
+    // one reminder went out. Runs on the quarter hour never sent at all, and
+    // once the checks before each send grew a little heavier, most other runs
+    // stopped sending too: three reminders an hour against a cap of ten, while
+    // people who had been promised a follow-up in one hour waited all day.
+    //
+    // So the promise is kept first. Sending runs at the start of every run;
+    // enrolment and repair take the time that remains, and neither is urgent —
+    // new people are booked in the moment their first message goes, and the
+    // intake pass is only a net.
+
+    // ---- HOUSEKEEPING: enrol, then give bounced messages another go --------
+    const housekeeping = async () => {
     const day = rampDay(seq.started_at || new Date().toISOString());
     const limit = intakeLimitFor(day, (ramp || []) as Ramp[]);
     const dayStartIst = new Date(`${istDate()}T00:00:00+05:30`).toISOString();
@@ -353,9 +508,6 @@ export async function runSequences(
       }
     }
 
-    const stages = seq.audience === 'both' ? ['cold', 'hot'] : [seq.audience];
-    const noReply = seq.trigger_mode === 'no_reply';
-
     // Industry filter: null/empty = everyone; '(none)' matches a blank industry.
     const industries: string[] | null =
       Array.isArray(seq.industries) && seq.industries.length ? seq.industries : null;
@@ -398,8 +550,12 @@ export async function runSequences(
         // The audit rows from the new-lead rule are the source of truth for
         // "we messaged them first". Two weeks back is plenty: beyond that the
         // chase reads as spam, not follow-up.
-        // While a backlog holds intake back, only the recent arrivals come in.
-        const horizon = freshOnlySince || new Date(Date.now() - 14 * 86_400_000).toISOString();
+        // While a backlog holds intake back, only the recent arrivals come in —
+        // and never anyone from before the chase's start date.
+        const floor = Math.max(Date.now() - 14 * 86_400_000, new Date(CHASE_START).getTime());
+        const horizon = freshOnlySince && new Date(freshOnlySince).getTime() > floor
+          ? freshOnlySince
+          : new Date(floor).toISOString();
 
         // NEWEST FIRST, and this matters more than it looks. The pass is
         // time-limited — the tick must finish in under ten seconds — and it
@@ -508,12 +664,14 @@ export async function runSequences(
       }
     }
 
-    // ---- 2. Give bounced messages another go -------------------------------
+    // Give bounced messages another go.
     if (opts.repair !== false && (!ctx || ctx.hasTime())) {
       report.retried = await repairBouncedSends(admin, seq.id, ws);
     }
+    };
 
-    // ---- 3. SEND what is due, inside sending hours -------------------------
+    // ---- SEND what is due, inside sending hours -----------------------------
+    const sendDue = async () => {
     if (seq.hours_enabled) {
       const h = istHour();
       if (h < seq.send_start_hour || h >= seq.send_end_hour) {
@@ -580,12 +738,18 @@ export async function runSequences(
     // not three queries per person.
     const dueLeadIds = [...new Set(due.map((r) => r.lead_id).filter(Boolean) as string[])];
     const duePhones = [...new Set(due.map((r) => r.phone_e164 as string))];
-    const [{ data: dueLeads }, { data: dueSupp }, ecosystemBlocked] = await Promise.all([
+    const [{ data: dueLeads }, { data: dueSupp }, ecosystem, alreadyReplied, fromBefore] = await Promise.all([
       dueLeadIds.length
         ? admin.from('leads').select('id, stage, full_name, visa_type').in('id', dueLeadIds)
         : Promise.resolve({ data: [] as { id: string; stage: string; full_name: string | null; visa_type: string | null }[] }),
       admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws).in('phone_e164', duePhones),
-      ecosystemBlockedPhones(admin, ws, duePhones),
+      ecosystemStates(admin, ws, duePhones),
+      noReply
+        ? repliedSinceFirstMessage(admin, ws, due as { phone_e164: string; enrolled_at: string | null }[])
+        : Promise.resolve(new Set<string>()),
+      noReply
+        ? beforeChaseStart(admin, ws, due as { phone_e164: string; enrolled_at: string | null }[])
+        : Promise.resolve(new Set<string>()),
     ]);
     const leadById = new Map((dueLeads || []).map((l) => [l.id, l]));
     const optedOut = new Set((dueSupp || []).map((x) => x.phone_e164 as string));
@@ -623,15 +787,44 @@ export async function runSequences(
         }
       }
 
-      // Twice told by Meta that this person is getting too much marketing.
-      // Stop, and stay stopped — no further step, no retry.
-      if (ecosystemBlocked.has(row.phone_e164)) {
+      // From before the chase's start date: left alone, by decision.
+      if (fromBefore.has(row.phone_e164)) {
         await admin.from('relay_lead_sequences').update({
-          status: 'stopped',
-          exit_reason: `ecosystem: ${ECOSYSTEM_LIMIT}+ messages undelivered by Meta`,
+          status: 'stopped', exit_reason: 'before 29 Sep 2026: backlog left alone',
           exited_at: stamp(), updated_at: stamp(),
         }).eq('id', row.id);
-        report.skipped.push(`${row.phone_e164}: blocked by Meta's per-person cap`);
+        report.skipped.push(`${row.phone_e164}: first message before 29 Sep — left alone`);
+        return;
+      }
+
+      // They wrote back. Whoever put them here, whenever, the chase is over.
+      if (alreadyReplied.has(row.phone_e164)) {
+        await admin.from('relay_lead_sequences').update({
+          status: 'replied', exit_reason: 'replied (checked before sending)',
+          exited_at: stamp(), updated_at: stamp(),
+        }).eq('id', row.id);
+        report.skipped.push(`${row.phone_e164}: already replied`);
+        return;
+      }
+
+      // Meta's per-person cap: three strikes and out; before that, a pause.
+      const eco = ecosystem.get(row.phone_e164);
+      if (eco?.stopped) {
+        await admin.from('relay_lead_sequences').update({
+          status: 'stopped',
+          exit_reason: 'ecosystem: refused by Meta 3 times, after a 4-day and a 10-day pause',
+          exited_at: stamp(), updated_at: stamp(),
+        }).eq('id', row.id);
+        report.skipped.push(`${row.phone_e164}: Meta refused 3 times — stopped for good`);
+        return;
+      }
+      if (heldByEcosystem(eco)) {
+        // Same step, later: the reminder they were due is simply moved to the
+        // day the pause ends. Nothing is skipped and nothing is sent early.
+        await admin.from('relay_lead_sequences').update({
+          next_send_at: eco!.pausedUntil, updated_at: stamp(),
+        }).eq('id', row.id);
+        report.skipped.push(`${row.phone_e164}: paused by Meta's cap until ${eco!.pausedUntil!.slice(0, 10)} (strike ${eco!.strikes})`);
         return;
       }
 
@@ -703,6 +896,10 @@ export async function runSequences(
         report.completed++;
       }
     });
+    };
+
+    await sendDue();
+    if (!ctx || ctx.hasTime()) await housekeeping();
   };
   await forEachLimited(sequences, 3, () => !ctx || ctx.hasTime(), runOne);
   return reports;

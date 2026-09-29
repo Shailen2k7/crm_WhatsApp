@@ -5,7 +5,7 @@ import { createClient } from '@/lib/supabase/server';
 import { sendTemplateToLead } from '@/lib/send-template';
 import { sendText, sendMedia, windowState, isConfigured, mediaTypeFrom } from '@/lib/interakt';
 import { toE164 } from '@/lib/phone';
-import { runSequences, ecosystemBlockedPhones } from '@/lib/sequence-engine';
+import { runSequences, ecosystemStates, heldByEcosystem } from '@/lib/sequence-engine';
 import { runCampaigns } from '@/lib/campaign-engine';
 import { RELAY_BUCKET } from '@/lib/files';
 import {
@@ -296,15 +296,16 @@ export async function POST(req: NextRequest) {
         jobs = jobs.slice(0, left);
       }
 
-      // Meta has already refused to deliver to some of these people twice over.
-      // Whatever we send next would be refused too, so they are left alone.
+      // Meta's per-person cap: anyone inside a pause, or out after three
+      // strikes, is left alone. A paused person is simply planned again on a
+      // later run, once the pause is over.
       if (jobs.length) {
-        const blocked = await ecosystemBlockedPhones(admin, ws, jobs.map((j) => j.phoneE164));
-        if (blocked.size) {
+        const eco = await ecosystemStates(admin, ws, jobs.map((j) => j.phoneE164));
+        if (eco.size) {
           const before = jobs.length;
-          jobs = jobs.filter((j) => !blocked.has(j.phoneE164));
+          jobs = jobs.filter((j) => !heldByEcosystem(eco.get(j.phoneE164)));
           const held = before - jobs.length;
-          if (held) skipped.push(`${held} left alone: blocked by Meta's per-person cap`);
+          if (held) skipped.push(`${held} left alone: paused or stopped by Meta's per-person cap`);
         }
       }
 
