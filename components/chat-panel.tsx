@@ -273,6 +273,41 @@ export function ChatPanel({
     setQrIndex(0); // typing narrows the list; the highlight restarts at the top
   }, [draft]);
 
+  // ---- closing the pop-ups -------------------------------------------------
+  // Both used to close ONLY on Escape typed inside the message box. Once you
+  // clicked anywhere else the box lost focus, Escape went nowhere, and the list
+  // stayed on screen until a page refresh. Every menu in every app closes on
+  // Escape from anywhere and on a click outside it — so these do too.
+  const tplRef = useRef<HTMLDivElement>(null);
+  const tplBtnRef = useRef<HTMLButtonElement>(null);
+  const qrRef = useRef<HTMLDivElement>(null);
+  const qrBtnRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!tplOpen && !qrOpen) return;
+    const inside = (t: Node, ...els: (HTMLElement | null)[]) => els.some((el) => el?.contains(t));
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setTplOpen(false); setQrOpen(false); }
+    };
+    const onDown = (e: PointerEvent) => {
+      const t = e.target as Node;
+      // Its own button toggles it, so a click there is left to the button.
+      if (tplOpen && !inside(t, tplRef.current, tplBtnRef.current)) setTplOpen(false);
+      // The message box counts as inside for quick replies: you keep typing
+      // after the "/" to narrow the list.
+      if (qrOpen && !inside(t, qrRef.current, qrBtnRef.current, taRef.current)) setQrOpen(false);
+    };
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('pointerdown', onDown);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('pointerdown', onDown);
+    };
+  }, [tplOpen, qrOpen]);
+
+  // Switching to another chat never carries an open pop-up across with it.
+  useEffect(() => { setTplOpen(false); setQrOpen(false); }, [contactKey]);
+
   const win = windowState(lastInboundAt);
   // Internal notes bypass the window entirely — they never reach WhatsApp.
   const canType = win.open || internal;
@@ -669,7 +704,7 @@ export function ChatPanel({
       >
         {/* Quick replies popover */}
         {qrOpen && qrMatches.length > 0 && (
-          <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 280, overflowY: 'auto', overscrollBehavior: 'contain', zIndex: 20 }}>
+          <div ref={qrRef} className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 280, overflowY: 'auto', overscrollBehavior: 'contain', zIndex: 20 }}>
             <div style={{ padding: '9px 14px 5px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>Quick replies · ↑↓ then ⏎</div>
             {/* Hover styling is pure CSS. The old onMouseEnter wrote React
                 state for every row the cursor crossed — and scrolling moves
@@ -693,7 +728,7 @@ export function ChatPanel({
         )}
 
         {tplOpen && (
-          <div className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 320, overflowY: 'auto', overscrollBehavior: 'contain', zIndex: 21 }}>
+          <div ref={tplRef} className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 320, overflowY: 'auto', overscrollBehavior: 'contain', zIndex: 21 }}>
             <div style={{ padding: '10px 14px 6px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>
               Templates — tap to send{!win.open ? ' (works with the window closed)' : ''}
             </div>
@@ -810,6 +845,7 @@ export function ChatPanel({
               {uploading ? <Loader2 size={15} style={{ animation: 'spin .8s linear infinite' }} /> : <Paperclip size={15} />}
             </button>
             <button
+              ref={qrBtnRef}
               onClick={() => { setDraft((d) => (d.startsWith('/') ? d : '/')); taRef.current?.focus(); }}
               title="Quick replies ( / )"
               aria-label="Quick replies"
@@ -818,6 +854,7 @@ export function ChatPanel({
               <Zap size={15} />
             </button>
             <button
+              ref={tplBtnRef}
               onClick={() => setTplOpen((v) => !v)}
               title="Send an approved template (works when the window is closed)"
               aria-label="Send a template"
