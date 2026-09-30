@@ -17,7 +17,6 @@ import { SettingsPanel } from './settings-panel';
 import { QuickRepliesManager } from './quick-replies';
 import { TemplatesPanel } from './templates-panel';
 import { FilesPanel } from './files-panel';
-import { Placeholder } from './placeholder';
 import { MobileTabs, MobileHeader } from './mobile-tabs';
 import { BellRing, X } from 'lucide-react';
 
@@ -57,7 +56,6 @@ export function RelayShell({
   const [crmOpen, setCrmOpen] = useState(true);
   const [isMobile, setIsMobile] = useState(false);
   const [live, setLive] = useState(false);
-  const [railExpanded, setRailExpanded] = useState(false);
   const [railHover, setRailHover] = useState(false);
   const [pushBanner, setPushBanner] = useState(false);
 
@@ -67,9 +65,6 @@ export function RelayShell({
       (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     setTheme(stored);
     document.documentElement.setAttribute('data-theme', stored);
-    try {
-      setRailExpanded(localStorage.getItem('relay-rail') === 'wide');
-    } catch { /* fine */ }
   }, []);
 
   const toggleTheme = useCallback(() => {
@@ -78,13 +73,6 @@ export function RelayShell({
       document.documentElement.setAttribute('data-theme', next);
       try { localStorage.setItem('relay-theme', next); } catch { /* private mode */ }
       return next;
-    });
-  }, []);
-
-  const toggleRail = useCallback(() => {
-    setRailExpanded((v) => {
-      try { localStorage.setItem('relay-rail', v ? 'narrow' : 'wide'); } catch { /* fine */ }
-      return !v;
     });
   }, []);
 
@@ -387,8 +375,8 @@ export function RelayShell({
   const contacts = useMemo(() => mergeContacts(leads, conversations), [leads, conversations]);
 
   // Chats nav shows ONLY real conversations — the inbox, not the database.
+  // (Spotlight is a filter chip inside the list itself, not a separate page.)
   const chatContacts = useMemo(() => contacts.filter((c) => c.lastMessageAt || c.conversationId), [contacts]);
-  const starredContacts = useMemo(() => chatContacts.filter((c) => c.spotlight), [chatContacts]);
 
   const selected: Contact | null = useMemo(
     () => contacts.find((c) => c.key === selectedKey) ?? null,
@@ -441,8 +429,8 @@ export function RelayShell({
   const showList = !isMobile || !selected;
   const showChat = !isMobile || !!selected;
 
-  const isChatNav = nav === 'chat' || nav === 'contacts' || nav === 'starred';
-  const listForNav = nav === 'contacts' ? contacts : nav === 'starred' ? starredContacts : chatContacts;
+  const isChatNav = nav === 'chat' || nav === 'contacts';
+  const listForNav = nav === 'contacts' ? contacts : chatContacts;
 
   async function turnOnPush() {
     setPushBanner(false);
@@ -517,7 +505,7 @@ export function RelayShell({
             this spacer holds its 62px of layout and nothing lurches sideways.
             A phone gets a bottom tab bar instead — see below. */}
         {!isMobile && (
-          <div style={{ position: 'relative', width: railExpanded ? 196 : 62, flex: 'none', transition: 'width .16s ease' }}>
+          <div style={{ position: 'relative', width: 62, flex: 'none' }}>
             <Rail
               active={nav}
               onSelect={setNav}
@@ -525,8 +513,6 @@ export function RelayShell({
               onToggleTheme={toggleTheme}
               userName={user.name}
               unread={totalUnread}
-              expanded={railExpanded}
-              onToggleExpanded={toggleRail}
               isMobile={false}
               onHoverChange={setRailHover}
               hovering={railHover}
@@ -574,7 +560,7 @@ export function RelayShell({
           <TemplatesPanel workspaceId={workspace.id} />
         ) : nav === 'files' ? (
           <FilesPanel workspaceId={workspace.id} contacts={contacts} isAdmin={role === 'admin'} onOpenChat={(key) => { setNav('chat'); setSelectedKey(key); }} />
-        ) : nav === 'settings' ? (
+        ) : (
           <SettingsPanel
             user={user}
             workspace={workspace}
@@ -584,8 +570,6 @@ export function RelayShell({
             theme={theme}
             onToggleTheme={toggleTheme}
           />
-        ) : (
-          <Placeholder nav={nav} />
         )}
       </div>
 
@@ -602,10 +586,8 @@ export function RelayShell({
 const NAV_TITLES: Partial<Record<RailKey, string>> = {
   chat: 'Chats',
   contacts: 'Contacts',
-  starred: 'Spotlight',
   files: 'Files',
   quickreplies: 'Quick replies',
   templates: 'Templates',
-  team: 'Team',
   settings: 'Settings',
 };

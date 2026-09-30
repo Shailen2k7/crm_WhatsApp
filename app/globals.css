@@ -37,6 +37,10 @@
   --out-bg: #0d8c7c;
   --out-fg: #ffffff;
   --shadow: 0 1px 2px rgba(13, 80, 72, 0.06), 0 6px 20px -12px rgba(13, 80, 72, 0.22);
+  /* Bubbles get the cheap shadow: the big blurred one above is painted per
+     element, and a long thread carries hundreds of bubbles — that paint cost
+     is measurable on a modest laptop, and invisible at bubble size anyway. */
+  --shadow-sm: 0 1px 1.5px rgba(13, 80, 72, 0.10);
   --rail: #0e1c1a;
   --rail-fg: rgba(255, 255, 255, 0.55);
   --rail-fg-on: #ffffff;
@@ -70,6 +74,7 @@
   --out-bg: #17685c;
   --out-fg: #eafaf6;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -14px rgba(0, 0, 0, 0.7);
+  --shadow-sm: 0 1px 1.5px rgba(0, 0, 0, 0.35);
   --rail: #0b1513;
   --rail-fg: rgba(255, 255, 255, 0.5);
   --rail-fg-on: #eafaf6;
@@ -137,8 +142,22 @@ input, textarea { font: inherit; color: inherit; }
   ::-webkit-scrollbar { width: 0; height: 0; }
 }
 
-/* Momentum scrolling + overscroll containment everywhere lists live. */
-* { overscroll-behavior: contain; }
+/* ---------------------------------------------------------------------------
+   SCROLLING — the "wheel gets stuck" fix.
+
+   This file used to say `* { overscroll-behavior: contain }`. That one line
+   was the sticking: `contain` stops a scroll from CHAINING to the parent, and
+   putting it on EVERY element meant any box with hidden overflow — a message
+   bubble, a clamped two-line preview, a chips row — captured the wheel and
+   then refused to pass it up to the list that should actually move. Whether
+   scrolling worked depended on which pixel the cursor happened to rest on.
+
+   Containment belongs on the app shell alone (so the page itself never
+   bounces or pull-to-refreshes) and on real scrolling lists, each of which
+   sets it inline. Everything in between must chain freely — that is what
+   makes a wheel feel like it always works, everywhere, like WhatsApp Web.
+--------------------------------------------------------------------------- */
+html, body { overscroll-behavior: none; }
 
 /* Never let a long word or URL break the layout. */
 body { word-break: normal; overflow-wrap: anywhere; }

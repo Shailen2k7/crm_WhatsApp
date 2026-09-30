@@ -3,6 +3,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { openLiveChannel } from '@/lib/live';
+import { uploadFile } from '@/lib/upload-file';
 import {
   Search, Star, PanelRight, Paperclip, Send, MessageSquare, ArrowLeft,
   AlertCircle, Loader2, RotateCw, Lock, FileText, Download, X, Trash2,
@@ -251,10 +252,16 @@ export function ChatPanel({
     else setUnseen((n) => n + (messages.length - prev));
   }, [messages.length, scrollToEnd]);
 
+  /** When this thread was opened. Only messages that arrive AFTER that moment
+   *  get the entry animation: opening a chat used to start two hundred
+   *  simultaneous animations, which is why long chats opened with a shudder. */
+  const openedAtRef = useRef(Date.now());
+
   // Opening a different chat always starts at the newest message, instantly.
   useEffect(() => {
     lastCountRef.current = 0;
     stickRef.current = true;
+    openedAtRef.current = Date.now();
     setUnseen(0);
     setAtBottom(true);
   }, [conversationId]);
@@ -276,15 +283,11 @@ export function ChatPanel({
     if (!files || files.length === 0) return;
     setUploading(true); setError(null);
     for (const f of Array.from(files).slice(0, 10 - pending.length)) {
-      const fd = new FormData();
-      fd.append('file', f);
       try {
-        const res = await fetch('/api/whatsapp/upload', { method: 'POST', body: fd });
-        const json = await res.json();
-        if (json.ok) setPending((prev) => [...prev, json.attachment]);
-        else setError(json.error || `Could not upload ${f.name}`);
-      } catch {
-        setError(`Could not upload ${f.name}`);
+        const attachment = await uploadFile(f);
+        setPending((prev) => [...prev, attachment]);
+      } catch (e) {
+        setError(`${f.name}: ${e instanceof Error ? e.message : 'upload failed'}`);
       }
     }
     setUploading(false);
@@ -355,14 +358,14 @@ export function ChatPanel({
    * If the count is wrong the SERVER learns the right one from Interakt's
    * rejection and retries with the same list — see the send route.
    */
-  function autoValues(): string[] {
+  const autoValues = useCallback((): string[] => {
     const first = contact && !contact.unknown ? contact.name.split(' ')[0] : 'there';
     const visa =
       contact?.lead?.visa_type?.toLowerCase().includes('ifv') || contact?.lead?.visa_type?.toLowerCase().includes('innovator')
         ? 'Innovator Founder Visa'
         : 'Global Talent Visa';
     return [first, visa, 'Migrizo'];
-  }
+  }, [contact]);
 
   /** Pick a template -> it sends. That is the whole interaction. */
   async function sendTemplateNow(t: RelayTemplate) {
@@ -435,7 +438,13 @@ export function ChatPanel({
    * recorded. Rather than guess in a migration, the person who can actually see
    * whose message it was gets a one-tap fix.
    */
-  async function flipSide(m: RelayMessage) {
+  // These three are handed to EVERY bubble. They are useCallback for a reason
+  // that shows up under the thumb, not in the code: an inline `() => …` prop is
+  // a new function on every render, which turns React.memo on Bubble into a
+  // no-op — so every keystroke in the composer, every tick of the 30-second
+  // clock and every scroll-position change re-rendered the entire thread.
+  // Stable identities let two hundred bubbles sit completely still.
+  const flipSide = useCallback(async (m: RelayMessage) => {
     const next = m.direction === 'in' ? 'out' : 'in';
     setMessages((prev) => prev.map((x) => (x.id === m.id ? { ...x, direction: next } : x)));
     const { error: err } = await supabase
@@ -443,13 +452,13 @@ export function ChatPanel({
       .update({ direction: next, status: next === 'out' ? 'delivered' : 'received' })
       .eq('id', m.id);
     if (err) setError(err.message);
-  }
+  }, [supabase]);
 
   /**
    * Re-send a message that failed. Reconstructs the payload from the stored
    * row (text or file) and posts it fresh, then removes the failed one.
    */
-  async function retryMessage(m: RelayMessage) {
+  const retryMessage = useCallback(async (m: RelayMessage) => {
     if (!contact) return;
     setError(null);
     try {
@@ -479,15 +488,15 @@ export function ChatPanel({
     } catch {
       setError('Network error on retry.');
     }
-  }
+  }, [contact, conversationId, supabase, autoValues]);
 
-  async function deleteMessage(id: string) {
+  const deleteMessage = useCallback(async (id: string) => {
     if (!conversationId) return;
     if (!confirm('Delete this message (and its file, if any) permanently?')) return;
     const res = await fetch(`/api/whatsapp/conversation/${conversationId}?messageId=${id}`, { method: 'DELETE' });
     const json = await res.json();
     if (!json.ok) setError(json.error || 'Could not delete.');
-  }
+  }, [conversationId]);
 
   if (!contact) return <EmptyState />;
 
@@ -568,6 +577,7 @@ export function ChatPanel({
         style={{
           flex: 1,
           overflowY: 'auto',
+          overscrollBehavior: 'contain',
           WebkitOverflowScrolling: 'touch',
           minHeight: 0,
           padding: '16px 0 6px',
@@ -603,7 +613,14 @@ export function ChatPanel({
             return (
               <div key={m.id}>
                 {showDate && <DateSeparator iso={m.created_at} />}
-                <Bubble message={m} isAdmin={role === 'admin'} onDelete={() => deleteMessage(m.id)} onFlip={() => flipSide(m)} onRetry={() => retryMessage(m)} />
+                <Bubble
+                  message={m}
+                  isAdmin={role === 'admin'}
+                  animate={new Date(m.created_at).getTime() >= openedAtRef.current - 3000}
+                  onDelete={deleteMessage}
+                  onFlip={flipSide}
+                  onRetry={retryMessage}
+                />
               </div>
             );
           })}
@@ -867,7 +884,14 @@ function DateSeparator({ iso }: { iso: string }) {
  * (status ticks, edited body). Without this, one 30-second timer re-rendered
  * every bubble in the thread — which is what made a long chat feel sticky.
  */
-const Bubble = memo(function Bubble({ message: m, isAdmin, onDelete, onFlip, onRetry }: { message: RelayMessage; isAdmin: boolean; onDelete: () => void; onFlip: () => void; onRetry: () => void }) {
+const Bubble = memo(function Bubble({ message: m, isAdmin, animate, onDelete, onFlip, onRetry }: {
+  message: RelayMessage;
+  isAdmin: boolean;
+  animate: boolean;
+  onDelete: (id: string) => void;
+  onFlip: (m: RelayMessage) => void;
+  onRetry: (m: RelayMessage) => void;
+}) {
   const out = m.direction === 'out';
   const failed = m.status === 'failed';
   const internal = m.is_internal;
@@ -887,7 +911,7 @@ const Bubble = memo(function Bubble({ message: m, isAdmin, onDelete, onFlip, onR
 
   return (
     <div
-      className="animate-msg-in"
+      className={animate ? 'animate-msg-in' : undefined}
       style={{
         display: 'flex',
         // `row-reverse` REVERSES the main axis, so `flex-end` on an outbound row
@@ -918,7 +942,7 @@ const Bubble = memo(function Bubble({ message: m, isAdmin, onDelete, onFlip, onR
             border: internal ? '1px dashed var(--amber)' : out || failed ? 'none' : '1px solid var(--line-2)',
             borderRadius: out ? '14px 14px 5px 14px' : '14px 14px 14px 5px',
             padding: hasFile && isImage ? 5 : '9px 13px 7px',
-            boxShadow: 'var(--shadow)',
+            boxShadow: 'var(--shadow-sm)',
             overflow: 'hidden',
           }}
         >
@@ -1003,7 +1027,7 @@ const Bubble = memo(function Bubble({ message: m, isAdmin, onDelete, onFlip, onR
 
         {failed && (
           <button
-            onClick={onRetry}
+            onClick={() => onRetry(m)}
             style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--red)', marginTop: 3, marginLeft: 'auto', fontWeight: 600, background: 'transparent', border: 0, cursor: 'pointer' }}
             title="Tap to retry"
           >
@@ -1052,12 +1076,12 @@ const Bubble = memo(function Bubble({ message: m, isAdmin, onDelete, onFlip, onR
               </a>
             )}
             {isAdmin && !internal && (
-              <button onClick={() => { setMenu(false); onFlip(); }} style={menuItem}>
+              <button onClick={() => { setMenu(false); onFlip(m); }} style={menuItem}>
                 <ArrowLeftRight size={14} /> Move to {out ? 'their' : 'our'} side
               </button>
             )}
             {isAdmin ? (
-              <button onClick={() => { setMenu(false); onDelete(); }} style={{ ...menuItem, color: 'var(--red)' }}>
+              <button onClick={() => { setMenu(false); onDelete(m.id); }} style={{ ...menuItem, color: 'var(--red)' }}>
                 <Trash2 size={14} /> Delete {internal ? 'note' : 'message'}
               </button>
             ) : (

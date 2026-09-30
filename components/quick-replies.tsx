@@ -5,8 +5,9 @@
 // Build them here; use them in any chat by typing "/" in the composer.
 // A reply's attachments (fee sheet PDF, document checklist) go out WITH it.
 // =============================================================================
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { uploadFile } from '@/lib/upload-file';
 import { Plus, Trash2, Paperclip, X, Loader2, Zap, Pencil } from 'lucide-react';
 import type { QuickReply } from '@/lib/messages';
 
@@ -22,6 +23,7 @@ export function QuickRepliesManager({ workspaceId }: { workspaceId: string }) {
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const scrollerRef = useRef<HTMLDivElement>(null);
 
   async function load() {
     const { data } = await supabase
@@ -38,14 +40,13 @@ export function QuickRepliesManager({ workspaceId }: { workspaceId: string }) {
     if (!files) return;
     setUploading(true); setError(null);
     for (const f of Array.from(files).slice(0, 5)) {
-      const fd = new FormData();
-      fd.append('file', f);
       try {
-        const res = await fetch('/api/whatsapp/upload', { method: 'POST', body: fd });
-        const json = await res.json();
-        if (json.ok) setDraft((d) => ({ ...d, attachments: [...d.attachments, json.attachment] }));
-        else setError(json.error || `Could not upload ${f.name}`);
-      } catch { setError(`Could not upload ${f.name}`); }
+        const attachment = await uploadFile(f);
+        setDraft((d) => ({ ...d, attachments: [...d.attachments, attachment] }));
+      } catch (e) {
+        // Show the real reason, never a blanket "could not upload".
+        setError(`${f.name}: ${e instanceof Error ? e.message : 'upload failed'}`);
+      }
     }
     setUploading(false);
   }
@@ -84,7 +85,7 @@ export function QuickRepliesManager({ workspaceId }: { workspaceId: string }) {
   }
 
   return (
-    <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg)' }}>
+    <div ref={scrollerRef} style={{ flex: 1, overflowY: 'auto', overscrollBehavior: 'contain', background: 'var(--bg)' }}>
       <div style={{ maxWidth: 680, margin: '0 auto', padding: '28px 20px 60px' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
           <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>Quick replies</h1>
@@ -177,7 +178,9 @@ export function QuickRepliesManager({ workspaceId }: { workspaceId: string }) {
                 {q.body}
               </p>
             </div>
-            <button onClick={() => { setDraft({ id: q.id, shortcut: q.shortcut, title: q.title, body: q.body, attachments: q.attachments || [] }); setEditing(true); window.scrollTo({ top: 0 }); }} aria-label="Edit" style={rowBtn}><Pencil size={14} /></button>
+            {/* The window never scrolls in this app — the panel does. Scrolling
+                the panel is what actually brings the edit form into view. */}
+            <button onClick={() => { setDraft({ id: q.id, shortcut: q.shortcut, title: q.title, body: q.body, attachments: q.attachments || [] }); setEditing(true); scrollerRef.current?.scrollTo({ top: 0, behavior: 'smooth' }); }} aria-label="Edit" style={rowBtn}><Pencil size={14} /></button>
             <button onClick={() => remove(q.id)} aria-label="Delete" style={{ ...rowBtn, color: 'var(--red)' }}><Trash2 size={14} /></button>
           </div>
         ))}

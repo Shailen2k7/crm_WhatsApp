@@ -13,8 +13,7 @@
 // =============================================================================
 import { useState } from 'react';
 import {
-  MessageSquare, Users, FileText, Zap, Menu, X, Star, LayoutTemplate,
-  User, Settings, ExternalLink,
+  MessageSquare, Users, FileText, Zap, Menu, X, LayoutTemplate, Settings,
 } from 'lucide-react';
 import type { RailKey } from './rail';
 
@@ -27,14 +26,12 @@ const TABS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
   { key: 'quickreplies', label: 'Replies', Icon: Zap },
 ];
 
+// Spotlight, Team and Open CRM are gone here for the same reasons as on the
+// desktop rail: Spotlight is a chip inside the chat list, the rest were unused.
 const MENU_ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare; hint: string }[] = [
-  { key: 'starred', label: 'Spotlight', Icon: Star, hint: 'Starred chats' },
   { key: 'templates', label: 'Templates', Icon: LayoutTemplate, hint: 'Approved messages' },
-  { key: 'team', label: 'Team', Icon: User, hint: 'Who is on Migrizo' },
   { key: 'settings', label: 'Settings', Icon: Settings, hint: 'Account & notifications' },
 ];
-
-const CRM_URL = 'https://crm.migrizo.com';
 
 export function MobileTabs({
   active,
@@ -108,25 +105,6 @@ export function MobileTabs({
                 </button>
               );
             })}
-
-            {/* Jump back to the main CRM, same as the rail's shortcut. */}
-            <a
-              href={CRM_URL}
-              target="_blank"
-              rel="noreferrer"
-              style={{
-                display: 'flex', alignItems: 'center', gap: 12, textDecoration: 'none',
-                padding: '13px 14px', borderRadius: 14, border: '1px solid var(--line)', background: 'var(--bg)',
-              }}
-            >
-              <span style={{ width: 38, height: 38, borderRadius: 11, display: 'grid', placeItems: 'center', flex: 'none', background: 'var(--surface-2)', color: 'var(--teal)' }}>
-                <ExternalLink size={18} />
-              </span>
-              <span>
-                <span style={{ display: 'block', fontSize: 13.5, fontWeight: 700, color: 'var(--ink)' }}>Open CRM</span>
-                <span style={{ display: 'block', fontSize: 11, color: 'var(--muted)', marginTop: 1 }}>crm.migrizo.com</span>
-              </span>
-            </a>
           </div>
         </div>
       </div>
@@ -146,7 +124,7 @@ export function MobileTabs({
       }}
     >
       {TABS.map(({ key, label, Icon }) => {
-        const on = active === key || (key === 'chat' && active === 'starred');
+        const on = active === key;
         return (
           <button
             key={key}
