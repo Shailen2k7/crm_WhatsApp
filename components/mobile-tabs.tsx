@@ -14,7 +14,7 @@
 import { useState } from 'react';
 import {
   MessageSquare, Users, FileText, Zap, Menu, X, Star, LayoutTemplate,
-  Workflow, User, Settings, ExternalLink,
+  User, Settings, ExternalLink,
 } from 'lucide-react';
 import type { RailKey } from './rail';
 
@@ -30,7 +30,6 @@ const TABS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
 const MENU_ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare; hint: string }[] = [
   { key: 'starred', label: 'Spotlight', Icon: Star, hint: 'Starred chats' },
   { key: 'templates', label: 'Templates', Icon: LayoutTemplate, hint: 'Approved messages' },
-  { key: 'automation', label: 'Automation', Icon: Workflow, hint: 'New lead & follow-ups' },
   { key: 'team', label: 'Team', Icon: User, hint: 'Who is on Migrizo' },
   { key: 'settings', label: 'Settings', Icon: Settings, hint: 'Account & notifications' },
 ];
