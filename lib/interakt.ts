@@ -193,6 +193,8 @@ export async function sendTemplate(opts: {
   languageCode?: string;
   bodyValues?: string[];
   headerValues?: string[];
+  /** Name the customer sees on a document header. */
+  fileName?: string;
   callbackData?: string;
   limits?: CallLimits;
 }): Promise<SendResult> {
@@ -208,6 +210,7 @@ export async function sendTemplate(opts: {
       name: opts.templateName,
       languageCode: opts.languageCode || 'en',
       headerValues: opts.headerValues,
+      fileName: opts.fileName,
       bodyValues: opts.bodyValues || [],
     },
   }, opts.limits);

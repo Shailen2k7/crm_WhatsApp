@@ -23,6 +23,7 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { sendText, sendTemplate, sendMedia, windowState, isConfigured } from '@/lib/interakt';
 import { toE164 } from '@/lib/phone';
 import { RELAY_BUCKET } from '@/lib/files';
+import { templateHeaderDoc } from '@/lib/template-header';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -178,6 +179,16 @@ export async function POST(req: Request) {
       return `Template “${templateName}”${vals.filter(Boolean).length ? ' · ' + vals.filter(Boolean).join(' · ') : ''}`;
     };
 
+    // A template approved with a PDF header (gtv_e1) cannot go without the
+    // file. If one is registered, send a short-lived link to it and show the
+    // PDF in the thread exactly as the customer receives it.
+    const headerDoc = await templateHeaderDoc(admin, RELAY_BUCKET, templateName);
+    let header: { headerValues?: string[]; fileName?: string } = {};
+    if (headerDoc) {
+      const { data: signed } = await admin.storage.from(RELAY_BUCKET).createSignedUrl(headerDoc.path, 3600);
+      if (signed?.signedUrl) header = { headerValues: [signed.signedUrl], fileName: headerDoc.name };
+    }
+
     const { data: msg } = await admin
       .from('relay_messages')
       .insert({
@@ -185,13 +196,17 @@ export async function POST(req: Request) {
         body: renderBody(values),
         template_name: templateName, template_language: body.templateLanguage || null,
         template_values: { bodyValues: values },
+        ...(header.headerValues && headerDoc ? {
+          media_path: headerDoc.path, media_name: headerDoc.name, media_mime: headerDoc.mime,
+          media_size: headerDoc.size, media_type: 'document',
+        } : {}),
         status: 'queued', sent_by: user.id,
       })
       .select('id').single();
     if (!msg) return NextResponse.json({ ok: false, error: 'Could not save message.' }, { status: 500 });
 
     let result = await sendTemplate({
-      phoneE164, templateName,
+      phoneE164, templateName, ...header,
       languageCode: body.templateLanguage, bodyValues: values, callbackData: msg.id,
     });
 
@@ -203,7 +218,7 @@ export async function POST(req: Request) {
       const alt = templateName === templateName.toLowerCase() ? templateName.toUpperCase() : templateName.toLowerCase();
       if (alt !== templateName) {
         const retry = await sendTemplate({
-          phoneE164, templateName: alt,
+          phoneE164, templateName: alt, ...header,
           languageCode: body.templateLanguage, bodyValues: values, callbackData: msg.id,
         });
         if (retry.ok) {
@@ -234,10 +249,18 @@ export async function POST(req: Request) {
           .eq('id', msg.id);
 
         result = await sendTemplate({
-          phoneE164, templateName,
+          phoneE164, templateName, ...header,
           languageCode: body.templateLanguage, bodyValues: values, callbackData: msg.id,
         });
       }
+    }
+
+    // Header file missing from storage: say what to do, not Interakt's jargon.
+    if (!result.ok && /media url is missing for header/i.test(result.detail || '')) {
+      result = {
+        ...result,
+        detail: `“${templateName}” needs its PDF attached, and none is set up for it yet — ask your admin to add it.`,
+      };
     }
 
     await admin.from('relay_messages').update({

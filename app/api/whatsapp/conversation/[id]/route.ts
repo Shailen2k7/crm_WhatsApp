@@ -14,6 +14,7 @@ import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { RELAY_BUCKET } from '@/lib/files';
+import { isTemplateHeaderPath } from '@/lib/template-header';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -59,7 +60,9 @@ export async function DELETE(req: Request, ctx: { params: Promise<{ id: string }
     if (!msg || msg.conversation_id !== id) {
       return NextResponse.json({ ok: false, error: 'Message not found in this conversation.' }, { status: 404 });
     }
-    if (msg.media_path) {
+    // A template's PDF (template-headers/…) is shared by every send of that
+    // template and must never be deleted from here — remove the message only.
+    if (msg.media_path && !isTemplateHeaderPath(msg.media_path)) {
       // A quick reply's attachment is sent by REFERENCE — the message row and
       // the quick reply point at the same object. Deleting it here would break
       // that quick reply for every future send ("no longer stored"), which is

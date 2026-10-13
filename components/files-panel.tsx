@@ -13,7 +13,8 @@
 // =============================================================================
 import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { FileText, Image as ImageIcon, Download, MessageSquare, Music, Film, Trash2, Zap, ChevronDown } from 'lucide-react';
+import { FileText, Image as ImageIcon, Download, MessageSquare, Music, Film, Trash2, Zap, ChevronDown, Lock } from 'lucide-react';
+import { templateOfHeaderPath } from '@/lib/template-header';
 import type { RelayMessage } from '@/lib/messages';
 import type { Contact } from '@/lib/contacts';
 
@@ -33,6 +34,8 @@ interface FileGroup {
   newest: RelayMessage;
   messages: RelayMessage[];
   usedByQuickReply: string | null;
+  /** The template this PDF belongs to — permanent, never deletable. */
+  usedByTemplate: string | null;
 }
 
 export function FilesPanel({
@@ -95,6 +98,7 @@ export function FilesPanel({
         newest: f,
         messages: [f],
         usedByQuickReply: f.media_path ? qrPaths[f.media_path] ?? null : null,
+        usedByTemplate: templateOfHeaderPath(f.media_path),
       });
     }
     return [...m.values()];
@@ -190,6 +194,11 @@ export function FilesPanel({
                     <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {f.media_name || (f.media_type === 'image' ? 'Photo' : 'Attachment')}
                     </span>
+                    {g.usedByTemplate && (
+                      <span title={`The PDF of the template ${g.usedByTemplate} — kept permanently`} style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flex: 'none', fontSize: 10.5, fontWeight: 700, color: 'var(--teal-ink)', background: 'var(--teal-bg)', borderRadius: 20, padding: '2px 7px' }}>
+                        <Lock size={10} /> {g.usedByTemplate}
+                      </span>
+                    )}
                     {g.usedByQuickReply && (
                       <span title={`Attached to the quick reply /${g.usedByQuickReply}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flex: 'none', fontSize: 10.5, fontWeight: 700, color: 'var(--teal-ink)', background: 'var(--teal-bg)', borderRadius: 20, padding: '2px 7px' }}>
                         <Zap size={10} /> /{g.usedByQuickReply}
@@ -224,7 +233,7 @@ export function FilesPanel({
                   <Download size={15} />
                 </a>
 
-                {isAdmin && (
+                {isAdmin && !g.usedByTemplate && (
                   <button
                     onClick={() => removeGroup(g)}
                     aria-label="Delete file"
