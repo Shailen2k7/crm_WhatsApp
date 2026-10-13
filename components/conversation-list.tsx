@@ -7,7 +7,7 @@ import { getStageMeta, getVisaMeta } from '@/lib/types';
 import { initialsOf, avatarTint, formatPhone, matchKey } from '@/lib/phone';
 import type { Contact } from '@/lib/contacts';
 
-type Filter = 'all' | 'unread' | 'hot' | 'cold' | 'spotlight' | 'won';
+type Filter = 'all' | 'unread' | 'hot' | 'cold' | 'spotlight' | 'won' | 'notcrm';
 
 // Chats mode is the inbox: smart tags, exactly as requested.
 const CHAT_FILTERS: { key: Filter; label: string }[] = [
@@ -16,6 +16,7 @@ const CHAT_FILTERS: { key: Filter; label: string }[] = [
   { key: 'hot', label: 'Hot' },
   { key: 'cold', label: 'Cold' },
   { key: 'spotlight', label: '★ Spotlight' },
+  { key: 'notcrm', label: 'Not in CRM' },
 ];
 // Contacts mode is the phonebook for STARTING a chat with any lead.
 const CONTACT_FILTERS: { key: Filter; label: string }[] = [
@@ -23,6 +24,7 @@ const CONTACT_FILTERS: { key: Filter; label: string }[] = [
   { key: 'hot', label: 'Hot' },
   { key: 'cold', label: 'Cold' },
   { key: 'won', label: 'Won' },
+  { key: 'notcrm', label: 'Not in CRM' },
 ];
 
 /**
@@ -101,6 +103,7 @@ export function ConversationList({
       if (filter === 'cold' && c.lead?.stage !== 'cold') return false;
       if (filter === 'won' && c.lead?.stage !== 'won') return false;
       if (filter === 'spotlight' && !c.spotlight) return false;
+      if (filter === 'notcrm' && !c.unknown) return false;
 
       if (!q) return true;
       if (qDigits && matchKey(c.phoneE164) === qDigits) return true;
@@ -111,6 +114,10 @@ export function ConversationList({
       );
     });
   }, [contacts, deferredQuery, filter]);
+
+  // How many threads have nobody in the CRM behind them — shown on the chip so
+  // the team can see at a glance whether anyone still needs adding.
+  const notInCrm = useMemo(() => contacts.reduce((n, c) => n + (c.unknown ? 1 : 0), 0), [contacts]);
 
   // ---- WINDOWED RENDERING — the actual scroll fix --------------------------
   // The list used to mount EVERY contact: with a couple of thousand leads that
@@ -179,6 +186,9 @@ export function ConversationList({
         <div style={{ display: 'flex', gap: 6, marginTop: 10, overflowX: 'auto', paddingBottom: 2, scrollbarWidth: 'none' }}>
           {FILTERS.map((f) => {
             const on = filter === f.key;
+            // "Not in CRM" wears the same amber as the row badge, so the chip
+            // and the rows it finds read as one thing.
+            const amber = f.key === 'notcrm';
             return (
               <button
                 key={f.key}
@@ -187,16 +197,38 @@ export function ConversationList({
                   padding: isMobile ? '7px 14px' : '4px 11px',
                   borderRadius: 99,
                   border: '1px solid ' + (on ? 'transparent' : 'var(--line)'),
-                  background: on ? 'var(--teal)' : 'transparent',
+                  background: on ? (amber ? 'var(--amber)' : 'var(--teal)') : 'transparent',
                   color: on ? '#fff' : 'var(--ink-2)',
                   fontSize: 12,
                   fontWeight: 600,
                   cursor: 'pointer',
                   whiteSpace: 'nowrap',
                   flex: 'none',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
                 }}
               >
                 {f.label}
+                {amber && notInCrm > 0 && (
+                  <span
+                    style={{
+                      minWidth: 17,
+                      height: 17,
+                      padding: '0 5px',
+                      borderRadius: 99,
+                      background: on ? 'rgba(255,255,255,0.25)' : 'var(--amber-bg)',
+                      color: on ? '#fff' : 'var(--amber)',
+                      fontSize: 10.5,
+                      fontWeight: 800,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    {notInCrm > 99 ? '99+' : notInCrm}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -221,6 +253,8 @@ export function ConversationList({
                 ? <>Nothing matches “{query}”.</>
                 : mode === 'chats' && filter === 'all'
                 ? 'Start one from the Contacts tab, or wait for a client to message you.'
+                : filter === 'notcrm'
+                ? 'Everyone here is already in the CRM.'
                 : 'Nothing in this filter yet.'}
             </div>
           </div>
