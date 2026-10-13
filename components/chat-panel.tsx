@@ -75,6 +75,7 @@ export function ChatPanel({
   const [menuOpen, setMenuOpen] = useState(false);
   const [qrOpen, setQrOpen] = useState(false);
   const [qrIndex, setQrIndex] = useState(0);
+  const [tplQuery, setTplQuery] = useState('');
   const [tplOpen, setTplOpen] = useState(false);
   const [, setTick] = useState(0);
 
@@ -304,6 +305,9 @@ export function ChatPanel({
       document.removeEventListener('pointerdown', onDown);
     };
   }, [tplOpen, qrOpen]);
+
+  // The template search always starts empty.
+  useEffect(() => { if (tplOpen) setTplQuery(''); }, [tplOpen]);
 
   // Switching to another chat never carries an open pop-up across with it.
   useEffect(() => { setTplOpen(false); setQrOpen(false); }, [contactKey]);
@@ -535,9 +539,33 @@ export function ChatPanel({
 
   if (!contact) return <EmptyState />;
 
+  // Templates and quick replies are two different things to WhatsApp (a
+  // template can open a closed window; a quick reply is plain text), but to
+  // the agent they are one list of "canned messages". So typing "/gtv" finds
+  // both: quick replies first, then any template whose name or wording
+  // matches. Picking a template sends it, exactly as in the template list.
+  const findTemplates = (raw: string): RelayTemplate[] => {
+    const q = raw.trim().toLowerCase();
+    if (!q) return templates;
+    const byName = templates.filter((t) => t.name.toLowerCase().includes(q));
+    const byBody = templates.filter((t) => !t.name.toLowerCase().includes(q) && (t.body || '').toLowerCase().includes(q));
+    return [...byName, ...byBody];
+  };
+  const qrQuery = draft.slice(1).toLowerCase();
   const qrMatches = qrOpen
-    ? quickReplies.filter((q) => draft.length <= 1 || q.shortcut.toLowerCase().startsWith(draft.slice(1).toLowerCase()))
+    ? quickReplies.filter((q) => !qrQuery || q.shortcut.toLowerCase().startsWith(qrQuery) || q.title.toLowerCase().includes(qrQuery))
     : [];
+  const qrTemplates = qrOpen && qrQuery ? findTemplates(qrQuery).slice(0, 8) : [];
+  type QrItem = { kind: 'qr'; q: QuickReply } | { kind: 'tpl'; t: RelayTemplate };
+  const qrItems: QrItem[] = [
+    ...qrMatches.map((q) => ({ kind: 'qr' as const, q })),
+    ...qrTemplates.map((t) => ({ kind: 'tpl' as const, t })),
+  ];
+  const pickQrItem = (it: QrItem) => {
+    if (it.kind === 'qr') applyQuickReply(it.q);
+    else { setDraft(''); setQrOpen(false); sendTemplateNow(it.t); }
+  };
+  const tplMatches = tplOpen ? findTemplates(tplQuery) : [];
 
   return (
     <div style={{ position: 'relative', flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, background: 'var(--chat)' }}>
@@ -703,41 +731,96 @@ export function ChatPanel({
         }}
       >
         {/* Quick replies popover */}
-        {qrOpen && qrMatches.length > 0 && (
-          <div ref={qrRef} className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 280, overflowY: 'auto', overscrollBehavior: 'contain', zIndex: 20 }}>
-            <div style={{ padding: '9px 14px 5px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>Quick replies · ↑↓ then ⏎</div>
+        {qrOpen && (qrItems.length > 0 || templates.length > 0) && (
+          <div ref={qrRef} className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 340, overflowY: 'auto', overscrollBehavior: 'contain', zIndex: 20 }}>
+            {qrMatches.length > 0 && (
+              <div style={{ padding: '9px 14px 5px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>Quick replies · ↑↓ then ⏎</div>
+            )}
             {/* Hover styling is pure CSS. The old onMouseEnter wrote React
                 state for every row the cursor crossed — and scrolling moves
                 rows UNDER the cursor, so each wheel tick re-rendered this
                 whole panel several times over. That was the freeze. */}
-            {qrMatches.map((q, qi) => (
-              <button key={q.id} onClick={() => applyQuickReply(q)} className="qr-item" style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 14px', border: 0, borderTop: '1px solid var(--line-2)', background: qi === qrIndex ? 'var(--surface-3)' : 'transparent', cursor: 'pointer' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                  <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--teal-ink)' }}>/{q.shortcut}</span>
-                  <span style={{ fontSize: 12.5, fontWeight: 600 }}>{q.title}</span>
-                  {q.attachments?.length > 0 && (
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontSize: 10.5, color: 'var(--muted)' }}>
-                      <Paperclip size={11} /> {q.attachments.length}
-                    </span>
+            {qrItems.map((it, qi) => {
+              const firstTpl = it.kind === 'tpl' && (qi === 0 || qrItems[qi - 1].kind === 'qr');
+              return (
+                <div key={it.kind === 'qr' ? it.q.id : 'tpl-' + it.t.id}>
+                  {firstTpl && (
+                    <div style={{ padding: '10px 14px 5px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)', borderTop: '1px solid var(--line-2)' }}>
+                      Templates · tap to send
+                    </div>
                   )}
+                  <button onClick={() => pickQrItem(it)} disabled={it.kind === 'tpl' && !!tplSending} className="qr-item" style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 14px', border: 0, borderTop: '1px solid var(--line-2)', background: qi === qrIndex ? 'var(--surface-3)' : 'transparent', cursor: 'pointer' }}>
+                    {it.kind === 'qr' ? (
+                      <>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                          <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--teal-ink)' }}>/{it.q.shortcut}</span>
+                          <span style={{ fontSize: 12.5, fontWeight: 600 }}>{it.q.title}</span>
+                          {it.q.attachments?.length > 0 && (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontSize: 10.5, color: 'var(--muted)' }}>
+                              <Paperclip size={11} /> {it.q.attachments.length}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{it.q.body}</div>
+                      </>
+                    ) : (
+                      <>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                          <LayoutTemplate size={12} style={{ color: 'var(--teal-ink)', flex: 'none' }} />
+                          <span style={{ fontSize: 12.5, fontWeight: 700 }}>{it.t.name}</span>
+                          <span style={{ fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 99, background: 'var(--teal-bg)', color: 'var(--teal-ink)' }}>template</span>
+                          {tplSending === it.t.id && <Loader2 size={13} style={{ animation: 'spin .8s linear infinite', color: 'var(--teal)' }} />}
+                        </div>
+                        <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {(it.t.body || '').replace(/\{\{\s*1\s*\}\}/g, autoValues()[0])}
+                        </div>
+                      </>
+                    )}
+                  </button>
                 </div>
-                <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{q.body}</div>
+              );
+            })}
+            {!qrQuery && templates.length > 0 && (
+              <button onClick={() => { setDraft(''); setQrOpen(false); setTplOpen(true); }} className="qr-item" style={{ display: 'flex', alignItems: 'center', gap: 7, width: '100%', textAlign: 'left', padding: '10px 14px', border: 0, borderTop: '1px solid var(--line-2)', background: 'transparent', cursor: 'pointer', fontSize: 12.5, fontWeight: 600, color: 'var(--teal-ink)' }}>
+                <LayoutTemplate size={13} /> All templates ({templates.length}) — or type to search them here
               </button>
-            ))}
+            )}
           </div>
         )}
 
         {tplOpen && (
-          <div ref={tplRef} className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 320, overflowY: 'auto', overscrollBehavior: 'contain', zIndex: 21 }}>
-            <div style={{ padding: '10px 14px 6px', fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>
-              Templates — tap to send{!win.open ? ' (works with the window closed)' : ''}
+          <div ref={tplRef} className="animate-pop-in" style={{ position: 'absolute', left: 12, right: 12, bottom: '100%', marginBottom: 6, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 13, boxShadow: 'var(--shadow)', maxHeight: 400, overflowY: 'auto', overscrollBehavior: 'contain', zIndex: 21 }}>
+            <div style={{ position: 'sticky', top: 0, zIndex: 1, background: 'var(--surface)', padding: '10px 12px 8px', borderBottom: '1px solid var(--line-2)' }}>
+              <div style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)', padding: '0 2px 7px' }}>
+                Templates — tap to send{!win.open ? ' (works with the window closed)' : ''}
+              </div>
+              {templates.length > 0 && (
+                <div style={{ position: 'relative' }}>
+                  <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--muted)' }} />
+                  <input
+                    autoFocus
+                    value={tplQuery}
+                    onChange={(e) => setTplQuery(e.target.value)}
+                    placeholder={`Search ${templates.length} templates — name or wording`}
+                    style={{ width: '100%', padding: '8px 28px 8px 31px', borderRadius: 9, border: '1px solid var(--line)', background: 'var(--surface-2)', outline: 'none', fontSize: 13 }}
+                  />
+                  {tplQuery && (
+                    <button onClick={() => setTplQuery('')} aria-label="Clear search" style={{ position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)', background: 'transparent', border: 0, cursor: 'pointer', color: 'var(--muted)', display: 'flex', padding: 3 }}>
+                      <X size={13} />
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
+            {templates.length > 0 && tplMatches.length === 0 && (
+              <div style={{ padding: '14px 14px 16px', fontSize: 12.5, color: 'var(--muted)' }}>No template matches “{tplQuery}”.</div>
+            )}
             {templates.length === 0 && (
               <div style={{ padding: '12px 14px 14px', fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.55 }}>
                 None registered yet. Add your approved templates under <strong>Templates</strong> in the sidebar.
               </div>
             )}
-            {templates.map((t) => (
+            {tplMatches.map((t) => (
               <button
                 key={t.id}
                 onClick={() => sendTemplateNow(t)}
@@ -751,7 +834,7 @@ export function ChatPanel({
                   </div>
                   <div style={{ fontSize: 11.8, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {t.body
-                      ? t.body.replace(/\{\{\s*1\s*\}\}/g, firstName)
+                      ? t.body.replace(/\{\{\s*1\s*\}\}/g, autoValues()[0])
                       : `Sends the approved wording to ${firstName}`}
                   </div>
                 </div>
@@ -808,11 +891,11 @@ export function ChatPanel({
             onKeyDown={(e) => {
               // While the "/" popover is open the arrows walk it and Enter
               // picks — exactly how a command palette behaves.
-              if (qrOpen && qrMatches.length > 0) {
-                if (e.key === 'ArrowDown') { e.preventDefault(); setQrIndex((i) => (i + 1) % qrMatches.length); return; }
-                if (e.key === 'ArrowUp') { e.preventDefault(); setQrIndex((i) => (i - 1 + qrMatches.length) % qrMatches.length); return; }
-                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); applyQuickReply(qrMatches[Math.min(qrIndex, qrMatches.length - 1)]); return; }
-                if (e.key === 'Tab') { e.preventDefault(); applyQuickReply(qrMatches[Math.min(qrIndex, qrMatches.length - 1)]); return; }
+              if (qrOpen && qrItems.length > 0) {
+                if (e.key === 'ArrowDown') { e.preventDefault(); setQrIndex((i) => (i + 1) % qrItems.length); return; }
+                if (e.key === 'ArrowUp') { e.preventDefault(); setQrIndex((i) => (i - 1 + qrItems.length) % qrItems.length); return; }
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); pickQrItem(qrItems[Math.min(qrIndex, qrItems.length - 1)]); return; }
+                if (e.key === 'Tab') { e.preventDefault(); pickQrItem(qrItems[Math.min(qrIndex, qrItems.length - 1)]); return; }
               }
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
               if (e.key === 'Escape') { setQrOpen(false); setTplOpen(false); }
@@ -846,8 +929,14 @@ export function ChatPanel({
             </button>
             <button
               ref={qrBtnRef}
-              onClick={() => { setDraft((d) => (d.startsWith('/') ? d : '/')); taRef.current?.focus(); }}
-              title="Quick replies ( / )"
+              onClick={() => {
+                // Window closed: a quick reply is plain text and WhatsApp would
+                // refuse it, so this opens the templates — the only thing that
+                // can go — instead of filling a box that cannot be sent.
+                if (!win.open && !internal) { setTplOpen(true); return; }
+                setDraft((d) => (d.startsWith('/') ? d : '/')); taRef.current?.focus();
+              }}
+              title={!win.open && !internal ? 'Window closed — opens templates' : 'Quick replies ( / )'}
               aria-label="Quick replies"
               style={composerBtn}
             >
