@@ -10,7 +10,7 @@ import {
   CALL_TIMEOUT_MS, MAX_SENDS_PER_RUN, createAutomationAdminClient, createRunContext, forEachLimited, isTimeoutError,
   type RunContext,
 } from '@/lib/automation/run-context';
-import { acquireTickLock, releaseTickLock } from '@/lib/automation/lock';
+import { acquireTickLock, releaseTickLock, NURTURE_LOCK_KEY } from '@/lib/automation/lock';
 import {
   planFirstMessages, RECENT_WINDOW_HOURS, MAX_ATTEMPTS,
   type HistoryRow, type Job, type LeadRow,
@@ -58,6 +58,7 @@ const IST = 'Asia/Kolkata';
 const CHASE_START_HOUR = 10;
 const CHASE_END_HOUR = 19;      // exclusive: last send window is 18:xx
 const CHASE_CONCURRENCY = 3;
+const NURTURE_CONCURRENCY = 5;
 const SEND_CONCURRENCY = 4;
 /** Marks a send whose outcome is unknown because the provider did not answer in time. */
 const TIMEOUT_NOTE = 'timeout — delivery unknown';
@@ -127,6 +128,19 @@ export async function POST(req: NextRequest) {
   }
 
   const dryRun = req.nextUrl.searchParams.get('dry') === '1';
+
+  // ---- THE NURTURE HAS ITS OWN RUN ------------------------------------------
+  // On 22 Oct 2026 the nurture was switched on and sent nothing: run last in
+  // the shared tick, it never got a turn — on Netlify (US) every round trip to
+  // the database (Singapore) costs 3–4× what it does locally, and T1 + the
+  // chase used up the budget first. So the nurture is its own scheduled run
+  // (netlify/functions/automation-nurture.mts → ?pass=nurture), with its own
+  // lock and its own full budget. The 20-hour cross-engine lock is read fresh
+  // from the database before every send, so the two runs still never double
+  // a person.
+  if (req.nextUrl.searchParams.get('pass') === 'nurture') {
+    return runNurturePass({ dryRun, workspaceId });
+  }
 
   const ctx = createRunContext();
   const admin = createAutomationAdminClient(ctx);
@@ -323,14 +337,7 @@ export async function POST(req: NextRequest) {
       if (chase) report.push(chase);
     }
 
-    // =========================================================================
-    // THE HOT & SPOTLIGHT NURTURE (HS1 → HS8) — last, with whatever remains:
-    // a fresh lead's first message and a live chase beat a nurture nudge.
-    // =========================================================================
-    if (ctx.hasTime()) {
-      const nurture = await runNurture(admin, lockAdmin, ctx, { dryRun, workspaceId, suppressed });
-      if (nurture) report.push(nurture);
-    }
+    // The Hot & Spotlight nurture runs separately — see ?pass=nurture above.
 
     return NextResponse.json({
       ok: true, dryRun,
@@ -793,10 +800,19 @@ async function runNurture(
   }
   for (const st of plan.settles) if (!st.reason.startsWith('series complete')) skipped.push(`${st.phoneE164} ${st.key}: ${st.reason}`);
 
-  // ---- the cross-engine lock: nobody gets two automated messages in 20h -----
+  // ---- the cross-engine lock and today's count, read side by side -----------
   let jobs = plan.jobs;
+  const [recent, sentTodayRes] = jobs.length
+    ? await Promise.all([
+      recentlyMessaged(admin, rule.ws, now),
+      admin.from('relay_automation_sent')
+        .select('id', { count: 'exact', head: true })
+        .eq('workspace_id', rule.ws).in('automation_key', NURTURE_KEYS).eq('ok', true)
+        .gte('sent_at', new Date(`${istDate()}T00:00:00+05:30`).toISOString()),
+    ])
+    : [{ phones: new Set<string>(), leads: new Set<string>() }, { count: 0 }];
   {
-    const recent = await recentlyMessaged(admin, rule.ws, now);
+    // Nobody gets two automated messages in 20 hours, from any engine.
     const held = jobs.filter((j) => recent.phones.has(j.phoneE164) || recent.leads.has(j.leadId));
     if (held.length) {
       for (const j of held) skipped.push(`${j.name || j.phoneE164} ${j.key}: held — got an automated message in the last 20h`);
@@ -806,10 +822,7 @@ async function runNurture(
 
   // ---- one cap for the whole engine, counted across all eight steps ----------
   if (rule.dailyCap > 0 && jobs.length) {
-    const { count } = await admin.from('relay_automation_sent')
-      .select('id', { count: 'exact', head: true })
-      .eq('workspace_id', rule.ws).in('automation_key', NURTURE_KEYS).eq('ok', true)
-      .gte('sent_at', new Date(`${istDate()}T00:00:00+05:30`).toISOString());
+    const count = (sentTodayRes as { count: number | null }).count;
     const left = Math.max(0, rule.dailyCap - (count ?? 0));
     if (left < jobs.length) skipped.push(`nurture: daily cap ${rule.dailyCap} — ${jobs.length - left} wait for tomorrow`);
     jobs = jobs.slice(0, left);                      // Spotlight already sorted first
@@ -822,7 +835,8 @@ async function runNurture(
     return out;
   }
 
-  await forEachLimited(jobs, CHASE_CONCURRENCY, () => ctx.hasTime() && ctx.sendsLeft() > 0, async (job) => {
+  // The nurture has its own run, so it can afford more sends in flight at once.
+  await forEachLimited(jobs, NURTURE_CONCURRENCY, () => ctx.hasTime() && ctx.sendsLeft() > 0, async (job) => {
     const stepRule = { key: job.key, template_name: templateOfStep(job.key), template_language: 'en' };
     const outcome = await sendChaseMessage(admin, durable, ctx, rule.ws, stepRule, job);
     if (outcome === 'sent') out.sent = (out.sent as number) + 1;
@@ -831,4 +845,49 @@ async function runNurture(
   const left = jobs.length - (out.sent as number);
   if (left > 0 && !ctx.hasTime()) out.note = `${left} continue on the next run.`;
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// ?pass=nurture — the nurture alone, with its own lock and its own budget.
+// ---------------------------------------------------------------------------
+async function runNurturePass(opts: { dryRun: boolean; workspaceId: string | null }): Promise<NextResponse> {
+  const ctx = createRunContext();
+  const admin = createAutomationAdminClient(ctx);
+  const lockAdmin = createAutomationAdminClient();
+  if (!admin || !lockAdmin) {
+    ctx.dispose();
+    return NextResponse.json({ ok: false, error: 'Server is not configured.' }, { status: 500 });
+  }
+  let lockToken: string | null = null;
+  try {
+    // Lock and opt-outs side by side: every round trip to Singapore counts.
+    let q = admin.from('relay_suppressions').select('workspace_id, phone_e164');
+    if (opts.workspaceId) q = q.eq('workspace_id', opts.workspaceId);
+    const [lock, { data: supp }] = await Promise.all([
+      opts.dryRun ? Promise.resolve({ acquired: true as const, token: '' }) : acquireTickLock(admin, NURTURE_LOCK_KEY),
+      q,
+    ]);
+    if (!lock.acquired) return NextResponse.json({ ok: true, pass: 'nurture', skipped: 'locked', reason: lock.reason, ms: ctx.elapsedMs() });
+    lockToken = lock.token || null;
+    const report = await runNurture(admin, lockAdmin, ctx, {
+      dryRun: opts.dryRun, workspaceId: opts.workspaceId,
+      suppressed: (supp || []) as { workspace_id: string; phone_e164: string }[],
+    });
+    return NextResponse.json({
+      ok: true, pass: 'nurture', dryRun: opts.dryRun,
+      ms: ctx.elapsedMs(), sendsUsed: MAX_SENDS_PER_RUN - ctx.sendsLeft(),
+      report: report ? [report] : [],
+    });
+  } catch (e) {
+    const timedOut = isTimeoutError(e);
+    console.error('[nurture] run failed', e);
+    return NextResponse.json({
+      ok: false, pass: 'nurture',
+      error: timedOut ? `A call exceeded its ${CALL_TIMEOUT_MS / 1000}s limit; the next run continues.` : (e instanceof Error ? e.message : String(e)),
+      ms: ctx.elapsedMs(),
+    }, { status: timedOut ? 200 : 500 });
+  } finally {
+    ctx.dispose();
+    if (lockToken) await releaseTickLock(lockAdmin, lockToken, NURTURE_LOCK_KEY).catch(() => {});
+  }
 }

@@ -21,6 +21,11 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 const LOCK_KEY = 'automation_tick_lock';
+/**
+ * Each engine has its own lock, so the nurture run never waits for — or is
+ * skipped because of — the main T1/T2–T4 run, and vice versa.
+ */
+export const NURTURE_LOCK_KEY = 'automation_nurture_lock';
 const EPOCH = '1970-01-01T00:00:00.000Z';
 
 /** Longer than any run can live (the platform kills a function by ~27s). */
@@ -28,26 +33,26 @@ export const LEASE_MS = 60_000;
 
 export type LockResult = { acquired: true; token: string } | { acquired: false; reason: string };
 
-async function tryTake(admin: SupabaseClient): Promise<{ token: string | null; error: string | null }> {
+async function tryTake(admin: SupabaseClient, lockKey: string): Promise<{ token: string | null; error: string | null }> {
   const now = new Date();
   const token = new Date(now.getTime() + LEASE_MS).toISOString();
   const { data, error } = await admin
     .from('relay_settings')
     .update({ value: token, updated_at: now.toISOString() })
-    .eq('key', LOCK_KEY)
+    .eq('key', lockKey)
     .lt('value', now.toISOString())
     .select('key');
   if (error) return { token: null, error: error.message };
   return { token: data && data.length > 0 ? token : null, error: null };
 }
 
-export async function acquireTickLock(admin: SupabaseClient): Promise<LockResult> {
-  const first = await tryTake(admin);
+export async function acquireTickLock(admin: SupabaseClient, lockKey: string = LOCK_KEY): Promise<LockResult> {
+  const first = await tryTake(admin, lockKey);
   if (first.error) return { acquired: false, reason: `lock error: ${first.error}` };
   if (first.token) return { acquired: true, token: first.token };
 
   // Not taken: either another run holds it, or the row has never existed.
-  const { data: row } = await admin.from('relay_settings').select('value').eq('key', LOCK_KEY).limit(1);
+  const { data: row } = await admin.from('relay_settings').select('value').eq('key', lockKey).limit(1);
   if (row && row.length > 0) {
     return { acquired: false, reason: `another run is in progress (lease until ${row[0].value})` };
   }
@@ -58,18 +63,18 @@ export async function acquireTickLock(admin: SupabaseClient): Promise<LockResult
   if (!ws?.id) return { acquired: false, reason: 'no workspace to hold the lock row' };
   await admin
     .from('relay_settings')
-    .upsert({ workspace_id: ws.id, key: LOCK_KEY, value: EPOCH }, { onConflict: 'workspace_id,key', ignoreDuplicates: true });
+    .upsert({ workspace_id: ws.id, key: lockKey, value: EPOCH }, { onConflict: 'workspace_id,key', ignoreDuplicates: true });
 
-  const second = await tryTake(admin);
+  const second = await tryTake(admin, lockKey);
   if (second.token) return { acquired: true, token: second.token };
   return { acquired: false, reason: second.error ? `lock error: ${second.error}` : 'another run took the lock first' };
 }
 
 /** Releases only OUR lease: a run that overran and lost it cannot free a newer run's. */
-export async function releaseTickLock(admin: SupabaseClient, token: string): Promise<void> {
+export async function releaseTickLock(admin: SupabaseClient, token: string, lockKey: string = LOCK_KEY): Promise<void> {
   await admin
     .from('relay_settings')
     .update({ value: EPOCH, updated_at: new Date().toISOString() })
-    .eq('key', LOCK_KEY)
+    .eq('key', lockKey)
     .eq('value', token);
 }

@@ -1,5 +1,5 @@
 // =============================================================================
-// NETLIFY SCHEDULED FUNCTION — sends T1 to new leads, every 5 minutes.
+// NETLIFY SCHEDULED FUNCTION — T1 and the T2→T4 chase, every 5 minutes.
 // -----------------------------------------------------------------------------
 // The ONLY automation in the app (since 1 Oct 2026): the first message to each
 // fresh lead in the CRM. No follow-ups, no meeting messages, no campaigns —
@@ -34,7 +34,10 @@ export default async (): Promise<Response> => {
     let summary = text.slice(0, 400);
     try {
       const j = JSON.parse(text);
-      summary = JSON.stringify({ ok: j.ok, ms: j.ms, sendsUsed: j.sendsUsed, note: j.note, skipped: j.skipped, error: j.error });
+      // Per engine: what it sent, what was due, and why it stopped — so a run
+      // that quietly sends nothing can be read straight off the log.
+      const passes = (j.report || []).map((r: { key?: string; sent?: number; due?: number; note?: string }) => ({ k: r.key, sent: r.sent, due: r.due, note: r.note }));
+      summary = JSON.stringify({ ok: j.ok, ms: j.ms, sendsUsed: j.sendsUsed, note: j.note, skipped: j.skipped, error: j.error, passes });
     } catch { /* not JSON: keep the raw start of the body */ }
 
     console.log(`[automation-tick] HTTP ${res.status} in ${Date.now() - started}ms ${summary}`);
