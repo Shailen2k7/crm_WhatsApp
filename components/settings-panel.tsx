@@ -5,6 +5,7 @@ import { createClient } from '@/lib/supabase/client';
 import { LogOut, Moon, Sun, RefreshCw } from 'lucide-react';
 import type { RelayUser, Workspace } from '@/lib/types';
 import { NotificationPanel } from './notification-panel';
+import { AutomationSwitches } from './automation-switches';
 
 /**
  * Phase 1 settings double as a diagnostics page: whether the shared database is
@@ -82,6 +83,8 @@ export function SettingsPanel({
       <div style={{ maxWidth: 620, margin: '0 auto', padding: '32px 24px 60px' }}>
         <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 4px' }}>Settings</h1>
         <p style={{ fontSize: 13, color: 'var(--muted)', margin: '0 0 26px' }}>Migrizo WhatsApp</p>
+
+        <AutomationSwitches />
 
         <Card title="Connection">
           <Row label="Database" value={<Status ok={true} text="Connected" />} />

@@ -15,6 +15,11 @@ import {
   planFirstMessages, RECENT_WINDOW_HOURS, MAX_ATTEMPTS,
   type HistoryRow, type Job, type LeadRow,
 } from '@/lib/automation/first-message';
+import {
+  planChase, CHASE_KEYS, T1R_KEY, CHASE_HORIZON_DAYS, CHASE_MAX_ATTEMPTS,
+  type AnyChaseKey, type ChaseJob, type PersonFacts, type T1Done, type ChaseHistRow,
+} from '@/lib/automation/follow-up';
+import { ecosystemStatesByConv } from '@/lib/automation/ecosystem';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -47,6 +52,10 @@ export const dynamic = 'force-dynamic';
 // =============================================================================
 
 const IST = 'Asia/Kolkata';
+/** The chase sends only inside these IST hours (Shailen, 17 Oct 2026). */
+const CHASE_START_HOUR = 10;
+const CHASE_END_HOUR = 19;      // exclusive: last send window is 18:xx
+const CHASE_CONCURRENCY = 3;
 const SEND_CONCURRENCY = 4;
 /** Marks a send whose outcome is unknown because the provider did not answer in time. */
 const TIMEOUT_NOTE = 'timeout — delivery unknown';
@@ -57,6 +66,9 @@ type Admin = SupabaseClient;
 
 function istDate(d = new Date()): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: IST }).format(d); // YYYY-MM-DD
+}
+function istHour(d = new Date()): number {
+  return Number(new Intl.DateTimeFormat('en-GB', { timeZone: IST, hour: 'numeric', hour12: false }).format(d)) % 24;
 }
 function firstNameOf(fullName: string | null | undefined): string {
   const n = (fullName || '').trim().split(/\s+/)[0];
@@ -264,6 +276,16 @@ export async function POST(req: NextRequest) {
       if (left > 0 && !ctx.hasTime()) out.note = `${left} continue on the next run.`;
     }
 
+    // =========================================================================
+    // THE NO-REPLY CHASE (T2 → T3 → T4) — runs after T1, with whatever time is
+    // left. T1 always goes first: a fresh lead's first message is never starved
+    // by the backlog of follow-ups (the exact failure of the old engine).
+    // =========================================================================
+    if (ctx.hasTime()) {
+      const chase = await runChase(admin, lockAdmin, ctx, { dryRun, workspaceId, suppressed });
+      if (chase) report.push(chase);
+    }
+
     return NextResponse.json({
       ok: true, dryRun,
       ms: ctx.elapsedMs(), sendsUsed: MAX_SENDS_PER_RUN - ctx.sendsLeft(),
@@ -461,4 +483,282 @@ async function sendQuickReply(
     allOk &&= r.ok;
   }
   return { ok: allOk, timedOut: !allOk && anyTimeout };
+}
+
+// =============================================================================
+// THE CHASE PASS. Reads everything in a few batched round trips, asks the pure
+// planner who is due, records the people who are out for good, and sends.
+// =============================================================================
+async function runChase(
+  admin: Admin, durable: Admin, ctx: RunContext,
+  opts: { dryRun: boolean; workspaceId: string | null; suppressed: { workspace_id: string; phone_e164: string }[] },
+): Promise<Record<string, unknown> | null> {
+  const { dryRun, workspaceId } = opts;
+  const now = Date.now();
+
+  // ---- the rules (one row per step). Off = inert; a dry run still reads them
+  // so the trial can show the plan before anything is switched on.
+  let q = admin.from('relay_automations').select('*').in('key', [...CHASE_KEYS, T1R_KEY]);
+  if (workspaceId) q = q.eq('workspace_id', workspaceId);
+  const { data: ruleRows, error: ruleErr } = await q;
+  if (ruleErr) throw new Error(`chase rules: ${ruleErr.message}`);
+  const rules = (ruleRows || []) as Record<string, any>[];              // eslint-disable-line @typescript-eslint/no-explicit-any
+  if (!rules.length) return null;
+
+  const ws = rules[0].workspace_id as string;
+  const out: Record<string, unknown> = { workspace: ws, key: 'no_reply_chase', sent: 0, skipped: [] as string[] };
+  const skipped = out.skipped as string[];
+
+  const enabledKeys = new Set<string>(rules.filter((r) => r.enabled).map((r) => r.key as string));
+  if (!enabledKeys.size && !dryRun) { out.note = 'All chase steps are switched off.'; return out; }
+  const ruleByKey = new Map(rules.map((r) => [r.key as AnyChaseKey, r]));
+  if (dryRun) for (const r of rules) enabledKeys.add(r.key as string);
+
+  // The chase anchors at the EARLIEST activation among its steps.
+  const activatedAtMs = Math.min(...rules.map((r) => (r.activated_at ? new Date(r.activated_at).getTime() : now)));
+
+  // ---- sending hours: outside them the whole pass waits (a dry run reports on).
+  const hour = istHour();
+  const inHours = hour >= CHASE_START_HOUR && hour < CHASE_END_HOUR;
+  if (!inHours && !dryRun) { out.note = `Outside sending hours (${CHASE_START_HOUR}:00–${CHASE_END_HOUR}:00 IST) — follow-ups wait.`; return out; }
+  if (!inHours && dryRun) out.hoursNote = 'outside sending hours — live runs would wait';
+
+  // ---- entry tickets: successful T1s, plus the hand-picked backfill ---------
+  const sinceIso = new Date(now - CHASE_HORIZON_DAYS * 86_400_000).toISOString();
+  const { data: bfRow } = await admin.from('relay_settings')
+    .select('value').eq('workspace_id', ws).eq('key', 'no_reply_chase_backfill').maybeSingle();
+  // relay_settings.value is a TEXT column: the list arrives as a JSON string.
+  let backfillPhones = new Set<string>();
+  try {
+    const parsed = typeof bfRow?.value === 'string' ? JSON.parse(bfRow.value) : bfRow?.value;
+    if (Array.isArray(parsed)) backfillPhones = new Set(parsed.filter((x): x is string => typeof x === 'string'));
+  } catch { /* unreadable list = empty list; the chase then covers new leads only */ }
+
+  const t1Cols = 'lead_id, phone_e164, sent_at, ok';
+  const [recentT1, ...bfParts] = await Promise.all([
+    admin.from('relay_automation_sent').select(t1Cols)
+      .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', true)
+      .gte('sent_at', sinceIso).limit(2000),
+    ...chunk([...backfillPhones], 100).map((ps) => admin.from('relay_automation_sent').select(t1Cols)
+      .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', true).in('phone_e164', ps)),
+  ]);
+  if (recentT1.error) throw new Error(`chase t1: ${recentT1.error.message}`);
+  const t1Rows = new Map<string, T1Done>();
+  for (const part of [recentT1, ...bfParts]) {
+    for (const r of (part.data || []) as { lead_id: string | null; phone_e164: string; sent_at: string }[]) {
+      if (!t1Rows.has(r.phone_e164)) t1Rows.set(r.phone_e164, { leadId: r.lead_id, phoneE164: r.phone_e164, sentAtMs: new Date(r.sent_at).getTime() });
+    }
+  }
+  if (!t1Rows.size) { out.note = 'Nobody in the chase window.'; return out; }
+
+  // ---- every chase row ever written (small; one person is at most 3 rows) ---
+  const { data: histData, error: histErr } = await admin.from('relay_automation_sent')
+    .select('id, automation_key, lead_id, phone_e164, ok, attempts, sent_at, error')
+    .eq('workspace_id', ws).in('automation_key', [...CHASE_KEYS, T1R_KEY]).limit(5000);
+  if (histErr) throw new Error(`chase history: ${histErr.message}`);
+  const history = (histData || []) as ChaseHistRow[];
+
+  // ---- the facts, batched ---------------------------------------------------
+  const phones = [...t1Rows.keys()];
+  const convs: { id: string; phone_e164: string; last_inbound_at: string | null; lead_id: string | null }[] = [];
+  for (const ps of chunk(phones, 100)) {
+    const { data, error } = await admin.from('relay_conversations')
+      .select('id, phone_e164, last_inbound_at, lead_id').eq('workspace_id', ws).in('phone_e164', ps);
+    if (error) throw new Error(`chase convs: ${error.message}`);
+    convs.push(...((data || []) as typeof convs));
+  }
+  const convByPhone = new Map(convs.map((c) => [c.phone_e164, c]));
+  const convIds = convs.map((c) => c.id);
+  const phoneByConv = new Map(convs.map((c) => [c.id, c.phone_e164]));
+
+  // Team (human) outbound since activation, and failed automated sends — both
+  // in the same chunked sweep over the conversations.
+  const lastTeamOut = new Map<string, number>();
+  const autoFails = new Map<string, { atMs: number; code: string | null }[]>();
+  const activatedIso = new Date(activatedAtMs).toISOString();
+  for (const ids of chunk(convIds, 100)) {
+    const [team, fails] = await Promise.all([
+      admin.from('relay_messages').select('conversation_id, created_at')
+        .in('conversation_id', ids).eq('direction', 'out').eq('is_internal', false)
+        .not('sent_by', 'is', null).neq('status', 'failed').gte('created_at', activatedIso).limit(2000),
+      admin.from('relay_messages').select('conversation_id, created_at, error_code')
+        .in('conversation_id', ids).eq('direction', 'out').is('sent_by', null)
+        .eq('status', 'failed').limit(2000),
+    ]);
+    if (team.error) throw new Error(`chase team: ${team.error.message}`);
+    if (fails.error) throw new Error(`chase fails: ${fails.error.message}`);
+    for (const m of (team.data || []) as { conversation_id: string; created_at: string }[]) {
+      const p = phoneByConv.get(m.conversation_id); if (!p) continue;
+      lastTeamOut.set(p, Math.max(lastTeamOut.get(p) ?? 0, new Date(m.created_at).getTime()));
+    }
+    for (const m of (fails.data || []) as { conversation_id: string; created_at: string; error_code: string | null }[]) {
+      const p = phoneByConv.get(m.conversation_id); if (!p) continue;
+      if (!autoFails.has(p)) autoFails.set(p, []);
+      autoFails.get(p)!.push({ atMs: new Date(m.created_at).getTime(), code: m.error_code });
+    }
+  }
+
+  const eco = await ecosystemStatesByConv(admin, convIds, now);
+
+  const leadIds = [...t1Rows.values()].map((t) => t.leadId).filter(Boolean) as string[];
+  const leadInfo = new Map<string, { full_name: string | null; visa_type: string | null; stage: string | null }>();
+  for (const ids of chunk(leadIds, 100)) {
+    const { data, error } = await admin.from('leads').select('id, full_name, visa_type, stage').in('id', ids);
+    if (error) throw new Error(`chase leads: ${error.message}`);
+    for (const l of (data || []) as { id: string; full_name: string | null; visa_type: string | null; stage: string | null }[]) {
+      leadInfo.set(l.id, l);
+    }
+  }
+
+  const suppressedSet = new Set(opts.suppressed.filter((x) => x.workspace_id === ws).map((x) => x.phone_e164));
+  const facts = new Map<string, PersonFacts>();
+  for (const t1 of t1Rows.values()) {
+    const conv = convByPhone.get(t1.phoneE164) ?? null;
+    const lead = t1.leadId ? leadInfo.get(t1.leadId) ?? null : null;
+    facts.set(t1.phoneE164, {
+      conversationId: conv?.id ?? null,
+      lastInboundMs: conv?.last_inbound_at ? new Date(conv.last_inbound_at).getTime() : null,
+      lastTeamOutMs: lastTeamOut.get(t1.phoneE164) ?? null,
+      failTimes: autoFails.get(t1.phoneE164) || [],
+      stage: lead?.stage ?? null,
+      name: lead?.full_name ?? null,
+      visaType: lead?.visa_type ?? null,
+      suppressed: suppressedSet.has(t1.phoneE164),
+      ecosystem: conv ? (eco.get(conv.id) ?? null) : null,
+    });
+  }
+
+  // ---- the decision -----------------------------------------------------------
+  const plan = planChase({
+    now, activatedAtMs, t1Done: [...t1Rows.values()], history, facts, backfillPhones, enabledKeys,
+  });
+  skipped.push(...plan.skipped);
+
+  // People who are out for good: say it once, then never re-examine them.
+  if (plan.settles.length && !dryRun) {
+    await admin.from('relay_automation_sent').upsert(
+      plan.settles.map((st) => ({
+        workspace_id: ws, automation_key: st.key, lead_id: st.leadId, phone_e164: st.phoneE164,
+        method: 'skipped', detail: null, ok: false, error: st.reason, attempts: CHASE_MAX_ATTEMPTS,
+      })),
+      { onConflict: 'workspace_id,automation_key,phone_e164' },
+    );
+  }
+  for (const st of plan.settles) skipped.push(`${st.phoneE164} ${st.key}: ${st.reason}`);
+
+  // ---- per-step daily caps ------------------------------------------------------
+  let jobs = plan.jobs;
+  const byKey = new Map<AnyChaseKey, ChaseJob[]>();
+  for (const j of jobs) { if (!byKey.has(j.key)) byKey.set(j.key, []); byKey.get(j.key)!.push(j); }
+  const allowed: ChaseJob[] = [];
+  for (const [key, list] of byKey) {
+    const cap = Number(ruleByKey.get(key)?.daily_cap) || 0;
+    if (cap <= 0) { allowed.push(...list); continue; }
+    const { count } = await admin.from('relay_automation_sent')
+      .select('id', { count: 'exact', head: true })
+      .eq('workspace_id', ws).eq('automation_key', key).eq('ok', true)
+      .gte('sent_at', new Date(`${istDate()}T00:00:00+05:30`).toISOString());
+    const left = Math.max(0, cap - (count ?? 0));
+    if (left < list.length) skipped.push(`${key}: daily cap ${cap} — ${list.length - left} wait for tomorrow`);
+    allowed.push(...list.slice(0, left));
+  }
+  jobs = allowed.sort((a, b) => a.dueMs - b.dueMs);
+  out.due = jobs.length;
+  if (!jobs.length) { if (!out.note) out.note = 'No follow-ups due.'; return out; }
+
+  if (dryRun) {
+    for (const j of jobs) {
+      skipped.push(`DRY RUN — would send ${String(ruleByKey.get(j.key)?.template_name)} (${j.key}) to ${j.name || j.phoneE164} (${j.phoneE164})`);
+    }
+    return out;
+  }
+
+  await forEachLimited(jobs, CHASE_CONCURRENCY, () => ctx.hasTime() && ctx.sendsLeft() > 0, async (job) => {
+    const rule = ruleByKey.get(job.key)!;
+    const outcome = await sendChaseMessage(admin, durable, ctx, ws, rule, job);
+    if (outcome === 'sent') out.sent = (out.sent as number) + 1;
+    else if (outcome !== 'skip') skipped.push(`${job.name || job.phoneE164} ${job.key}: ${outcome}`);
+  });
+  const left = jobs.length - (out.sent as number);
+  if (left > 0 && !ctx.hasTime()) out.note = `${left} continue on the next run.`;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// One follow-up: claim, send the template, record. Same claim discipline as
+// T1 — the write IS the lock, and the unique indexes make a duplicate
+// impossible. Always a template: by definition this person has not written to
+// us, so the 24-hour window is closed and nothing else is allowed anyway.
+// ---------------------------------------------------------------------------
+async function sendChaseMessage(
+  admin: Admin, durable: Admin, ctx: RunContext, ws: string,
+  rule: Record<string, any>,                                            // eslint-disable-line @typescript-eslint/no-explicit-any
+  job: ChaseJob,
+): Promise<string> {
+  if (!ctx.takeSend()) return 'skip';
+  let spent = false;
+  try {
+    let conversationId = job.conversationId;
+    if (!conversationId) {
+      const { data } = await admin.rpc('relay_get_or_create_conversation', { p_workspace_id: ws, p_phone_e164: job.phoneE164 });
+      conversationId = (data as string) || null;
+    }
+    if (!conversationId) return 'could not open a conversation';
+    if (!rule.template_name) return 'no template chosen for this step';
+
+    // A retry after a timeout: did the first try arrive after all?
+    if (job.prior?.error?.includes('delivery unknown')) {
+      const since = new Date(new Date(job.prior.sent_at).getTime() - 60_000).toISOString();
+      const { data: arrived } = await admin.from('relay_messages').select('id')
+        .eq('conversation_id', conversationId).eq('direction', 'out').is('sent_by', null)
+        .eq('template_name', rule.template_name)
+        .in('status', ['sent', 'delivered', 'read']).gte('created_at', since).limit(1);
+      if (arrived?.length) {
+        await admin.from('relay_automation_sent').update({ ok: true, error: null }).eq('id', job.prior.id);
+        return 'skip';
+      }
+    }
+
+    const IN_FLIGHT = `in flight — ${TIMEOUT_NOTE}`;
+    const attemptNo = job.prior ? (job.prior.attempts ?? 1) + 1 : 1;
+    let claimId: string | null = null;
+    if (job.prior) {
+      const { data } = await admin.from('relay_automation_sent')
+        .update({ method: 'template', detail: rule.template_name, ok: false, error: IN_FLIGHT, attempts: attemptNo, sent_at: new Date().toISOString() })
+        .eq('id', job.prior.id).eq('ok', job.prior.ok).select('id');
+      claimId = data?.[0]?.id ?? null;
+    } else {
+      const { data, error } = await admin.from('relay_automation_sent')
+        .insert({ workspace_id: ws, automation_key: job.key, lead_id: job.leadId, phone_e164: job.phoneE164, method: 'template', detail: rule.template_name, ok: false, error: IN_FLIGHT, attempts: 1 })
+        .select('id').single();
+      claimId = error ? null : data?.id ?? null;
+    }
+    if (!claimId) return 'skip';
+    spent = true;
+
+    let ok = false;
+    let errText: string | null = null;
+    try {
+      const r = await sendTemplateToLead(admin, {
+        workspaceId: ws, conversationId, phoneE164: job.phoneE164,
+        templateName: rule.template_name, language: rule.template_language || 'en',
+        lead: { full_name: job.name, visa_type: job.visaType },
+      }, ctx);
+      ok = r.ok;
+      errText = r.ok ? null : r.timedOut ? TIMEOUT_NOTE : r.error;
+    } catch (e) {
+      errText = isTimeoutError(e) ? TIMEOUT_NOTE : e instanceof Error ? e.message : String(e);
+    }
+
+    // An empty Interakt wallet is OUR outage, not this person's failure: the
+    // attempt is handed back so they are retried once the wallet is topped up,
+    // however long that takes, instead of burning through their three tries.
+    const walletEmpty = !ok && /wallet|insufficient balance/i.test(errText || '');
+    await durable.from('relay_automation_sent')
+      .update({ ok, error: walletEmpty ? `wallet empty — will retry after recharge (${new Date().toISOString().slice(0, 16)}Z)` : errText, attempts: walletEmpty ? Math.max(0, attemptNo - 1) : attemptNo })
+      .eq('id', claimId);
+    return ok ? 'sent' : errText || 'send failed';
+  } finally {
+    if (!spent) ctx.giveBackSend();
+  }
 }
