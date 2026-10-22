@@ -23,6 +23,7 @@ import { statusFromEvent, mediaTypeFrom, type InteraktWebhook } from '@/lib/inte
 import { toE164 } from '@/lib/phone';
 import { pushToWorkspace } from '@/lib/push-server';
 import { RELAY_BUCKET, MAX_UPLOAD_BYTES, mediaPath, safeFilename, mimeFor, presentableName } from '@/lib/files';
+import { linkOrCreateLead } from '@/lib/lead-link';
 import { captureCvFromDocument } from '@/lib/cv-capture';
 import { createHmac, timingSafeEqual } from 'crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -403,6 +404,15 @@ export async function POST(req: Request) {
       if (conv?.lead_id) {
         const { data: lead } = await admin.from('leads').select('full_name').eq('id', conv.lead_id).maybeSingle();
         if (lead?.full_name) who = lead.full_name;
+      } else {
+        // "Not in CRM" ends here when the message is the ad-form enquiry: the
+        // form names them, so find their lead (they often WhatsApp from a
+        // different number than they typed into the form) — or create it. The
+        // very notification that announces them already carries their name.
+        const linked = await linkOrCreateLead(admin, {
+          ws: ws.id, conversationId: convId as string, waPhone: phoneE164, body: message?.message || '',
+        });
+        if ((linked.action === 'linked' || linked.action === 'created') && linked.leadName) who = linked.leadName;
       }
       const previewText = message?.message || (mediaType ? `📎 ${mediaType === 'image' ? 'Photo' : mediaType === 'document' ? 'Document' : 'Attachment'}` : 'New message');
       await pushToWorkspace(admin, ws.id, {

@@ -108,12 +108,35 @@ export async function loadChaseFacts(
   const phones = [...t1Rows.keys()].filter((p) => !wanted || wanted.has(p));
   if (!phones.length) return { backfillPhones, t1Rows, history, facts };
   type Conv = { id: string; phone_e164: string; last_inbound_at: string | null; lead_id: string | null };
-  const convs: Conv[] = (await inParallel(chunk(phones, 100), async (ps) => {
-    const { data, error } = await admin.from('relay_conversations')
-      .select('id, phone_e164, last_inbound_at, lead_id').eq('workspace_id', ws).in('phone_e164', ps);
-    if (error) throw new Error(`chase convs: ${error.message}`);
-    return (data || []) as Conv[];
-  })).flat();
+  const phoneSet = new Set(phones);
+  const wantedLeadIds = [...t1Rows.values()].filter((t) => phoneSet.has(t.phoneE164)).map((t) => t.leadId).filter(Boolean) as string[];
+  const [byPhoneParts, byLeadParts] = await Promise.all([
+    inParallel(chunk(phones, 100), async (ps) => {
+      const { data, error } = await admin.from('relay_conversations')
+        .select('id, phone_e164, last_inbound_at, lead_id').eq('workspace_id', ws).in('phone_e164', ps);
+      if (error) throw new Error(`chase convs: ${error.message}`);
+      return (data || []) as Conv[];
+    }),
+    // ONE PERSON, TWO NUMBERS. A lead can chat from a number other than the
+    // one the CRM holds (the ad form's). The webhook links that chat to the
+    // lead, and here BOTH conversations count as the same person: a reply, a
+    // team message or a STOP on either number stops the chase for them.
+    inParallel(chunk(wantedLeadIds, 100), async (ids) => {
+      const { data, error } = await admin.from('relay_conversations')
+        .select('id, phone_e164, last_inbound_at, lead_id').eq('workspace_id', ws).in('lead_id', ids);
+      if (error) throw new Error(`chase linked convs: ${error.message}`);
+      return (data || []) as Conv[];
+    }),
+  ]);
+  const convs: Conv[] = byPhoneParts.flat();
+  const seenConv = new Set(convs.map((c) => c.id));
+  const convsByLead = new Map<string, Conv[]>();
+  for (const c of byLeadParts.flat()) {
+    if (!c.lead_id) continue;
+    if (!convsByLead.has(c.lead_id)) convsByLead.set(c.lead_id, []);
+    convsByLead.get(c.lead_id)!.push(c);
+    if (!seenConv.has(c.id)) { seenConv.add(c.id); convs.push(c); }
+  }
   const convByPhone = new Map(convs.map((c) => [c.phone_e164, c]));
   const convIds = convs.map((c) => c.id);
   const phoneByConv = new Map(convs.map((c) => [c.id, c.phone_e164]));
@@ -145,8 +168,7 @@ export async function loadChaseFacts(
     }
   });
 
-  const phoneSet = new Set(phones);
-  const leadIds = [...t1Rows.values()].filter((t) => phoneSet.has(t.phoneE164)).map((t) => t.leadId).filter(Boolean) as string[];
+  const leadIds = wantedLeadIds;
   const leadInfo = new Map<string, { full_name: string | null; visa_type: string | null; stage: string | null }>();
   type LeadRow = { id: string; full_name: string | null; visa_type: string | null; stage: string | null };
   const [eco] = await Promise.all([
@@ -169,16 +191,29 @@ export async function loadChaseFacts(
     if (!phoneSet.has(t1.phoneE164)) continue;
     const conv = convByPhone.get(t1.phoneE164) ?? null;
     const lead = t1.leadId ? leadInfo.get(t1.leadId) ?? null : null;
+    // Every conversation that is this person: the T1 number's, plus any chat
+    // the webhook linked to their lead from another number.
+    const mine: Conv[] = [...new Map([
+      ...(conv ? [[conv.id, conv] as const] : []),
+      ...((t1.leadId ? convsByLead.get(t1.leadId) : undefined) ?? []).map((c) => [c.id, c] as const),
+    ]).values()];
+    const maxMs = (xs: (number | null)[]) => xs.reduce<number | null>((a, b) => (b === null ? a : a === null ? b : Math.max(a, b)), null);
+    const ecoStates = mine.map((c) => eco.get(c.id)).filter(Boolean) as { stopped: boolean; pausedUntil: string | null }[];
     facts.set(t1.phoneE164, {
       conversationId: conv?.id ?? null,
-      lastInboundMs: conv?.last_inbound_at ? new Date(conv.last_inbound_at).getTime() : null,
-      lastTeamOutMs: lastTeamOut.get(t1.phoneE164) ?? null,
+      lastInboundMs: maxMs(mine.map((c) => (c.last_inbound_at ? new Date(c.last_inbound_at).getTime() : null))),
+      lastTeamOutMs: maxMs(mine.map((c) => lastTeamOut.get(c.phone_e164) ?? null)),
       failTimes: autoFails.get(t1.phoneE164) || [],
       stage: lead?.stage ?? null,
       name: lead?.full_name ?? null,
       visaType: lead?.visa_type ?? null,
-      suppressed: suppressedSet.has(t1.phoneE164),
-      ecosystem: conv ? (eco.get(conv.id) ?? null) : null,
+      suppressed: mine.some((c) => suppressedSet.has(c.phone_e164)) || suppressedSet.has(t1.phoneE164),
+      ecosystem: ecoStates.length ? {
+        stopped: ecoStates.some((e) => e.stopped),
+        pausedUntil: maxMs(ecoStates.map((e) => (e.pausedUntil ? new Date(e.pausedUntil).getTime() : null))) !== null
+          ? new Date(maxMs(ecoStates.map((e) => (e.pausedUntil ? new Date(e.pausedUntil).getTime() : null)))!).toISOString()
+          : null,
+      } : null,
     });
   }
   return { backfillPhones, t1Rows, history, facts };

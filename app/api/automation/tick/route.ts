@@ -232,6 +232,41 @@ export async function POST(req: NextRequest) {
         convs.push(...((data || []) as typeof convs));
       }
       const convByPhone = new Map(convs.map((c) => [c.phone_e164, c]));
+
+      // SEND TO THE NUMBER THEY ACTUALLY USE. When a chat from another number
+      // is linked to the lead (the ad form held a different phone), T1 goes to
+      // the chat's number — the form one may not even be on WhatsApp — and,
+      // because they have just written to us, it goes as a free text inside
+      // the 24h window instead of a paid template. The unique index on
+      // (workspace, rule, lead) still guarantees one T1 per person.
+      {
+        const jobLeadIds = jobs.map((j) => j.leadId).filter(Boolean) as string[];
+        const linkedByLead = new Map<string, { id: string; phone_e164: string; last_inbound_at: string | null }>();
+        for (const ids of chunk(jobLeadIds, 100)) {
+          const { data } = await admin.from('relay_conversations')
+            .select('id, phone_e164, last_inbound_at, lead_id').eq('workspace_id', ws).in('lead_id', ids);
+          for (const c of (data || []) as { id: string; phone_e164: string; last_inbound_at: string | null; lead_id: string }[]) {
+            const cur = linkedByLead.get(c.lead_id);
+            if (!cur || String(c.last_inbound_at || '') > String(cur.last_inbound_at || '')) linkedByLead.set(c.lead_id, c);
+          }
+        }
+        const wsSuppressed = new Set(suppressed.filter((x) => x.workspace_id === ws).map((x) => x.phone_e164));
+        const optedOut = new Set<Job>();
+        for (const j of jobs) {
+          const lc = j.leadId ? linkedByLead.get(j.leadId) : undefined;
+          if (!lc || lc.phone_e164 === j.phoneE164) continue;
+          if (wsSuppressed.has(lc.phone_e164)) {
+            // A STOP from the number they actually write from is a STOP from
+            // the person — the form number gets nothing either.
+            skipped.push(`${j.name || j.phoneE164}: opted out (STOP) from their chat number`);
+            optedOut.add(j);
+            continue;
+          }
+          j.phoneE164 = lc.phone_e164;
+          if (!convByPhone.has(lc.phone_e164)) { convByPhone.set(lc.phone_e164, lc); convs.push(lc); }
+        }
+        if (optedOut.size) jobs = jobs.filter((j) => !optedOut.has(j));
+      }
       const contacted = new Set<string>();
       for (const ids of chunk(convs.map((c) => c.id), 100)) {
         // A failed attempt is not contact; anything that went (or may have) is.

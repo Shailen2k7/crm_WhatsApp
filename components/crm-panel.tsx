@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { ExternalLink, FileDown, Mail, Phone, Calendar, Tag, Briefcase, UserCircle, X, Loader2 } from 'lucide-react';
+import { ExternalLink, FileDown, Mail, Phone, Calendar, Tag, Briefcase, UserCircle, X, Loader2, Link2, UserPlus, Sparkles, Check } from 'lucide-react';
 import type { Lead } from '@/lib/types';
 import { getStageMeta, getVisaMeta } from '@/lib/types';
 import type { Contact } from '@/lib/contacts';
@@ -81,7 +81,16 @@ export function CrmPanel({
         </aside>
       );
     }
-    return <UnknownPanel contact={contact} onClose={onClose} />;
+    return (
+      <UnknownPanel
+        contact={contact}
+        onClose={onClose}
+        onLinked={async (leadId) => {
+          const { data } = await supabase.from('leads').select('*').eq('id', leadId).maybeSingle();
+          if (data) setFetched(data as Lead);
+        }}
+      />
+    );
   }
 
   const stage = getStageMeta(lead.stage);
@@ -278,81 +287,215 @@ function titleise(s: string): string {
 
 
 /** Shown when a conversation has no CRM record behind it. */
-function UnknownPanel({ contact, onClose }: { contact: Contact; onClose?: () => void }) {
+/**
+ * THE END OF A DEAD-END PANEL. "Not in CRM" used to say: go to the CRM and do
+ * it yourself. Now the panel reads the chat's own enquiry message, says who
+ * this almost certainly is, and fixes it in one click:
+ *
+ *   enquiry + exactly one matching lead  → "This is <name>" + Link
+ *   enquiry + several possible leads     → the shortlist, pick one
+ *   enquiry + nobody                     → their form details + Create lead
+ *   plain chat, no enquiry               → type a name + Create lead
+ *
+ * Linking is the server's job (/api/whatsapp/link-lead) and it re-checks
+ * everything, so a stale panel can never cross-link two people.
+ */
+interface LinkCandidate { id: string; full_name: string | null; phone: string | null; email: string | null; stage: string | null }
+interface LinkInfo {
+  parsed: { fullName: string | null; formPhone: string | null; email: string | null; expertise: string | null; investmentReadiness: string | null } | null;
+  candidates: LinkCandidate[];
+  alreadyLinked?: string;
+}
+
+function UnknownPanel({ contact, onClose, onLinked }: { contact: Contact; onClose?: () => void; onLinked: (leadId: string) => void }) {
+  const [info, setInfo] = useState<LinkInfo | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+  const [nameDraft, setNameDraft] = useState('');
+  const [emailDraft, setEmailDraft] = useState('');
+
+  useEffect(() => {
+    setInfo(null); setError(null); setDone(null); setNameDraft(''); setEmailDraft('');
+    if (!contact.conversationId) { setInfo({ parsed: null, candidates: [] }); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/api/whatsapp/link-lead?conversationId=${contact.conversationId}`, { cache: 'no-store' });
+        const json = await res.json();
+        if (cancelled) return;
+        if (!json.ok) { setError(json.error || 'Could not read this chat.'); setInfo({ parsed: null, candidates: [] }); return; }
+        if (json.alreadyLinked) { onLinked(json.alreadyLinked); return; }
+        setInfo({ parsed: json.parsed, candidates: json.candidates || [] });
+      } catch {
+        if (!cancelled) { setError('Could not read this chat.'); setInfo({ parsed: null, candidates: [] }); }
+      }
+    })();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contact.conversationId]);
+
+  async function act(body: Record<string, unknown>, successName: string | null) {
+    if (!contact.conversationId || busy) return;
+    setBusy(true); setError(null);
+    try {
+      const res = await fetch('/api/whatsapp/link-lead', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId: contact.conversationId, ...body }),
+      });
+      const json = await res.json();
+      if (!json.ok) { setError(json.error || 'Could not save.'); return; }
+      setDone(json.leadName || successName || 'Linked');
+      // A short beat so the person SEES it worked, then the full lead panel.
+      setTimeout(() => onLinked(json.leadId), 650);
+    } catch {
+      setError('Network error — nothing was changed.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const parsed = info?.parsed ?? null;
+  const candidates = info?.candidates ?? [];
+
   return (
-    <aside
-      style={{
-        width: 300,
-        maxWidth: '86vw',
-        flex: 'none',
-        borderLeft: '1px solid var(--line)',
-        background: 'var(--surface)',
-        overflowY: 'auto',
-        minHeight: 0,
-      }}
-    >
+    <aside style={{ width: 300, maxWidth: '86vw', flex: 'none', borderLeft: '1px solid var(--line)', background: 'var(--surface)', overflowY: 'auto', minHeight: 0 }}>
       {onClose && (
         <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '10px 12px 0' }}>
-          <button
-            onClick={onClose}
-            aria-label="Close"
-            style={{ width: 30, height: 30, borderRadius: 8, border: 0, background: 'var(--surface-2)', color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}
-          >
+          <button onClick={onClose} aria-label="Close" style={{ width: 30, height: 30, borderRadius: 8, border: 0, background: 'var(--surface-2)', color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
             <X size={16} />
           </button>
         </div>
       )}
 
       <div style={{ padding: '22px 18px 16px', textAlign: 'center', borderBottom: '1px solid var(--line-2)' }}>
-        <div
-          style={{
-            width: 62,
-            height: 62,
-            borderRadius: 99,
-            background: 'var(--surface-3)',
-            border: '1px dashed var(--line)',
-            color: 'var(--muted)',
-            fontSize: 24,
-            fontWeight: 700,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            margin: '0 auto 11px',
-          }}
-        >
+        <div style={{ width: 62, height: 62, borderRadius: 99, background: 'var(--surface-3)', border: '1px dashed var(--line)', color: 'var(--muted)', fontSize: 24, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 11px' }}>
           ?
         </div>
-        <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 3 }}>{formatPhone(contact.phoneE164)}</div>
+        <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 3 }}>{parsed?.fullName || formatPhone(contact.phoneE164)}</div>
+        {parsed?.fullName && <div style={{ fontSize: 12, color: 'var(--muted)' }}>{formatPhone(contact.phoneE164)}</div>}
         <span style={{ display: 'inline-block', fontSize: 10.5, fontWeight: 700, padding: '3px 9px', borderRadius: 99, background: 'var(--amber-bg)', color: 'var(--amber)', marginTop: 8 }}>
           Not in CRM
         </span>
       </div>
 
       <div style={{ padding: '16px 18px' }}>
-        <p style={{ fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.6, margin: '0 0 14px' }}>
-          This number messaged you but has no lead record. The conversation is saved
-          and will link itself automatically once a lead with this number exists.
-        </p>
-        <a
-          href={`${CRM_URL}/leads`}
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            gap: 7,
-            padding: '9px 14px',
-            borderRadius: 9,
-            border: '1px solid var(--line)',
-            background: 'var(--surface-2)',
-            fontSize: 12.5,
-            fontWeight: 600,
-            color: 'var(--ink-2)',
-          }}
-        >
-          Add as a lead in CRM <ExternalLink size={13} />
-        </a>
+        {done ? (
+          <div className="animate-pop-in" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10, padding: '26px 0', textAlign: 'center' }}>
+            <div style={{ width: 44, height: 44, borderRadius: 99, background: 'var(--teal)', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <Check size={22} />
+            </div>
+            <div style={{ fontSize: 13.5, fontWeight: 700 }}>{done}</div>
+            <div style={{ fontSize: 12, color: 'var(--muted)' }}>Linked to the CRM</div>
+          </div>
+        ) : !info ? (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, padding: '22px 0', color: 'var(--muted)', fontSize: 12.5 }}>
+            <Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> Reading the chat…
+          </div>
+        ) : (
+          <>
+            {parsed && (
+              <div style={{ border: '1px solid var(--line)', borderRadius: 12, padding: '12px 13px', marginBottom: 14, background: 'var(--surface-2)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)', marginBottom: 8 }}>
+                  <Sparkles size={11} /> From their enquiry form
+                </div>
+                {[
+                  ['Name', parsed.fullName],
+                  ['Form phone', parsed.formPhone && formatPhone(parsed.formPhone)],
+                  ['Email', parsed.email],
+                  ['Expertise', parsed.expertise],
+                ].filter(([, v]) => v).map(([k, v]) => (
+                  <div key={k as string} style={{ display: 'flex', gap: 8, fontSize: 12.3, padding: '2.5px 0' }}>
+                    <span style={{ color: 'var(--muted)', flex: 'none', width: 78 }}>{k}</span>
+                    <span style={{ fontWeight: 600, wordBreak: 'break-word' }}>{v}</span>
+                  </div>
+                ))}
+                {parsed.investmentReadiness && (
+                  <span style={{ display: 'inline-block', marginTop: 7, fontSize: 10.5, fontWeight: 700, padding: '2px 8px', borderRadius: 99, background: parsed.investmentReadiness === 'yes' ? 'var(--teal-bg)' : 'var(--surface-3)', color: parsed.investmentReadiness === 'yes' ? 'var(--teal-ink)' : 'var(--muted)' }}>
+                    {parsed.investmentReadiness === 'yes' ? 'Ready to invest £7,000' : `Invest: ${parsed.investmentReadiness}`}
+                  </span>
+                )}
+              </div>
+            )}
+
+            {error && <div style={{ background: 'var(--red-bg)', color: 'var(--red)', padding: '8px 11px', borderRadius: 9, fontSize: 12, marginBottom: 10 }}>{error}</div>}
+
+            {candidates.length > 0 ? (
+              <>
+                <p style={{ fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.55, margin: '0 0 10px' }}>
+                  {candidates.length === 1
+                    ? <>This chat matches an existing lead — they filled the form with a different number.</>
+                    : <>{candidates.length} leads could be this person — pick the right one.</>}
+                </p>
+                {candidates.map((c) => (
+                  <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: 10, border: '1px solid var(--line)', borderRadius: 11, padding: '10px 12px', marginBottom: 8 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.full_name || '—'}</div>
+                      <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 1 }}>{formatPhone(c.phone)}{c.stage ? ` · ${c.stage}` : ''}</div>
+                    </div>
+                    <button
+                      onClick={() => act({ leadId: c.id }, c.full_name)}
+                      disabled={busy}
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '7px 12px', borderRadius: 9, border: 0, background: 'var(--teal)', color: '#fff', fontSize: 12, fontWeight: 700, cursor: 'pointer', flex: 'none' }}
+                    >
+                      {busy ? <Loader2 size={12} style={{ animation: 'spin .8s linear infinite' }} /> : <Link2 size={12} />} Link
+                    </button>
+                  </div>
+                ))}
+              </>
+            ) : parsed ? (
+              <>
+                <p style={{ fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.55, margin: '0 0 12px' }}>
+                  No lead in the CRM matches this enquiry — create one from the form above.
+                </p>
+                <button
+                  onClick={() => act({ create: {} }, parsed.fullName)}
+                  disabled={busy}
+                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, width: '100%', padding: '10px 14px', borderRadius: 10, border: 0, background: 'var(--teal)', color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}
+                >
+                  {busy ? <Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> : <UserPlus size={14} />}
+                  Add {parsed.fullName ? parsed.fullName.split(/\s+/)[0] : 'them'} to the CRM
+                </button>
+              </>
+            ) : (
+              <>
+                <p style={{ fontSize: 12.5, color: 'var(--muted)', lineHeight: 1.55, margin: '0 0 12px' }}>
+                  This number messaged you but has no lead record. Add them with a name — the chat links itself.
+                </p>
+                <input
+                  value={nameDraft}
+                  onChange={(e) => setNameDraft(e.target.value)}
+                  placeholder="Full name"
+                  style={{ width: '100%', padding: '9px 12px', borderRadius: 9, border: '1px solid var(--line)', background: 'var(--surface-2)', outline: 'none', fontSize: 13, marginBottom: 8 }}
+                />
+                <input
+                  value={emailDraft}
+                  onChange={(e) => setEmailDraft(e.target.value)}
+                  placeholder="Email (optional)"
+                  inputMode="email"
+                  style={{ width: '100%', padding: '9px 12px', borderRadius: 9, border: '1px solid var(--line)', background: 'var(--surface-2)', outline: 'none', fontSize: 13, marginBottom: 10 }}
+                />
+                <button
+                  onClick={() => act({ create: { name: nameDraft, email: emailDraft } }, nameDraft)}
+                  disabled={busy || !nameDraft.trim()}
+                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, width: '100%', padding: '10px 14px', borderRadius: 10, border: 0, background: nameDraft.trim() ? 'var(--teal)' : 'var(--surface-3)', color: nameDraft.trim() ? '#fff' : 'var(--muted)', fontSize: 13, fontWeight: 700, cursor: nameDraft.trim() ? 'pointer' : 'not-allowed' }}
+                >
+                  {busy ? <Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> : <UserPlus size={14} />}
+                  Add as a lead
+                </button>
+              </>
+            )}
+
+            <a
+              href={`${CRM_URL}/leads`}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 12, fontSize: 11.5, fontWeight: 600, color: 'var(--muted)' }}
+            >
+              Open the CRM instead <ExternalLink size={11} />
+            </a>
+          </>
+        )}
       </div>
     </aside>
   );

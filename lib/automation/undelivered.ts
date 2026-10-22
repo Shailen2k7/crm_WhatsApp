@@ -130,7 +130,23 @@ export async function findUndeliveredT1(
   if (!candidates.length) return [];
 
   // ---- has ANYTHING reached them since, or has a human stepped in? ---------------
-  const candConvIds = candidates.map((r) => convByPhone.get(r.phone_e164)?.id).filter(Boolean) as string[];
+  // Including on a chat linked to their lead from ANOTHER number: one person.
+  const candLeadIds = candidates.map((r) => r.lead_id).filter(Boolean) as string[];
+  const linkedByLead = new Map<string, Conv[]>();
+  const linked = (await inParallel(chunk(candLeadIds, 100), async (ids) => {
+    const { data } = await admin.from('relay_conversations')
+      .select('id, phone_e164, last_inbound_at, lead_id').eq('workspace_id', ws).in('lead_id', ids);
+    return (data || []) as (Conv & { lead_id: string })[];
+  })).flat();
+  for (const c of linked) {
+    if (!linkedByLead.has(c.lead_id)) linkedByLead.set(c.lead_id, []);
+    linkedByLead.get(c.lead_id)!.push(c);
+  }
+  const convsOf = (r: { phone_e164: string; lead_id: string | null }): Conv[] => [...new Map([
+    ...([convByPhone.get(r.phone_e164)].filter(Boolean) as Conv[]).map((c) => [c.id, c] as const),
+    ...((r.lead_id ? linkedByLead.get(r.lead_id) : undefined) ?? []).map((c) => [c.id, c] as const),
+  ]).values()];
+  const candConvIds = [...new Set(candidates.flatMap((r) => convsOf(r).map((c) => c.id)))];
   const reached = new Set<string>();
   const teamed = new Set<string>();
   const leadIds = candidates.map((r) => r.lead_id).filter(Boolean) as string[];
@@ -162,13 +178,13 @@ export async function findUndeliveredT1(
 
   const out: UndeliveredT1[] = [];
   for (const r of candidates) {
-    const conv = convByPhone.get(r.phone_e164) ?? null;
+    const mine = convsOf(r);
     const lead = r.lead_id ? leads.get(r.lead_id) ?? null : null;
     const t1Ms = new Date(r.sent_at).getTime();
-    if (conv && (reached.has(conv.id) || teamed.has(conv.id))) continue;
-    if (conv?.last_inbound_at && new Date(conv.last_inbound_at).getTime() > t1Ms - 5 * 60_000) continue;
+    if (mine.some((c) => reached.has(c.id) || teamed.has(c.id))) continue;
+    if (mine.some((c) => c.last_inbound_at && new Date(c.last_inbound_at).getTime() > t1Ms - 5 * 60_000)) continue;
     if (lead?.stage && HUMAN_STAGES.has(lead.stage)) continue;
-    if (suppressed.has(r.phone_e164)) continue;
+    if (suppressed.has(r.phone_e164) || mine.some((c) => suppressed.has(c.phone_e164))) continue;
 
     const fails = failsByPhone.get(r.phone_e164) || [];
     const lastFail = fails.filter((f) => Math.abs(f.atMs - t1Ms) <= 30 * 60_000).sort((a, b) => b.atMs - a.atMs)[0];
