@@ -171,6 +171,8 @@ export function CrmPanel({
         </div>
       </div>
 
+      <NurtureCard phone={contact.phoneE164 || lead.phone} hotOrSpotlight={lead.stage === 'hot' || !!(lead as { is_spotlight?: boolean }).is_spotlight || contact.spotlight} />
+
       {/* Fields */}
       <Section title="Details">
         {fields.map((f, i) => (
@@ -498,5 +500,86 @@ function UnknownPanel({ contact, onClose, onLinked }: { contact: Contact; onClos
         )}
       </div>
     </aside>
+  );
+}
+
+/**
+ * THE NURTURE, FROM INSIDE THE CHAT. For a Hot or Spotlight lead the side
+ * panel says where they stand in HS1→HS8 — what is next and when — with one
+ * button to pause them and one to resume. The same server call the Automation
+ * tab uses, so the two can never tell different stories.
+ */
+function NurtureCard({ phone, hotOrSpotlight }: { phone: string | null; hotOrSpotlight: boolean }) {
+  const [st, setSt] = useState<{
+    inAudience: boolean; paused?: boolean; spotlight?: boolean; done?: number; total?: number;
+    state?: string; nextStep?: string | null; nextAt?: string | null; stoppedReason?: string | null; phoneE164?: string;
+  } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    if (!phone) { setSt({ inAudience: false }); return; }
+    try {
+      const res = await fetch(`/api/automation/nurture?phone=${encodeURIComponent(phone)}`, { cache: 'no-store' });
+      const json = await res.json();
+      setSt(json.ok ? json : { inAudience: false });
+    } catch { setSt({ inAudience: false }); }
+  };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { setSt(null); load(); }, [phone]);
+
+  if (!hotOrSpotlight || !st || !st.inAudience) return null;
+
+  const stepNo = st.nextStep ? st.nextStep.replace('nurture_hs', 'HS') : null;
+  const when = st.nextAt ? new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short' }).format(new Date(st.nextAt)) : null;
+  const line = st.state === 'stopped' ? `Ended — ${st.stoppedReason}`
+    : st.state === 'finished' ? 'Series complete — all 8 messages sent'
+    : st.paused ? `Paused — ${stepNo ?? 'the series'} waits for Resume`
+    : st.state === 'due' ? `${stepNo} goes out today` 
+    : st.state === 'silence' ? `${stepNo} waits — they're in a conversation`
+    : st.state === 'ecosystem' ? `${stepNo} waits — Meta pause until ${when}`
+    : stepNo ? `${stepNo} around ${when}` : 'Waiting';
+
+  async function toggle() {
+    if (!st?.phoneE164) return;
+    setBusy(true);
+    try {
+      const res = await fetch('/api/automation/nurture', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: st.paused ? 'resume' : 'pause', phone: st.phoneE164 }),
+      });
+      const json = await res.json();
+      if (json.ok) await load();
+      else alert(json.error || 'Could not save.');
+    } finally { setBusy(false); }
+  }
+
+  const active = st.state !== 'stopped' && st.state !== 'finished';
+  return (
+    <div style={{ margin: '12px 16px 0', border: '1px solid var(--line)', borderRadius: 12, padding: '10px 12px', background: 'var(--surface-2)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.05em', color: 'var(--muted)' }}>
+            Nurture · {st.done}/{st.total} sent{st.spotlight ? ' · ★' : ''}
+          </div>
+          <div style={{ fontSize: 12.3, fontWeight: 600, marginTop: 3, color: st.paused ? 'var(--amber)' : 'var(--ink-2)', lineHeight: 1.45 }}>{line}</div>
+        </div>
+        {active && (
+          <button
+            onClick={toggle}
+            disabled={busy}
+            style={{ padding: '6px 12px', borderRadius: 8, border: 0, flex: 'none', cursor: 'pointer', fontSize: 11.5, fontWeight: 700,
+              background: st.paused ? 'var(--teal)' : 'var(--amber-bg)', color: st.paused ? '#fff' : 'var(--amber)' }}
+          >
+            {busy ? '…' : st.paused ? 'Resume' : 'Pause'}
+          </button>
+        )}
+      </div>
+      {/* the series at a glance */}
+      <div style={{ display: 'flex', gap: 3, marginTop: 8 }}>
+        {Array.from({ length: st.total || 8 }, (_, i) => (
+          <span key={i} style={{ flex: 1, height: 4, borderRadius: 2, background: i < (st.done || 0) ? 'var(--teal)' : 'var(--line)' }} />
+        ))}
+      </div>
+    </div>
   );
 }

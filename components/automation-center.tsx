@@ -495,7 +495,7 @@ type Engine = 'cv' | 'cold' | 'hot';
 const ENGINES: { id: Engine; label: string; icon: React.ReactNode; live: boolean; blurb: string }[] = [
   { id: 'cv', label: 'CV & LinkedIn chase', icon: <FileText size={14} />, live: true, blurb: 'New leads: ask for the CV and LinkedIn, then follow up until they reply.' },
   { id: 'cold', label: 'Cold lead chase', icon: <Snowflake size={14} />, live: false, blurb: 'Leads marked Cold in the CRM: slow, spaced nudges over months.' },
-  { id: 'hot', label: 'Hot lead chase', icon: <Flame size={14} />, live: false, blurb: 'Leads marked Hot: short, closer follow-ups towards a call.' },
+  { id: 'hot', label: 'Hot & Spotlight', icon: <Flame size={14} />, live: true, blurb: 'Hot and Spotlight leads who have gone quiet: one value message (HS1→HS8) every 4 days until they reply.' },
 ];
 
 let selectedEngine: Engine = 'cv';
@@ -504,10 +504,14 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
   const [engine, setEngineState] = useState<Engine>(selectedEngine);
   const setEngine = (e: Engine) => { selectedEngine = e; setEngineState(e); };
   const [cvOn, setCvOn] = useState<number | null>(() => (switchCache ? Object.values(switchCache).filter(Boolean).length : null));
+  const [nurtureOn, setNurtureOn] = useState<boolean | null>(null);
 
   useEffect(() => {
     fetch('/api/automation/switch', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
       if (j.ok) setCvOn((j.rules as { enabled: boolean }[]).filter((x) => x.enabled).length);
+    }).catch(() => {});
+    fetch('/api/automation/nurture', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
+      if (j.ok) setNurtureOn(!!j.rule?.enabled);
     }).catch(() => {});
   }, [engine]);
 
@@ -536,7 +540,10 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
       <div role="tablist" style={{ display: 'flex', gap: 8, overflowX: 'auto', scrollbarWidth: 'none', marginBottom: 6, paddingBottom: 2 }}>
         {ENGINES.map((e) => {
           const active = e.id === engine;
-          const status = e.live ? (cvOn === null ? '' : cvOn > 0 ? 'On' : 'Off') : 'Coming next';
+          const status = !e.live ? 'Coming next'
+            : e.id === 'cv' ? (cvOn === null ? '' : cvOn > 0 ? 'On' : 'Off')
+            : e.id === 'hot' ? (nurtureOn === null ? '' : nurtureOn ? 'On' : 'Off')
+            : '';
           return (
             <button
               key={e.id}
@@ -556,8 +563,8 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
               {status && (
                 <span style={{
                   fontSize: 10.5, fontWeight: 700, padding: '2px 7px', borderRadius: 99,
-                  background: e.live && cvOn ? 'var(--teal)' : active ? 'rgba(255,255,255,.16)' : 'var(--surface-3)',
-                  color: e.live && cvOn ? '#fff' : active ? 'var(--surface)' : 'var(--muted)',
+                  background: status === 'On' ? 'var(--teal)' : active ? 'rgba(255,255,255,.16)' : 'var(--surface-3)',
+                  color: status === 'On' ? '#fff' : active ? 'var(--surface)' : 'var(--muted)',
                 }}>{status}</span>
               )}
             </button>
@@ -578,14 +585,7 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
           ]}
         />
       )}
-      {engine === 'hot' && (
-        <PreviewEngine
-          name="Hot lead chase"
-          audience="Leads whose stage is Hot in the CRM (119 today)"
-          hours="10am–7pm IST"
-          steps={[{ tpl: 'h1', after: 'Start' }, { tpl: 'h2', after: '+3 days' }, { tpl: 'h3', after: '+3 days' }, { tpl: 'h4', after: '+4 days' }]}
-        />
-      )}
+      {engine === 'hot' && <NurtureEngine />}
     </div>
   );
 }
@@ -674,6 +674,206 @@ function PreviewEngine({ name, audience, hours, steps }: {
           </div>
         </Card>
       )}
+    </>
+  );
+}
+
+// =============================================================================
+// HOT & SPOTLIGHT NURTURE — the live tab. One switch, one cap, the HS1→HS8
+// timeline with real wording, and the Next up / Paused / Sent / Stopped lists.
+// Pause, Resume and Skip act through /api/automation/nurture, the same code
+// the engine reads, so the tab and the sender can never disagree.
+// =============================================================================
+interface NurtureOverview {
+  isAdmin: boolean;
+  rule: { enabled: boolean; dailyCap: number };
+  audience: { total: number; spotlight: number; paused: number };
+  sentToday: number;
+  steps: { key: string; template: string; body: string | null; sent: number }[];
+  next: { phone: string; name: string | null; key: string; spotlight: boolean; at: string; state: string }[];
+  sent: { phone: string; name: string | null; key: string; at: string }[];
+  paused: { phone: string; name: string | null; spotlight: boolean }[];
+  stopped: { phone: string; name: string | null; key: string; at: string; reason: string }[];
+}
+
+let nurtureCache: NurtureOverview | null = null;
+
+function NurtureEngine() {
+  const [ov, setOv] = useState<NurtureOverview | null>(nurtureCache);
+  const [openStep, setOpenStep] = useState<string>('nurture_hs1');
+  const [list, setList] = useState('next');
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [capDraft, setCapDraft] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async (quiet = false) => {
+    try {
+      const res = await fetch('/api/automation/nurture', { cache: 'no-store' });
+      const json = await res.json();
+      if (!json.ok) { if (!quiet) setError(json.error || 'Could not load.'); return; }
+      nurtureCache = json as NurtureOverview;
+      setOv(nurtureCache);
+      setError(null);
+    } catch { if (!quiet) setError('Could not load — check your connection.'); }
+  }, []);
+  useEffect(() => {
+    load(!!nurtureCache);
+    const t = setInterval(() => load(true), 60_000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  async function post(body: Record<string, unknown>, busyKey: string) {
+    setBusy(busyKey); setMsg(null);
+    try {
+      const res = await fetch('/api/automation/nurture', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const json = await res.json();
+      if (!json.ok) { setMsg({ ok: false, text: json.error || 'Could not save.' }); return false; }
+      await load(true);
+      return true;
+    } catch { setMsg({ ok: false, text: 'Network error — nothing was changed.' }); return false; }
+    finally { setBusy(null); }
+  }
+
+  if (!ov) {
+    return error
+      ? <Card><div style={{ color: 'var(--red)', fontSize: 12.5 }}>{error}</div></Card>
+      : <Card><div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--muted)', fontSize: 13, padding: '6px 0' }}><Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> Loading…</div></Card>;
+  }
+
+  const stepMeta = (k: string) => ({ n: Number(k.replace('nurture_hs', '')), tpl: k.replace('nurture_', '') });
+  const fmtAt = (iso: string) => new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(iso));
+  const open = ov.steps.find((s) => s.key === openStep) ?? ov.steps[0];
+  const lists = [
+    { id: 'next', label: 'Next up', count: ov.next.length },
+    { id: 'paused', label: 'Paused', count: ov.paused.length },
+    { id: 'sent', label: 'Sent', count: ov.sent.length },
+    { id: 'stopped', label: 'Stopped', count: ov.stopped.length },
+  ];
+
+  function toggleEngine() {
+    const on = !ov!.rule.enabled;
+    const text = on
+      ? `Switch ON the Hot & Spotlight nurture?\n\nIt starts on the next run (within 5 minutes), 10am–7pm IST, up to ${ov!.rule.dailyCap || 'unlimited'} messages a day across HS1–HS8. ${ov!.audience.total} people are in the audience; only those quiet for 3+ days get anything.`
+      : 'Switch OFF the nurture?\n\nNothing is lost: everyone continues from their next message when you switch it back on.';
+    if (confirm(text)) post({ enabled: on }, 'switch');
+  }
+
+  return (
+    <>
+      <Card>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 16, fontWeight: 700 }}>Hot & Spotlight nurture</span>
+              <span style={{ fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 99, background: ov.rule.enabled ? 'var(--teal-bg)' : 'var(--surface-3)', color: ov.rule.enabled ? 'var(--teal-ink)' : 'var(--muted)' }}>
+                {ov.rule.enabled ? 'ON' : 'OFF'}
+              </span>
+            </div>
+            <div style={{ fontSize: 12.5, color: 'var(--muted)', marginTop: 4, lineHeight: 1.55 }}>
+              Starts after 3 quiet days, then one message every 4 days, HS1 → HS8, 10am–7pm IST.
+              A reply pauses it; the team talking pauses it; Won/Lost/Junk or STOP ends it. Spotlight goes first.
+            </div>
+          </div>
+          <Switch on={ov.rule.enabled} disabled={!ov.isAdmin || busy === 'switch'} onClick={toggleEngine} label="Hot & Spotlight nurture" />
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--line-2)', fontSize: 12.5, color: 'var(--muted)' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Max per day
+            <input
+              inputMode="numeric"
+              disabled={!ov.isAdmin || busy === 'switch'}
+              value={capDraft ?? String(ov.rule.dailyCap)}
+              onChange={(e) => setCapDraft(e.target.value.replace(/[^\d]/g, ''))}
+              onBlur={() => { if (capDraft !== null && capDraft !== String(ov.rule.dailyCap)) { const n = Number(capDraft); if (Number.isInteger(n) && n >= 0) post({ dailyCap: n }, 'switch'); } setCapDraft(null); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+              style={{ width: 54, padding: '4px 6px', borderRadius: 7, border: '1px solid var(--line)', background: 'var(--surface-2)', fontSize: 12.5, textAlign: 'center', outline: 'none' }}
+            />
+          </label>
+          <span>Audience <strong style={{ color: 'var(--ink-2)' }}>{ov.audience.total}</strong> · ★ {ov.audience.spotlight} · paused {ov.audience.paused}</span>
+          <span>Sent today <strong style={{ color: 'var(--ink-2)' }}>{ov.sentToday}</strong></span>
+          {!ov.isAdmin && <span>Only an admin can change these.</span>}
+        </div>
+      </Card>
+
+      {/* the series */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 0, overflowX: 'auto', scrollbarWidth: 'none', marginBottom: 14, paddingBottom: 2 }}>
+        {ov.steps.map((st, i) => (
+          <div key={st.key} style={{ display: 'flex', alignItems: 'center', flex: 'none' }}>
+            {i > 0 && <ChevronRight size={14} style={{ color: 'var(--muted)', margin: '0 2px' }} />}
+            <button
+              onClick={() => setOpenStep(st.key)}
+              style={{
+                textAlign: 'left', padding: '8px 12px', borderRadius: 11, cursor: 'pointer', minWidth: 72,
+                border: '1px solid ' + (openStep === st.key ? 'var(--teal)' : 'var(--line)'),
+                background: openStep === st.key ? 'var(--teal-bg)' : 'var(--surface)',
+              }}
+            >
+              <div style={{ fontSize: 13, fontWeight: 700, color: openStep === st.key ? 'var(--teal-ink)' : 'var(--ink)' }}>HS{stepMeta(st.key).n}</div>
+              <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2, whiteSpace: 'nowrap' }}>{i === 0 ? 'after 3 quiet days' : '+4 days'} · {st.sent} sent</div>
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {open && (
+        <Card>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, fontSize: 12.5, color: 'var(--muted)' }}>
+            <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--ink)' }}>HS{stepMeta(open.key).n}</span>
+            template <code>{open.template}</code> · sent to {open.sent} people so far
+          </div>
+          <div style={{ padding: '11px 13px', borderRadius: 10, background: 'var(--surface-2)', fontSize: 13, lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
+            {open.body || 'Wording not registered.'}
+          </div>
+        </Card>
+      )}
+
+      {msg && <div style={{ background: msg.ok ? 'var(--teal-bg)' : 'var(--red-bg)', color: msg.ok ? 'var(--teal-ink)' : 'var(--red)', padding: '9px 12px', borderRadius: 10, fontSize: 12.5, marginBottom: 12 }}>{msg.text}</div>}
+
+      <Card>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+          {lists.map((l) => (
+            <button key={l.id} onClick={() => setList(l.id)}
+              style={{ padding: '5px 11px', borderRadius: 99, fontSize: 12, fontWeight: 600, cursor: 'pointer', border: '1px solid ' + (list === l.id ? 'transparent' : 'var(--line)'), background: list === l.id ? 'var(--ink)' : 'transparent', color: list === l.id ? 'var(--surface)' : 'var(--ink-2)' }}>
+              {l.label} <span style={{ opacity: 0.7 }}>{l.count}</span>
+            </button>
+          ))}
+        </div>
+        <div style={{ maxHeight: 440, overflowY: 'auto', overscrollBehavior: 'contain' }}>
+          {list === 'next' && (ov.next.length === 0 ? <Empty text="Nobody is waiting right now." /> : ov.next.map((n) => (
+            <Line key={n.phone + n.key} name={n.name ? (n.spotlight ? '★ ' + n.name : n.name) : n.phone} phone={n.phone}
+              sub={n.state === 'due' ? `HS${stepMeta(n.key).n} — goes out on the next run (within the daily limit)`
+                : n.state === 'off' ? `HS${stepMeta(n.key).n} — due, waiting for the switch`
+                : n.state === 'paused' ? `HS${stepMeta(n.key).n} — paused by the team`
+                : n.state === 'ecosystem' ? `HS${stepMeta(n.key).n} — Meta pause, earliest ${fmtAt(n.at)}`
+                : n.state === 'silence' ? `HS${stepMeta(n.key).n} — waiting for 3 quiet days (they're talking to you)`
+                : `HS${stepMeta(n.key).n} — scheduled ${fmtAt(n.at)}`}
+              right={<span style={{ display: 'inline-flex', gap: 6 }}>
+                {ov.isAdmin && n.state !== 'paused' && (
+                  <button onClick={() => { if (confirm(`Skip HS${stepMeta(n.key).n} for ${n.name || n.phone}?\n\nThe series continues with the next message.`)) post({ action: 'skipStep', phone: n.phone, key: n.key }, n.phone); }} disabled={!!busy}
+                    style={{ padding: '5px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface-2)', fontSize: 11.5, fontWeight: 700, cursor: 'pointer' }}>Skip</button>
+                )}
+                <button onClick={() => post({ action: n.state === 'paused' ? 'resume' : 'pause', phone: n.phone }, n.phone)} disabled={!!busy}
+                  style={{ padding: '5px 10px', borderRadius: 8, border: 0, background: n.state === 'paused' ? 'var(--teal)' : 'var(--amber-bg)', color: n.state === 'paused' ? '#fff' : 'var(--amber)', fontSize: 11.5, fontWeight: 700, cursor: 'pointer' }}>
+                  {n.state === 'paused' ? 'Resume' : 'Pause'}
+                </button>
+              </span>}
+            />
+          )))}
+          {list === 'paused' && (ov.paused.length === 0 ? <Empty text="Nobody is paused." /> : ov.paused.map((p) => (
+            <Line key={p.phone} name={p.name ? (p.spotlight ? '★ ' + p.name : p.name) : p.phone} phone={p.phone} sub="Paused by the team — nothing sends until resumed"
+              right={<button onClick={() => post({ action: 'resume', phone: p.phone }, p.phone)} disabled={!!busy}
+                style={{ padding: '5px 10px', borderRadius: 8, border: 0, background: 'var(--teal)', color: '#fff', fontSize: 11.5, fontWeight: 700, cursor: 'pointer' }}>Resume</button>}
+            />
+          )))}
+          {list === 'sent' && (ov.sent.length === 0 ? <Empty text="Nothing sent yet." /> : ov.sent.map((x) => (
+            <Line key={x.phone + x.key} name={x.name || x.phone} phone={x.phone} sub={`HS${stepMeta(x.key).n} · ${fmtAt(x.at)}`} right={<Chip tone="teal">Sent</Chip>} />
+          )))}
+          {list === 'stopped' && (ov.stopped.length === 0 ? <Empty text="Nobody has been stopped." /> : ov.stopped.map((x) => (
+            <Line key={x.phone + x.key} name={x.name || x.phone} phone={x.phone} sub={`${x.reason} · ${fmtAt(x.at)}`} right={<Chip tone="grey">Stopped</Chip>} />
+          )))}
+        </div>
+      </Card>
     </>
   );
 }

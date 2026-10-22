@@ -107,13 +107,13 @@ export async function loadChaseFacts(
   const wanted = opts.pick ? opts.pick({ t1Rows, history, backfillPhones }) : null;
   const phones = [...t1Rows.keys()].filter((p) => !wanted || wanted.has(p));
   if (!phones.length) return { backfillPhones, t1Rows, history, facts };
-  type Conv = { id: string; phone_e164: string; last_inbound_at: string | null; lead_id: string | null };
+  type Conv = { id: string; phone_e164: string; last_inbound_at: string | null; lead_id: string | null; spotlight?: boolean | null };
   const phoneSet = new Set(phones);
   const wantedLeadIds = [...t1Rows.values()].filter((t) => phoneSet.has(t.phoneE164)).map((t) => t.leadId).filter(Boolean) as string[];
   const [byPhoneParts, byLeadParts] = await Promise.all([
     inParallel(chunk(phones, 100), async (ps) => {
       const { data, error } = await admin.from('relay_conversations')
-        .select('id, phone_e164, last_inbound_at, lead_id').eq('workspace_id', ws).in('phone_e164', ps);
+        .select('id, phone_e164, last_inbound_at, lead_id, spotlight').eq('workspace_id', ws).in('phone_e164', ps);
       if (error) throw new Error(`chase convs: ${error.message}`);
       return (data || []) as Conv[];
     }),
@@ -123,7 +123,7 @@ export async function loadChaseFacts(
     // team message or a STOP on either number stops the chase for them.
     inParallel(chunk(wantedLeadIds, 100), async (ids) => {
       const { data, error } = await admin.from('relay_conversations')
-        .select('id, phone_e164, last_inbound_at, lead_id').eq('workspace_id', ws).in('lead_id', ids);
+        .select('id, phone_e164, last_inbound_at, lead_id, spotlight').eq('workspace_id', ws).in('lead_id', ids);
       if (error) throw new Error(`chase linked convs: ${error.message}`);
       return (data || []) as Conv[];
     }),
@@ -169,12 +169,12 @@ export async function loadChaseFacts(
   });
 
   const leadIds = wantedLeadIds;
-  const leadInfo = new Map<string, { full_name: string | null; visa_type: string | null; stage: string | null }>();
-  type LeadRow = { id: string; full_name: string | null; visa_type: string | null; stage: string | null };
+  const leadInfo = new Map<string, { full_name: string | null; visa_type: string | null; stage: string | null; is_spotlight: boolean | null }>();
+  type LeadRow = { id: string; full_name: string | null; visa_type: string | null; stage: string | null; is_spotlight: boolean | null };
   const [eco] = await Promise.all([
     ecosystemStatesByConv(admin, convIds, now),
     inParallel(chunk(leadIds, 100), async (ids) => {
-      const { data, error } = await admin.from('leads').select('id, full_name, visa_type, stage').in('id', ids);
+      const { data, error } = await admin.from('leads').select('id, full_name, visa_type, stage, is_spotlight').in('id', ids);
       if (error) throw new Error(`chase leads: ${error.message}`);
       for (const l of (data || []) as LeadRow[]) leadInfo.set(l.id, l);
     }),
@@ -205,6 +205,7 @@ export async function loadChaseFacts(
       lastTeamOutMs: maxMs(mine.map((c) => lastTeamOut.get(c.phone_e164) ?? null)),
       failTimes: autoFails.get(t1.phoneE164) || [],
       stage: lead?.stage ?? null,
+      spotlight: !!lead?.is_spotlight || mine.some((c) => !!c.spotlight),
       name: lead?.full_name ?? null,
       visaType: lead?.visa_type ?? null,
       suppressed: mine.some((c) => suppressedSet.has(c.phone_e164)) || suppressedSet.has(t1.phoneE164),

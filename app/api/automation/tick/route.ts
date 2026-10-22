@@ -20,6 +20,8 @@ import {
   type AnyChaseKey, type ChaseJob,
 } from '@/lib/automation/follow-up';
 import { loadChaseRules, loadChaseFacts } from '@/lib/automation/chase-data';
+import { planNurture, templateOfStep, NURTURE_KEYS, NURTURE_MAX_ATTEMPTS } from '@/lib/automation/nurture';
+import { loadNurtureRule, loadNurtureFacts } from '@/lib/automation/nurture-data';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -321,6 +323,15 @@ export async function POST(req: NextRequest) {
       if (chase) report.push(chase);
     }
 
+    // =========================================================================
+    // THE HOT & SPOTLIGHT NURTURE (HS1 → HS8) — last, with whatever remains:
+    // a fresh lead's first message and a live chase beat a nurture nudge.
+    // =========================================================================
+    if (ctx.hasTime()) {
+      const nurture = await runNurture(admin, lockAdmin, ctx, { dryRun, workspaceId, suppressed });
+      if (nurture) report.push(nurture);
+    }
+
     return NextResponse.json({
       ok: true, dryRun,
       ms: ctx.elapsedMs(), sendsUsed: MAX_SENDS_PER_RUN - ctx.sendsLeft(),
@@ -521,6 +532,37 @@ async function sendQuickReply(
 }
 
 // =============================================================================
+// THE CROSS-ENGINE LOCK — one automated message per person per 20 hours.
+// -----------------------------------------------------------------------------
+// The T-chase and the HS nurture have separate audiences by design (Hot or
+// Spotlight leaves the chase; the nurture waits 3 quiet days after ANY
+// message). This is the belt to those braces: right before either engine
+// sends, anyone who received ANY automated message in the last 20 hours — on
+// any of their numbers — is held to a later run. Read fresh each pass, so a
+// message the chase sent a second ago blocks the nurture in the same run.
+// =============================================================================
+const CROSS_ENGINE_GAP_MS = 20 * 3_600_000;
+
+async function recentlyMessaged(admin: Admin, ws: string, now: number): Promise<{ phones: Set<string>; leads: Set<string> }> {
+  const since = new Date(now - CROSS_ENGINE_GAP_MS).toISOString();
+  const { data: msgs } = await admin.from('relay_messages').select('conversation_id')
+    .eq('workspace_id', ws).eq('direction', 'out').is('sent_by', null).neq('status', 'failed')
+    .gte('created_at', since).limit(5000);
+  const convIds = [...new Set(((msgs || []) as { conversation_id: string }[]).map((m) => m.conversation_id))];
+  const phones = new Set<string>();
+  const leads = new Set<string>();
+  const parts = await Promise.all(chunk(convIds, 100).map((ids) =>
+    admin.from('relay_conversations').select('phone_e164, lead_id').in('id', ids)));
+  for (const { data } of parts) {
+    for (const c of (data || []) as { phone_e164: string; lead_id: string | null }[]) {
+      phones.add(c.phone_e164);
+      if (c.lead_id) leads.add(c.lead_id);
+    }
+  }
+  return { phones, leads };
+}
+
+// =============================================================================
 // THE CHASE PASS. Reads everything in a few batched round trips, asks the pure
 // planner who is due, records the people who are out for good, and sends.
 // =============================================================================
@@ -593,6 +635,14 @@ async function runChase(
     allowed.push(...list.slice(0, left));
   }
   jobs = allowed.sort((a, b) => a.dueMs - b.dueMs);
+  {
+    const recent = await recentlyMessaged(admin, ws, now);
+    const held = jobs.filter((j) => recent.phones.has(j.phoneE164) || (j.leadId && recent.leads.has(j.leadId)));
+    if (held.length) {
+      for (const j of held) skipped.push(`${j.name || j.phoneE164} ${j.key}: held — got an automated message in the last 20h`);
+      jobs = jobs.filter((j) => !held.includes(j));
+    }
+  }
   out.due = jobs.length;
   if (!jobs.length) { if (!out.note) out.note = 'No follow-ups due.'; return out; }
 
@@ -620,10 +670,20 @@ async function runChase(
 // impossible. Always a template: by definition this person has not written to
 // us, so the 24-hour window is closed and nothing else is allowed anyway.
 // ---------------------------------------------------------------------------
+interface SendableJob {
+  key: string;
+  phoneE164: string;
+  leadId: string | null;
+  conversationId: string | null;
+  name: string | null;
+  visaType: string | null;
+  prior: { id: string; ok: boolean; attempts: number | null; sent_at: string; error: string | null } | null;
+}
+
 async function sendChaseMessage(
   admin: Admin, durable: Admin, ctx: RunContext, ws: string,
   rule: Record<string, any>,                                            // eslint-disable-line @typescript-eslint/no-explicit-any
-  job: ChaseJob,
+  job: SendableJob,
 ): Promise<string> {
   if (!ctx.takeSend()) return 'skip';
   let spent = false;
@@ -691,4 +751,84 @@ async function sendChaseMessage(
   } finally {
     if (!spent) ctx.giveBackSend();
   }
+}
+
+// =============================================================================
+// THE NURTURE PASS. Same bones as the chase: load, ask the pure planner,
+// record the people who are out, send under the caps. One switch, one cap,
+// Spotlight first.
+// =============================================================================
+async function runNurture(
+  admin: Admin, durable: Admin, ctx: RunContext,
+  opts: { dryRun: boolean; workspaceId: string | null; suppressed: { workspace_id: string; phone_e164: string }[] },
+): Promise<Record<string, unknown> | null> {
+  const { dryRun, workspaceId } = opts;
+  const now = Date.now();
+
+  const rule = await loadNurtureRule(admin, workspaceId, now);
+  if (!rule) return null;                           // not set up in this workspace
+  const out: Record<string, unknown> = { workspace: rule.ws, key: 'nurture_hs', sent: 0, skipped: [] as string[] };
+  const skipped = out.skipped as string[];
+  if (!rule.enabled && !dryRun) { out.note = 'The nurture is switched off.'; return out; }
+
+  const hour = istHour();
+  const inHours = hour >= CHASE_START_HOUR && hour < CHASE_END_HOUR;
+  if (!inHours && !dryRun) { out.note = `Outside sending hours (${CHASE_START_HOUR}:00–${CHASE_END_HOUR}:00 IST) — the nurture waits.`; return out; }
+  if (!inHours && dryRun) out.hoursNote = 'outside sending hours — live runs would wait';
+
+  const { people, history } = await loadNurtureFacts(admin, { ws: rule.ws, now, suppressed: opts.suppressed });
+  out.audience = people.length;
+
+  const plan = planNurture({ now, enabled: rule.enabled || dryRun, people, history });
+  skipped.push(...plan.skipped);
+
+  if (plan.settles.length && !dryRun) {
+    await admin.from('relay_automation_sent').upsert(
+      plan.settles.map((st) => ({
+        workspace_id: rule.ws, automation_key: st.key, lead_id: st.leadId, phone_e164: st.phoneE164,
+        method: 'skipped', detail: null, ok: false, error: st.reason, attempts: NURTURE_MAX_ATTEMPTS,
+      })),
+      { onConflict: 'workspace_id,automation_key,phone_e164' },
+    );
+  }
+  for (const st of plan.settles) if (!st.reason.startsWith('series complete')) skipped.push(`${st.phoneE164} ${st.key}: ${st.reason}`);
+
+  // ---- the cross-engine lock: nobody gets two automated messages in 20h -----
+  let jobs = plan.jobs;
+  {
+    const recent = await recentlyMessaged(admin, rule.ws, now);
+    const held = jobs.filter((j) => recent.phones.has(j.phoneE164) || recent.leads.has(j.leadId));
+    if (held.length) {
+      for (const j of held) skipped.push(`${j.name || j.phoneE164} ${j.key}: held — got an automated message in the last 20h`);
+      jobs = jobs.filter((j) => !held.includes(j));
+    }
+  }
+
+  // ---- one cap for the whole engine, counted across all eight steps ----------
+  if (rule.dailyCap > 0 && jobs.length) {
+    const { count } = await admin.from('relay_automation_sent')
+      .select('id', { count: 'exact', head: true })
+      .eq('workspace_id', rule.ws).in('automation_key', NURTURE_KEYS).eq('ok', true)
+      .gte('sent_at', new Date(`${istDate()}T00:00:00+05:30`).toISOString());
+    const left = Math.max(0, rule.dailyCap - (count ?? 0));
+    if (left < jobs.length) skipped.push(`nurture: daily cap ${rule.dailyCap} — ${jobs.length - left} wait for tomorrow`);
+    jobs = jobs.slice(0, left);                      // Spotlight already sorted first
+  }
+  out.due = jobs.length;
+  if (!jobs.length) { if (!out.note) out.note = 'Nobody is due a nurture message.'; return out; }
+
+  if (dryRun) {
+    for (const j of jobs) skipped.push(`DRY RUN — would send ${templateOfStep(j.key)} to ${j.name || j.phoneE164} (${j.phoneE164})${j.spotlight ? ' ★' : ''}`);
+    return out;
+  }
+
+  await forEachLimited(jobs, CHASE_CONCURRENCY, () => ctx.hasTime() && ctx.sendsLeft() > 0, async (job) => {
+    const stepRule = { key: job.key, template_name: templateOfStep(job.key), template_language: 'en' };
+    const outcome = await sendChaseMessage(admin, durable, ctx, rule.ws, stepRule, job);
+    if (outcome === 'sent') out.sent = (out.sent as number) + 1;
+    else if (outcome !== 'skip') skipped.push(`${job.name || job.phoneE164} ${job.key}: ${outcome}`);
+  });
+  const left = jobs.length - (out.sent as number);
+  if (left > 0 && !ctx.hasTime()) out.note = `${left} continue on the next run.`;
+  return out;
 }

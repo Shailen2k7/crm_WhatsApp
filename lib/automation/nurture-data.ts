@@ -1,0 +1,150 @@
+// =============================================================================
+// NURTURE DATA — everything the HS1→HS8 planner needs, read in parallel.
+// -----------------------------------------------------------------------------
+// One loader, two readers (the tick that sends and the Automation tab that
+// shows), so the screen can never promise something the engine will not do.
+//
+// The audience is LEADS (stage Hot, or the Spotlight flag on the lead or on a
+// starred chat). Silence is measured across EVERY conversation that is this
+// person: the one matching their CRM phone and any chat linked to their lead
+// from another number — a reply anywhere resets the clock.
+// =============================================================================
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { toE164 } from '@/lib/phone';
+import { ecosystemStatesByConv } from './ecosystem';
+import { chunk } from './parallel';
+import {
+  NURTURE_KEYS, NURTURE_PAUSE_KEY, NURTURE_RULE_KEY,
+  type NurtureHistRow, type NurturePerson,
+} from './nurture';
+
+export interface NurtureRule {
+  ws: string;
+  enabled: boolean;
+  dailyCap: number;
+  activatedAtMs: number;
+}
+
+export async function loadNurtureRule(admin: SupabaseClient, workspaceId: string | null, now: number): Promise<NurtureRule | null> {
+  let q = admin.from('relay_automations').select('workspace_id, enabled, daily_cap, activated_at').eq('key', NURTURE_RULE_KEY);
+  if (workspaceId) q = q.eq('workspace_id', workspaceId);
+  const { data, error } = await q.limit(1);
+  if (error) throw new Error(`nurture rule: ${error.message}`);
+  const r = (data || [])[0] as { workspace_id: string; enabled: boolean; daily_cap: number | null; activated_at: string | null } | undefined;
+  if (!r) return null;
+  return {
+    ws: r.workspace_id,
+    enabled: !!r.enabled,
+    dailyCap: Number(r.daily_cap) || 0,
+    activatedAtMs: r.activated_at ? new Date(r.activated_at).getTime() : now,
+  };
+}
+
+export interface NurtureFacts {
+  people: NurturePerson[];
+  history: NurtureHistRow[];
+}
+
+export async function loadNurtureFacts(
+  admin: SupabaseClient,
+  opts: { ws: string; now: number; suppressed?: { workspace_id: string; phone_e164: string }[] },
+): Promise<NurtureFacts> {
+  const { ws, now } = opts;
+  const last10 = (p: string | null | undefined) => {
+    const d = String(p || '').replace(/\D/g, '');
+    return d.length >= 10 ? d.slice(-10) : null;
+  };
+
+  // ---- the audience, their chats, their history, the opt-outs — in parallel --
+  type LeadRow = { id: string; full_name: string | null; phone: string | null; visa_type: string | null; stage: string | null; is_spotlight: boolean | null };
+  type ConvRow = { id: string; phone_e164: string; lead_id: string | null; last_message_at: string | null; spotlight: boolean | null };
+  const [leadsRes, convsRes, histRes, suppRes] = await Promise.all([
+    admin.from('leads')
+      .select('id, full_name, phone, visa_type, stage, is_spotlight')
+      .eq('workspace_id', ws).eq('is_sample', false)
+      .or('stage.eq.hot,is_spotlight.eq.true').limit(3000),
+    // Starred chats join the audience through their lead; every conversation is
+    // needed anyway to measure silence, so one whole read beats many lookups.
+    admin.from('relay_conversations')
+      .select('id, phone_e164, lead_id, last_message_at, spotlight')
+      .eq('workspace_id', ws).limit(5000),
+    admin.from('relay_automation_sent')
+      .select('id, automation_key, lead_id, phone_e164, ok, attempts, sent_at, error')
+      .eq('workspace_id', ws).in('automation_key', [...NURTURE_KEYS, NURTURE_PAUSE_KEY]).limit(5000),
+    opts.suppressed
+      ? Promise.resolve({ data: opts.suppressed, error: null })
+      : admin.from('relay_suppressions').select('workspace_id, phone_e164').eq('workspace_id', ws),
+  ]);
+  if (leadsRes.error) throw new Error(`nurture leads: ${leadsRes.error.message}`);
+  if (convsRes.error) throw new Error(`nurture convs: ${convsRes.error.message}`);
+  if (histRes.error) throw new Error(`nurture history: ${histRes.error.message}`);
+
+  const leads = (leadsRes.data || []) as LeadRow[];
+  const convs = (convsRes.data || []) as ConvRow[];
+  const history = (histRes.data || []) as NurtureHistRow[];
+  const suppressed = new Set(((suppRes.data || []) as { workspace_id: string; phone_e164: string }[])
+    .filter((s) => s.workspace_id === ws).map((s) => s.phone_e164));
+
+  const convsByLead = new Map<string, ConvRow[]>();
+  const convsBy10 = new Map<string, ConvRow[]>();
+  for (const c of convs) {
+    if (c.lead_id) { if (!convsByLead.has(c.lead_id)) convsByLead.set(c.lead_id, []); convsByLead.get(c.lead_id)!.push(c); }
+    const k = last10(c.phone_e164);
+    if (k) { if (!convsBy10.has(k)) convsBy10.set(k, []); convsBy10.get(k)!.push(c); }
+  }
+
+  // A starred chat whose lead is not Hot/Spotlight still counts (the team
+  // starred it for a reason) — bring that lead in.
+  const starredLeadIds = new Set(convs.filter((c) => c.spotlight && c.lead_id).map((c) => c.lead_id as string));
+  const haveLead = new Set(leads.map((l) => l.id));
+  const extraIds = [...starredLeadIds].filter((id) => !haveLead.has(id));
+  for (const ids of chunk(extraIds, 100)) {
+    const { data } = await admin.from('leads')
+      .select('id, full_name, phone, visa_type, stage, is_spotlight')
+      .eq('workspace_id', ws).eq('is_sample', false).in('id', ids);
+    leads.push(...((data || []) as LeadRow[]));
+  }
+
+  // ---- one person = lead + every conversation that is theirs -----------------
+  const pre = leads.map((l) => {
+    const mine = [...new Map([
+      ...(convsByLead.get(l.id) || []).map((c) => [c.id, c] as const),
+      ...(convsBy10.get(last10(l.phone) || '') || []).map((c) => [c.id, c] as const),
+    ]).values()];
+    // Send where they actually talk: the busiest linked chat wins; the CRM
+    // phone is the fallback for a Hot lead who has never messaged.
+    const best = mine.filter((c) => c.lead_id === l.id).sort((a, b) => String(b.last_message_at || '').localeCompare(String(a.last_message_at || '')))[0]
+      ?? mine.sort((a, b) => String(b.last_message_at || '').localeCompare(String(a.last_message_at || '')))[0]
+      ?? null;
+    const phone = best?.phone_e164 ?? toE164(l.phone);
+    return { l, mine, best, phone };
+  }).filter((x): x is typeof x & { phone: string } => !!x.phone);
+
+  const eco = await ecosystemStatesByConv(admin, pre.flatMap((x) => x.mine.map((c) => c.id)), now);
+
+  const pausedPhones = new Set(history.filter((h) => h.automation_key === NURTURE_PAUSE_KEY && (h.error || '').startsWith('paused')).map((h) => h.phone_e164));
+
+  const people: NurturePerson[] = pre.map(({ l, mine, best, phone }) => {
+    const activity = mine.map((c) => (c.last_message_at ? new Date(c.last_message_at).getTime() : null)).filter((x): x is number => x !== null);
+    const ecoStates = mine.map((c) => eco.get(c.id)).filter(Boolean) as { stopped: boolean; pausedUntil: string | null }[];
+    const pausedUntilMs = ecoStates.map((e) => (e.pausedUntil ? new Date(e.pausedUntil).getTime() : null)).filter((x): x is number => x !== null);
+    return {
+      leadId: l.id,
+      phoneE164: phone,
+      name: l.full_name,
+      visaType: l.visa_type,
+      stage: l.stage,
+      spotlight: !!l.is_spotlight || mine.some((c) => c.spotlight),
+      conversationId: best?.id ?? null,
+      lastActivityMs: activity.length ? Math.max(...activity) : null,
+      suppressed: suppressed.has(phone) || mine.some((c) => suppressed.has(c.phone_e164)),
+      ecosystem: ecoStates.length ? {
+        stopped: ecoStates.some((e) => e.stopped),
+        pausedUntil: pausedUntilMs.length ? new Date(Math.max(...pausedUntilMs)).toISOString() : null,
+      } : null,
+      paused: pausedPhones.has(phone),
+    };
+  });
+
+  return { people, history };
+}

@@ -85,6 +85,7 @@ export const SETTLE = {
   replied: 'stopped — they replied after T1',
   team: 'stopped — the team messaged them by hand',
   stage: (s: string) => `stopped — a human set their stage to ${s}`,
+  spotlight: 'stopped — starred Spotlight: the Hot & Spotlight nurture looks after them now',
   optedOut: 'stopped — opted out (STOP)',
   t1Failed: (code: string) => `stopped — T1 was never delivered (Meta error ${code}), nothing to follow up`,
   ecosystem: 'stopped — refused by Meta 3 times, after a 4-day and a 10-day pause',
@@ -119,6 +120,8 @@ export interface PersonFacts {
   /** Every FAILED automated outbound in this conversation, with Meta's code. */
   failTimes: { atMs: number; code: string | null }[];
   stage: string | null;
+  /** Starred Spotlight (lead flag or chat star): the HS nurture owns them. */
+  spotlight?: boolean;
   name: string | null;
   visaType: string | null;
   suppressed: boolean;
@@ -284,6 +287,7 @@ export function planChase(input: ChasePlanInput): ChasePlan {
       if (f.lastInboundMs !== null && f.lastInboundMs > t1.sentAtMs) { settle(key, SETTLE.replied); continue; }
       if (f.lastTeamOutMs !== null && f.lastTeamOutMs > Math.max(t1.sentAtMs, activatedAtMs)) { settle(key, SETTLE.team); continue; }
       if (f.stage && HUMAN_STAGES.has(f.stage)) { settle(key, SETTLE.stage(f.stage)); continue; }
+      if (f.spotlight) { settle(key, SETTLE.spotlight); continue; }
       if (f.suppressed) { settle(key, SETTLE.optedOut); continue; }
       if (lastAttemptFail.code !== '131049') {
         // Undeliverable number, experiment group, etc. — trying again cannot
@@ -337,7 +341,7 @@ export function planChase(input: ChasePlanInput): ChasePlan {
         // Only people the stop checks would still let through are "waiting".
         const stopped = (f.lastInboundMs !== null && f.lastInboundMs > t1.sentAtMs)
           || (f.lastTeamOutMs !== null && f.lastTeamOutMs > Math.max(t1.sentAtMs, activatedAtMs))
-          || (!!f.stage && HUMAN_STAGES.has(f.stage)) || f.suppressed || !!f.ecosystem?.stopped;
+          || (!!f.stage && HUMAN_STAGES.has(f.stage)) || !!f.spotlight || f.suppressed || !!f.ecosystem?.stopped;
         if (!stopped) upcoming.push({ key, phoneE164: t1.phoneE164, leadId: t1.leadId, name: f.name, dueMs, wait: 'off' });
         chainOk = false; break;
       }
@@ -353,6 +357,13 @@ export function planChase(input: ChasePlanInput): ChasePlan {
       }
       if (f.stage && HUMAN_STAGES.has(f.stage)) {
         settles.push({ key, phoneE164: t1.phoneE164, leadId: t1.leadId, reason: SETTLE.stage(f.stage) });
+        chainOk = false; break;
+      }
+      // ONE ENGINE PER PERSON. Hot leads already leave the chase via the stage
+      // check above; a Spotlight star on a lead still marked Cold must too —
+      // otherwise the same person could be in the T-chase AND the HS nurture.
+      if (f.spotlight) {
+        settles.push({ key, phoneE164: t1.phoneE164, leadId: t1.leadId, reason: SETTLE.spotlight });
         chainOk = false; break;
       }
       if (f.suppressed) {
