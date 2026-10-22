@@ -19,8 +19,7 @@
 // =============================================================================
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { ecosystemStateFrom, ECOSYSTEM_CODE } from './ecosystem';
-
-const chunk = <T,>(xs: T[], n: number) => Array.from({ length: Math.ceil(xs.length / n) }, (_, i) => xs.slice(i * n, i * n + n));
+import { chunk, inParallel } from './parallel';
 const HUMAN_STAGES = new Set(['hot', 'won', 'junk', 'lost', 'retired']);
 
 export interface UndeliveredT1 {
@@ -55,49 +54,72 @@ function explain(code: string | null, rowError: string | null): { reason: string
 export async function findUndeliveredT1(
   admin: SupabaseClient, ws: string, now: number, onlyPhone?: string,
 ): Promise<UndeliveredT1[]> {
-  // ---- every T1 record (one per person) ---------------------------------------
-  // A query builder is mutable, so each page gets a fresh one.
-  const query = () => {
-    let q = admin.from('relay_automation_sent')
-      .select('id, lead_id, phone_e164, ok, error, method, sent_at')
-      .eq('workspace_id', ws).eq('automation_key', 'new_lead_first');
-    if (onlyPhone) q = q.eq('phone_e164', onlyPhone);
+  // ---- start from what FAILED, not from every T1 ever sent --------------------
+  // Two small sets: automated messages Meta refused, and T1 records whose own
+  // send failed (wallet, bad number…). Everyone else's T1 went through.
+  type Row = { id: string; lead_id: string | null; phone_e164: string; ok: boolean; error: string | null; method: string | null; sent_at: string };
+  type Fail = { conversation_id: string; created_at: string; error_code: string | null };
+  type Conv = { id: string; phone_e164: string; last_inbound_at: string | null };
+  const rowCols = 'id, lead_id, phone_e164, ok, error, method, sent_at';
+  const failQuery = () => {
+    const q = admin.from('relay_messages').select('conversation_id, created_at, error_code')
+      .eq('workspace_id', ws).eq('direction', 'out').is('sent_by', null).eq('status', 'failed');
     return q;
   };
-  const rows: { id: string; lead_id: string | null; phone_e164: string; ok: boolean; error: string | null; method: string | null; sent_at: string }[] = [];
-  for (let page = 0; page < 20; page++) {
-    const { data, error } = await query().order('sent_at', { ascending: true }).range(page * 1000, page * 1000 + 999);
+  const [failRes, badRowsRes] = await Promise.all([
+    failQuery().limit(10000),
+    (onlyPhone
+      ? admin.from('relay_automation_sent').select(rowCols).eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', false).eq('phone_e164', onlyPhone)
+      : admin.from('relay_automation_sent').select(rowCols).eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', false)
+    ).limit(5000),
+  ]);
+  if (failRes.error) throw new Error(`fails: ${failRes.error.message}`);
+  if (badRowsRes.error) throw new Error(`t1 rows: ${badRowsRes.error.message}`);
+  const allFails = (failRes.data || []) as Fail[];
+
+  // The conversations those refusals belong to → their phones.
+  const failConvIds = [...new Set(allFails.map((f) => f.conversation_id))];
+  const convs: Conv[] = (await inParallel(chunk(failConvIds, 100), async (ids) => {
+    const { data, error } = await admin.from('relay_conversations')
+      .select('id, phone_e164, last_inbound_at').in('id', ids);
+    if (error) throw new Error(`convs: ${error.message}`);
+    return (data || []) as Conv[];
+  })).flat();
+
+  // The T1 record of everyone who might be affected.
+  const candidatePhones = new Set<string>([
+    ...convs.map((c) => c.phone_e164),
+    ...((badRowsRes.data || []) as Row[]).map((r) => r.phone_e164),
+  ]);
+  if (onlyPhone) for (const p of [...candidatePhones]) if (p !== onlyPhone) candidatePhones.delete(p);
+  const rows: Row[] = (await inParallel(chunk([...candidatePhones], 100), async (ps) => {
+    const { data, error } = await admin.from('relay_automation_sent').select(rowCols)
+      .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').in('phone_e164', ps);
     if (error) throw new Error(`t1 rows: ${error.message}`);
-    rows.push(...((data || []) as typeof rows));
-    if (!data || data.length < 1000) break;
+    return (data || []) as Row[];
+  })).flat();
+  const byPhone = new Map<string, Row>();
+  for (const r of rows.sort((a, b) => a.sent_at.localeCompare(b.sent_at))) {
+    if (r.method !== 'skipped' && !byPhone.has(r.phone_e164)) byPhone.set(r.phone_e164, r);
   }
-  const byPhone = new Map<string, (typeof rows)[number]>();
-  for (const r of rows) if (r.method !== 'skipped' && !byPhone.has(r.phone_e164)) byPhone.set(r.phone_e164, r);
   if (!byPhone.size) return [];
 
-  // ---- conversations for these people -------------------------------------------
-  const convs: { id: string; phone_e164: string; last_inbound_at: string | null }[] = [];
-  for (const ps of chunk([...byPhone.keys()], 100)) {
-    const { data, error } = await admin.from('relay_conversations')
+  // Conversations for people whose own send failed (they may have none above).
+  const known = new Set(convs.map((c) => c.phone_e164));
+  const missing = [...byPhone.keys()].filter((p) => !known.has(p));
+  convs.push(...(await inParallel(chunk(missing, 100), async (ps) => {
+    const { data } = await admin.from('relay_conversations')
       .select('id, phone_e164, last_inbound_at').eq('workspace_id', ws).in('phone_e164', ps);
-    if (error) throw new Error(`convs: ${error.message}`);
-    convs.push(...((data || []) as typeof convs));
-  }
+    return (data || []) as Conv[];
+  })).flat());
   const convByPhone = new Map(convs.map((c) => [c.phone_e164, c]));
   const phoneByConv = new Map(convs.map((c) => [c.id, c.phone_e164]));
 
-  // ---- failed automated messages (small) → the candidates -----------------------
   const failsByPhone = new Map<string, { atMs: number; code: string | null }[]>();
-  for (const ids of chunk(convs.map((c) => c.id), 100)) {
-    const { data, error } = await admin.from('relay_messages')
-      .select('conversation_id, created_at, error_code')
-      .in('conversation_id', ids).eq('direction', 'out').is('sent_by', null).eq('status', 'failed').limit(5000);
-    if (error) throw new Error(`fails: ${error.message}`);
-    for (const m of (data || []) as { conversation_id: string; created_at: string; error_code: string | null }[]) {
-      const p = phoneByConv.get(m.conversation_id); if (!p) continue;
-      if (!failsByPhone.has(p)) failsByPhone.set(p, []);
-      failsByPhone.get(p)!.push({ atMs: new Date(m.created_at).getTime(), code: m.error_code });
-    }
+  for (const m of allFails) {
+    const p = phoneByConv.get(m.conversation_id); if (!p) continue;
+    if (!failsByPhone.has(p)) failsByPhone.set(p, []);
+    failsByPhone.get(p)!.push({ atMs: new Date(m.created_at).getTime(), code: m.error_code });
   }
 
   const candidates = [...byPhone.values()].filter((r) => {
@@ -111,7 +133,11 @@ export async function findUndeliveredT1(
   const candConvIds = candidates.map((r) => convByPhone.get(r.phone_e164)?.id).filter(Boolean) as string[];
   const reached = new Set<string>();
   const teamed = new Set<string>();
-  for (const ids of chunk(candConvIds, 100)) {
+  const leadIds = candidates.map((r) => r.lead_id).filter(Boolean) as string[];
+  const leads = new Map<string, { full_name: string | null; stage: string | null }>();
+  const suppressed = new Set<string>();
+  await Promise.all([
+    inParallel(chunk(candConvIds, 100), async (ids) => {
     const [ok, team] = await Promise.all([
       admin.from('relay_messages').select('conversation_id')
         .in('conversation_id', ids).eq('direction', 'out').in('status', ['delivered', 'read']).limit(5000),
@@ -123,16 +149,16 @@ export async function findUndeliveredT1(
     if (team.error) throw new Error(`team: ${team.error.message}`);
     for (const m of (ok.data || []) as { conversation_id: string }[]) reached.add(m.conversation_id);
     for (const m of (team.data || []) as { conversation_id: string }[]) teamed.add(m.conversation_id);
-  }
-
-  const leadIds = candidates.map((r) => r.lead_id).filter(Boolean) as string[];
-  const leads = new Map<string, { full_name: string | null; stage: string | null }>();
-  for (const ids of chunk(leadIds, 100)) {
-    const { data } = await admin.from('leads').select('id, full_name, stage').in('id', ids);
-    for (const l of (data || []) as { id: string; full_name: string | null; stage: string | null }[]) leads.set(l.id, l);
-  }
-  const { data: supp } = await admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws);
-  const suppressed = new Set(((supp || []) as { phone_e164: string }[]).map((s) => s.phone_e164));
+    }),
+    inParallel(chunk(leadIds, 100), async (ids) => {
+      const { data } = await admin.from('leads').select('id, full_name, stage').in('id', ids);
+      for (const l of (data || []) as { id: string; full_name: string | null; stage: string | null }[]) leads.set(l.id, l);
+    }),
+    (async () => {
+      const { data: supp } = await admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws);
+      for (const x of (supp || []) as { phone_e164: string }[]) suppressed.add(x.phone_e164);
+    })(),
+  ]);
 
   const out: UndeliveredT1[] = [];
   for (const r of candidates) {

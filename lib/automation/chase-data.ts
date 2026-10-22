@@ -16,21 +16,7 @@ import {
   type AnyChaseKey, type ChaseHistRow, type PersonFacts, type T1Done,
 } from './follow-up';
 import { ecosystemStatesByConv } from './ecosystem';
-
-const chunk = <T,>(xs: T[], n: number) => Array.from({ length: Math.ceil(xs.length / n) }, (_, i) => xs.slice(i * n, i * n + n));
-
-/**
- * Runs the chunked queries side by side (a few at a time) instead of one after
- * another. Sequential, ~25 round trips cost 7–9 s and starved every send.
- */
-async function inParallel<T, R>(items: T[], fn: (item: T) => Promise<R>, width = 6): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(width, items.length) }, async () => {
-    while (next < items.length) { const i = next++; out[i] = await fn(items[i]); }
-  }));
-  return out;
-}
+import { chunk, inParallel } from './parallel';
 
 export interface ChaseRules {
   ws: string;

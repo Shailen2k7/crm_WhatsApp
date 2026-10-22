@@ -1,10 +1,16 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ChevronDown, Loader2, RefreshCw, RotateCw, MessageSquare } from 'lucide-react';
+import { ChevronDown, ChevronRight, Loader2, RefreshCw, RotateCw, MessageSquare, FileText, Snowflake, Flame } from 'lucide-react';
+import { createClient } from '@/lib/supabase/client';
 
 /**
- * SETTINGS → AUTOMATION. One tab per step of the CV/LinkedIn chase.
+ * SETTINGS → AUTOMATION. One tab per AUTOMATION ENGINE — the CV & LinkedIn
+ * chase today; the Cold and Hot lead chases next (shown as design previews,
+ * with no engine and no live switches, until they are built). Inside each tab
+ * the engine's steps sit on a timeline; pick a step to manage it.
+ *
+ * Step management (unchanged):
  *
  * Each tab is the whole story of that step: its switch and daily limit, the
  * exact approved wording, how it has done this week, who it went to (with the
@@ -27,6 +33,14 @@ const TABS: { key: Key; label: string; title: string; when: string }[] = [
   { key: 'no_reply_t4', label: 'T4', title: 'T4 — last follow-up', when: '7 days after T1, if still no reply. The final message. 10am–7pm IST.' },
 ];
 
+const STEP_DAY: Record<Key, string> = {
+  new_lead_first: 'Day 0',
+  no_reply_t1r: 'If Meta refused',
+  no_reply_t2: 'Day 1',
+  no_reply_t3: 'Day 3',
+  no_reply_t4: 'Day 7',
+};
+
 interface Overview {
   isAdmin: boolean;
   rule: { key: string; enabled: boolean; template_name: string | null; daily_cap: number | null; body: string | null };
@@ -40,72 +54,122 @@ interface Overview {
 const fmt = (iso: string) =>
   new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(iso));
 
-export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) => void }) {
-  const [tab, setTab] = useState<Key>('new_lead_first');
-  const [data, setData] = useState<Partial<Record<Key, Overview>>>({});
-  const [onMap, setOnMap] = useState<Partial<Record<Key, boolean>>>({});
+// ---- SESSION CACHE -----------------------------------------------------------
+// Kept at module level, so it survives switching steps, switching engines and
+// leaving Settings: a step you have opened once shows INSTANTLY next time, and
+// is refreshed quietly behind it. Only this browser tab's memory — nothing is
+// stored, and a page reload starts clean.
+const overviewCache = new Map<Key, Overview>();
+let switchCache: Partial<Record<Key, boolean>> | null = null;
+let selectedStep: Key = 'new_lead_first';
+/** A refresh already running for a step — clicks never start a second one. */
+const inFlight = new Map<Key, Promise<Overview | null>>();
+
+/** `force` = after a change (switch, limit, resend): never reuse a read that began before it. */
+function fetchOverview(k: Key, force = false): Promise<Overview | null> {
+  const running = inFlight.get(k);
+  if (running && !force) return running;
+  const p = fetch(`/api/automation/overview?key=${k}`, { cache: 'no-store' })
+    .then((r) => r.json())
+    .then((json) => {
+      if (!json.ok) throw new Error(json.error || 'Could not load.');
+      overviewCache.set(k, json as Overview);
+      return json as Overview;
+    })
+    .finally(() => { if (inFlight.get(k) === p) inFlight.delete(k); });
+  inFlight.set(k, p);
+  return p;
+}
+
+function CvChase({ onOpenChat }: { onOpenChat?: (key: string) => void }) {
+  const [tab, setTabState] = useState<Key>(selectedStep);
+  const setTab = (k: Key) => { selectedStep = k; setTabState(k); };
+  const [data, setData] = useState<Partial<Record<Key, Overview>>>(() => Object.fromEntries(overviewCache));
+  const [onMap, setOnMap] = useState<Partial<Record<Key, boolean>>>(() => switchCache || {});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async (k: Key) => {
-    setLoading(true);
-    setError(null);
+  /** Fetch one step; with `quiet`, a failure keeps what is on screen. */
+  const load = useCallback(async (k: Key, quiet = false, force = false) => {
+    if (!quiet) { setLoading(true); setError(null); }
     try {
-      const res = await fetch(`/api/automation/overview?key=${k}`, { cache: 'no-store' });
-      const json = await res.json();
-      if (!json.ok) { setError(json.error || 'Could not load.'); return; }
-      setData((d) => ({ ...d, [k]: json as Overview }));
-      setOnMap((m) => ({ ...m, [k]: !!json.rule?.enabled }));
-    } catch {
-      setError('Could not load — check your connection.');
+      const ov = await fetchOverview(k, force);
+      if (!ov) return;
+      setData((d) => ({ ...d, [k]: ov }));
+      setOnMap((m) => { const n = { ...m, [k]: !!ov.rule?.enabled }; switchCache = n; return n; });
+    } catch (e) {
+      if (!quiet) setError(e instanceof Error ? e.message : 'Could not load — check your connection.');
     } finally {
-      setLoading(false);
+      if (!quiet) setLoading(false);
     }
   }, []);
 
-  // The tab dots: one light call for all five switches.
+  // The step dots: one light call for all five switches.
   const loadSwitches = useCallback(async () => {
     try {
       const res = await fetch('/api/automation/switch', { cache: 'no-store' });
       const json = await res.json();
-      if (json.ok) setOnMap(Object.fromEntries((json.rules as { key: Key; enabled: boolean }[]).map((r) => [r.key, r.enabled])));
+      if (json.ok) {
+        const m = Object.fromEntries((json.rules as { key: Key; enabled: boolean }[]).map((r) => [r.key, r.enabled]));
+        switchCache = m;
+        setOnMap(m);
+      }
     } catch { /* dots are decoration */ }
   }, []);
 
   useEffect(() => { loadSwitches(); }, [loadSwitches]);
+
+  // Show what we have at once; refresh behind it. A step never seen before
+  // shows the loader only until its first answer.
   useEffect(() => {
-    load(tab);
-    const t = setInterval(() => load(tab), 60_000);
+    load(tab, overviewCache.has(tab));
+    const t = setInterval(() => load(tab, true), 60_000);
     return () => clearInterval(t);
   }, [tab, load]);
+
+  // Pick up steps the warm-up (below) finishes while this view is open.
+  useEffect(() => {
+    const t = setInterval(() => {
+      setData((d) => {
+        let changed = false;
+        const n = { ...d };
+        for (const [k, v] of overviewCache) if (!n[k]) { n[k] = v; changed = true; }
+        return changed ? n : d;
+      });
+    }, 400);
+    return () => clearInterval(t);
+  }, []);
 
   const meta = TABS.find((t) => t.key === tab)!;
   const ov = data[tab];
 
   return (
     <div>
-      {/* ---- the tabs ---- */}
-      <div role="tablist" style={{ display: 'flex', gap: 6, overflowX: 'auto', scrollbarWidth: 'none', marginBottom: 14, paddingBottom: 2 }}>
-        {TABS.map((t) => {
+      {/* ---- the steps, in the order a lead meets them ---- */}
+      <div style={{ display: 'flex', alignItems: 'stretch', gap: 0, overflowX: 'auto', scrollbarWidth: 'none', marginBottom: 14, paddingBottom: 2 }}>
+        {TABS.map((t, i) => {
           const active = t.key === tab;
           const on = onMap[t.key];
           return (
-            <button
-              key={t.key}
-              role="tab"
-              aria-selected={active}
-              onClick={() => setTab(t.key)}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 7, flex: 'none',
-                padding: '8px 14px', borderRadius: 99, cursor: 'pointer',
-                border: '1px solid ' + (active ? 'transparent' : 'var(--line)'),
-                background: active ? 'var(--teal)' : 'var(--surface)',
-                color: active ? '#fff' : 'var(--ink-2)', fontSize: 13, fontWeight: 600,
-              }}
-            >
-              <span style={{ width: 7, height: 7, borderRadius: 99, background: on === undefined ? 'var(--line)' : on ? (active ? '#fff' : 'var(--teal)') : (active ? 'rgba(255,255,255,.45)' : 'var(--muted)'), opacity: on ? 1 : 0.6 }} />
-              {t.label}
-            </button>
+            <div key={t.key} style={{ display: 'flex', alignItems: 'center', flex: 'none' }}>
+              {i > 0 && <ChevronRight size={14} style={{ color: 'var(--muted)', margin: '0 2px', flex: 'none' }} />}
+              <button
+                role="tab"
+                aria-selected={active}
+                onClick={() => setTab(t.key)}
+                style={{
+                  textAlign: 'left', padding: '8px 12px', borderRadius: 11, cursor: 'pointer', minWidth: 86,
+                  border: '1px solid ' + (active ? 'var(--teal)' : 'var(--line)'),
+                  background: active ? 'var(--teal-bg)' : 'var(--surface)',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, fontWeight: 700, color: active ? 'var(--teal-ink)' : 'var(--ink)' }}>
+                  <span style={{ width: 7, height: 7, borderRadius: 99, flex: 'none', background: on === undefined ? 'var(--line)' : on ? 'var(--teal)' : 'var(--muted)', opacity: on ? 1 : 0.5 }} />
+                  {t.label}
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2, whiteSpace: 'nowrap' }}>{STEP_DAY[t.key]}</div>
+              </button>
+            </div>
           );
         })}
       </div>
@@ -121,7 +185,7 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
           meta={meta}
           ov={ov}
           loading={loading}
-          onReload={() => { load(tab); loadSwitches(); }}
+          onReload={() => { load(tab, false, true); loadSwitches(); }}
           onOpenChat={onOpenChat}
         />
       )}
@@ -421,4 +485,195 @@ function StatusChip({ status }: { status: string }) {
 
 function Empty({ text }: { text: string }) {
   return <div style={{ padding: '18px 4px', textAlign: 'center', fontSize: 12.5, color: 'var(--muted)' }}>{text}</div>;
+}
+
+// =============================================================================
+// THE ENGINE TABS
+// =============================================================================
+type Engine = 'cv' | 'cold' | 'hot';
+
+const ENGINES: { id: Engine; label: string; icon: React.ReactNode; live: boolean; blurb: string }[] = [
+  { id: 'cv', label: 'CV & LinkedIn chase', icon: <FileText size={14} />, live: true, blurb: 'New leads: ask for the CV and LinkedIn, then follow up until they reply.' },
+  { id: 'cold', label: 'Cold lead chase', icon: <Snowflake size={14} />, live: false, blurb: 'Leads marked Cold in the CRM: slow, spaced nudges over months.' },
+  { id: 'hot', label: 'Hot lead chase', icon: <Flame size={14} />, live: false, blurb: 'Leads marked Hot: short, closer follow-ups towards a call.' },
+];
+
+let selectedEngine: Engine = 'cv';
+
+export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) => void }) {
+  const [engine, setEngineState] = useState<Engine>(selectedEngine);
+  const setEngine = (e: Engine) => { selectedEngine = e; setEngineState(e); };
+  const [cvOn, setCvOn] = useState<number | null>(() => (switchCache ? Object.values(switchCache).filter(Boolean).length : null));
+
+  useEffect(() => {
+    fetch('/api/automation/switch', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
+      if (j.ok) setCvOn((j.rules as { enabled: boolean }[]).filter((x) => x.enabled).length);
+    }).catch(() => {});
+  }, [engine]);
+
+  // WARM-UP: the moment the Automation section opens, fetch every step in the
+  // background (two at a time, the selected one first), so the first click on
+  // any of them is instant — not just the second.
+  useEffect(() => {
+    let cancelled = false;
+    const order = [selectedStep, ...TABS.map((t) => t.key).filter((k) => k !== selectedStep)]
+      .filter((k) => !overviewCache.has(k));
+    let i = 0;
+    const worker = async () => {
+      while (!cancelled && i < order.length) {
+        const k = order[i++];
+        try { await fetchOverview(k); } catch { /* a click will retry */ }
+      }
+    };
+    worker(); worker();
+    return () => { cancelled = true; };
+  }, []);
+
+  const current = ENGINES.find((e) => e.id === engine)!;
+
+  return (
+    <div>
+      <div role="tablist" style={{ display: 'flex', gap: 8, overflowX: 'auto', scrollbarWidth: 'none', marginBottom: 6, paddingBottom: 2 }}>
+        {ENGINES.map((e) => {
+          const active = e.id === engine;
+          const status = e.live ? (cvOn === null ? '' : cvOn > 0 ? 'On' : 'Off') : 'Coming next';
+          return (
+            <button
+              key={e.id}
+              role="tab"
+              aria-selected={active}
+              onClick={() => setEngine(e.id)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 8, flex: 'none',
+                padding: '10px 14px', borderRadius: 12, cursor: 'pointer',
+                border: '1px solid ' + (active ? 'transparent' : 'var(--line)'),
+                background: active ? 'var(--ink)' : 'var(--surface)',
+                color: active ? 'var(--surface)' : 'var(--ink-2)', fontSize: 13.5, fontWeight: 700,
+              }}
+            >
+              {e.icon}
+              {e.label}
+              {status && (
+                <span style={{
+                  fontSize: 10.5, fontWeight: 700, padding: '2px 7px', borderRadius: 99,
+                  background: e.live && cvOn ? 'var(--teal)' : active ? 'rgba(255,255,255,.16)' : 'var(--surface-3)',
+                  color: e.live && cvOn ? '#fff' : active ? 'var(--surface)' : 'var(--muted)',
+                }}>{status}</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+      <p style={{ fontSize: 12.5, color: 'var(--muted)', margin: '6px 0 16px', lineHeight: 1.5 }}>{current.blurb}</p>
+
+      {engine === 'cv' && <CvChase onOpenChat={onOpenChat} />}
+      {engine === 'cold' && (
+        <PreviewEngine
+          name="Cold lead chase"
+          audience="Leads whose stage is Cold in the CRM (2,124 today)"
+          hours="10am–7pm IST"
+          steps={[
+            { tpl: 'c1', after: 'Start' }, { tpl: 'c2', after: '+3 days' }, { tpl: 'c3', after: '+7 days' }, { tpl: 'c4', after: '+14 days' },
+            { tpl: 'c5', after: '+21 days' }, { tpl: 'c6', after: '+40 days' }, { tpl: 'c7', after: '+70 days' }, { tpl: 'c8', after: '+90 days' },
+          ]}
+        />
+      )}
+      {engine === 'hot' && (
+        <PreviewEngine
+          name="Hot lead chase"
+          audience="Leads whose stage is Hot in the CRM (119 today)"
+          hours="10am–7pm IST"
+          steps={[{ tpl: 'h1', after: 'Start' }, { tpl: 'h2', after: '+3 days' }, { tpl: 'h3', after: '+3 days' }, { tpl: 'h4', after: '+4 days' }]}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * A DESIGN PREVIEW of an engine that is not built yet: the steps, timing and
+ * exact approved wording, so the shape can be agreed before any code that can
+ * send exists. Every control here is disabled on purpose.
+ */
+const templateBodyCache: Record<string, string> = {};
+
+function PreviewEngine({ name, audience, hours, steps }: {
+  name: string; audience: string; hours: string; steps: { tpl: string; after: string }[];
+}) {
+  const [bodies, setBodies] = useState<Record<string, string>>(() => ({ ...templateBodyCache }));
+  const [open, setOpen] = useState<string | null>(steps[0]?.tpl ?? null);
+
+  // Keyed on the template NAMES, not the array: the parent builds a fresh
+  // array every render, and depending on it would refetch forever.
+  const names = steps.map((x) => x.tpl).join(',');
+  useEffect(() => {
+    const supabase = createClient();
+    supabase.from('relay_templates').select('name, body').in('name', names.split(',')).then(({ data }) => {
+      for (const t of (data || []) as { name: string; body: string }[]) templateBodyCache[t.name] = t.body;
+      setBodies({ ...templateBodyCache });
+    });
+  }, [names]);
+
+  return (
+    <>
+      <div style={{ background: 'var(--amber-bg)', color: 'var(--amber)', padding: '10px 13px', borderRadius: 11, fontSize: 12.5, fontWeight: 600, marginBottom: 14, lineHeight: 1.5 }}>
+        Design preview — {name} is not built yet. Nothing here can send; the switches are disabled.
+      </div>
+
+      <Card>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>{name}</div>
+            <div style={{ fontSize: 12.5, color: 'var(--muted)', marginTop: 4, lineHeight: 1.55 }}>
+              <strong style={{ color: 'var(--ink-2)' }}>Who:</strong> {audience}<br />
+              <strong style={{ color: 'var(--ink-2)' }}>When:</strong> {hours}, one message per person per day at most<br />
+              <strong style={{ color: 'var(--ink-2)' }}>Stops:</strong> the moment they reply, the team messages them, their stage changes, or they say STOP
+            </div>
+          </div>
+          <Switch on={false} disabled onClick={() => {}} label={name} />
+        </div>
+      </Card>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 0, overflowX: 'auto', scrollbarWidth: 'none', marginBottom: 14, paddingBottom: 2 }}>
+        {steps.map((st, i) => (
+          <div key={st.tpl} style={{ display: 'flex', alignItems: 'center', flex: 'none' }}>
+            {i > 0 && <ChevronRight size={14} style={{ color: 'var(--muted)', margin: '0 2px' }} />}
+            <button
+              onClick={() => setOpen(st.tpl)}
+              style={{
+                textAlign: 'left', padding: '8px 12px', borderRadius: 11, cursor: 'pointer', minWidth: 74,
+                border: '1px solid ' + (open === st.tpl ? 'var(--ink-2)' : 'var(--line)'),
+                background: open === st.tpl ? 'var(--surface-3)' : 'var(--surface)',
+              }}
+            >
+              <div style={{ fontSize: 13, fontWeight: 700 }}>{st.tpl.toUpperCase()}</div>
+              <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2, whiteSpace: 'nowrap' }}>{st.after}</div>
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {open && (
+        <Card>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <span style={{ fontSize: 14, fontWeight: 700 }}>{open.toUpperCase()}</span>
+            <span style={{ fontSize: 12, color: 'var(--muted)' }}>{steps.find((x) => x.tpl === open)?.after} · template <code>{open}</code></span>
+            <span style={{ marginLeft: 'auto' }}><Switch on={false} disabled onClick={() => {}} label={open} /></span>
+          </div>
+          <div style={{ padding: '11px 13px', borderRadius: 10, background: 'var(--surface-2)', fontSize: 13, lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
+            {(bodies[open] || 'Loading wording…').replace(/\{\{\s*1\s*\}\}/g, 'Name')}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(96px, 1fr))', gap: 8, marginTop: 12, opacity: 0.55 }}>
+            <Tile label="Sent today" value={0} />
+            <Tile label="Last 7 days" value={0} />
+            <Tile label="Delivered" value={0} />
+            <Tile label="Replied" value={0} />
+          </div>
+          <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 10 }}>
+            Once built, this step gets the same lists as the CV chase: Next up, Sent and Stopped.
+          </div>
+        </Card>
+      )}
+    </>
+  );
 }
