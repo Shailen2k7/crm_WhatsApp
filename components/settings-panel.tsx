@@ -5,7 +5,7 @@ import { createClient } from '@/lib/supabase/client';
 import { LogOut, Moon, Sun, RefreshCw } from 'lucide-react';
 import type { RelayUser, Workspace } from '@/lib/types';
 import { NotificationPanel } from './notification-panel';
-import { AutomationSwitches } from './automation-switches';
+import { AutomationCenter } from './automation-center';
 
 /**
  * Phase 1 settings double as a diagnostics page: whether the shared database is
@@ -20,6 +20,7 @@ export function SettingsPanel({
   live,
   theme,
   onToggleTheme,
+  onOpenChat,
 }: {
   user: RelayUser;
   workspace: Workspace;
@@ -28,8 +29,20 @@ export function SettingsPanel({
   live: boolean;
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
+  /** Opens a lead's chat from the Automation lists. */
+  onOpenChat?: (key: string) => void;
 }) {
   const [signingOut, setSigningOut] = useState(false);
+  // General settings, or the Automation section. Remembered on this browser
+  // only — a convenience, never anything that matters if it is lost.
+  const [section, setSection] = useState<'general' | 'automation'>('general');
+  useEffect(() => {
+    try { if (localStorage.getItem('relay.settings.section') === 'automation') setSection('automation'); } catch { /* private window */ }
+  }, []);
+  const pickSection = (s: 'general' | 'automation') => {
+    setSection(s);
+    try { localStorage.setItem('relay.settings.section', s); } catch { /* private window */ }
+  };
   const [log, setLog] = useState<WebhookLogRow[] | null>(null);
   const [interakt, setInterakt] = useState<InteraktState | null>(null);
   const [testing, setTesting] = useState(false);
@@ -80,11 +93,30 @@ export function SettingsPanel({
 
   return (
     <div style={{ flex: 1, overflowY: 'auto', background: 'var(--bg)' }}>
-      <div style={{ maxWidth: 620, margin: '0 auto', padding: '32px 24px 60px' }}>
+      <div style={{ maxWidth: section === 'automation' ? 860 : 620, margin: '0 auto', padding: '32px 16px 60px' }}>
         <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 4px' }}>Settings</h1>
-        <p style={{ fontSize: 13, color: 'var(--muted)', margin: '0 0 26px' }}>Migrizo WhatsApp</p>
+        <p style={{ fontSize: 13, color: 'var(--muted)', margin: '0 0 18px' }}>Migrizo WhatsApp</p>
 
-        <AutomationSwitches />
+        <div role="tablist" style={{ display: 'inline-flex', gap: 2, padding: 3, borderRadius: 11, background: 'var(--surface-3)', marginBottom: 22 }}>
+          {(['general', 'automation'] as const).map((id) => (
+            <button
+              key={id}
+              role="tab"
+              aria-selected={section === id}
+              onClick={() => pickSection(id)}
+              style={{
+                padding: '7px 16px', borderRadius: 9, border: 0, cursor: 'pointer', fontSize: 13, fontWeight: 600,
+                background: section === id ? 'var(--surface)' : 'transparent',
+                color: section === id ? 'var(--ink)' : 'var(--muted)',
+                boxShadow: section === id ? 'var(--shadow-sm)' : 'none',
+              }}
+            >
+              {id === 'general' ? 'General' : 'Automation'}
+            </button>
+          ))}
+        </div>
+
+        {section === 'automation' ? <AutomationCenter onOpenChat={onOpenChat} /> : (<>
 
         <Card title="Connection">
           <Row label="Database" value={<Status ok={true} text="Connected" />} />
@@ -256,6 +288,7 @@ export function SettingsPanel({
           <LogOut size={15} />
           {signingOut ? 'Signing out…' : 'Sign out'}
         </button>
+        </>)}
       </div>
     </div>
   );

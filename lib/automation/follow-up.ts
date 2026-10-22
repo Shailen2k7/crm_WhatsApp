@@ -159,10 +159,27 @@ export interface ChasePlanInput {
   enabledKeys: Set<string>;
 }
 
+export interface ChaseUpcoming {
+  key: AnyChaseKey;
+  phoneE164: string;
+  leadId: string | null;
+  name: string | null;
+  /** When this step becomes due (before sending hours are applied). */
+  dueMs: number;
+  /** Why it is waiting: not due yet, an ecosystem pause, or the step is off. */
+  wait: 'time' | 'ecosystem' | 'off';
+}
+
 export interface ChasePlan {
   jobs: ChaseJob[];
   settles: ChaseSettle[];
   skipped: string[];
+  /**
+   * DISPLAY ONLY — who is next for each step and when. Never read by the
+   * sender: jobs and settles are decided exactly as before, this list is just
+   * the planner saying out loud what it is waiting for.
+   */
+  upcoming: ChaseUpcoming[];
 }
 
 export function chaseRetryDue(row: Pick<ChaseHistRow, 'attempts' | 'sent_at'>, now: number): boolean {
@@ -171,11 +188,59 @@ export function chaseRetryDue(row: Pick<ChaseHistRow, 'attempts' | 'sent_at'>, n
   return now - new Date(row.sent_at).getTime() >= wait;
 }
 
+/**
+ * WHO NEEDS LOOKING AT ON THIS RUN — decided from the chase's own records
+ * alone, before any per-person facts are fetched.
+ *
+ * On 22 Oct 2026 the chase was switched on and sent NOTHING: fetching facts for
+ * all ~900 people in the window, one query after another, took 7–9 s — longer
+ * than a run may spend before it stops starting sends. The loader now runs its
+ * queries in parallel (≈2 s for everyone), and this filter drops the people
+ * whose chase is already OVER by its own records: a step marked stopped, a step
+ * out of attempts, or T4 delivered. The planner can never produce a send for
+ * them, so leaving them out cannot change who gets a message — a property the
+ * tests check across thousands of random cases.
+ *
+ * Deliberately NOT a "due by the clock" filter: a T1 retry can fall due on a
+ * Meta pause that started before the latest attempt, which timestamps alone
+ * cannot see. When in doubt, include.
+ */
+export function chaseCandidates(input: {
+  now: number; activatedAtMs: number; t1Done: T1Done[]; history: ChaseHistRow[]; backfillPhones: Set<string>;
+}): Set<string> {
+  const { now, activatedAtMs, t1Done, history, backfillPhones } = input;
+  const hist = new Map<string, ChaseHistRow>();
+  for (const h of history) hist.set(`${h.automation_key}:${h.phone_e164}`, h);
+  const horizonMs = now - CHASE_HORIZON_DAYS * DAY;
+  const over = (r: ChaseHistRow | null) =>
+    !!r && !r.ok && ((r.error || '').startsWith('stopped') || (r.attempts ?? 1) >= CHASE_MAX_ATTEMPTS);
+  const out = new Set<string>();
+
+  for (const t1 of t1Done) {
+    if (!t1.phoneE164 || out.has(t1.phoneE164)) continue;
+    const isBackfill = t1.sentAtMs < activatedAtMs;
+    if (isBackfill && !backfillPhones.has(t1.phoneE164)) continue;
+    if (t1.sentAtMs < horizonMs && !isBackfill) continue;
+
+    if (over(hist.get(`${T1R_KEY}:${t1.phoneE164}`) || null)) continue;     // T1 can never arrive
+    let finished = false;
+    for (const key of CHASE_KEYS) {
+      const row = hist.get(`${key}:${t1.phoneE164}`) || null;
+      if (row?.ok) { if (key === 'no_reply_t4') finished = true; continue; } // done → next step
+      if (over(row)) finished = true;                                        // chase ended here
+      break;
+    }
+    if (!finished) out.add(t1.phoneE164);
+  }
+  return out;
+}
+
 export function planChase(input: ChasePlanInput): ChasePlan {
   const { now, activatedAtMs, t1Done, history, facts, backfillPhones, enabledKeys } = input;
   const jobs: ChaseJob[] = [];
   const settles: ChaseSettle[] = [];
   const skipped: string[] = [];
+  const upcoming: ChaseUpcoming[] = [];
 
   // One row per person per step (the unique indexes guarantee it in the DB).
   const hist = new Map<string, ChaseHistRow>();
@@ -228,9 +293,13 @@ export function planChase(input: ChasePlanInput): ChasePlan {
       if (f.ecosystem?.stopped) { settle(key, SETTLE.ecosystem); continue; }
       if (f.ecosystem?.pausedUntil && new Date(f.ecosystem.pausedUntil).getTime() > now) {
         skipped.push(`${f.name || t1.phoneE164}: T1 redelivery waits — ecosystem pause until ${f.ecosystem.pausedUntil.slice(0, 10)}`);
+        upcoming.push({ key, phoneE164: t1.phoneE164, leadId: t1.leadId, name: f.name, dueMs: new Date(f.ecosystem.pausedUntil).getTime(), wait: 'ecosystem' });
         continue;
       }
-      if (!enabledKeys.has(key)) continue;                          // step off — wait
+      if (!enabledKeys.has(key)) {                                  // step off — wait
+        upcoming.push({ key, phoneE164: t1.phoneE164, leadId: t1.leadId, name: f.name, dueMs: now, wait: 'off' });
+        continue;
+      }
       if (t1r && !t1r.ok && (t1r.attempts ?? 1) >= CHASE_MAX_ATTEMPTS) continue;
       if (t1r && !t1r.ok && !chaseRetryDue(t1r, now)) continue;     // in-flight/timeout back-off
       jobs.push({
@@ -259,9 +328,19 @@ export function planChase(input: ChasePlanInput): ChasePlan {
 
       // This is the step to do. Is it due?
       const dueMs = Math.max(anchorMs + CHASE_OFFSET_MS[key], prevSentMs + MIN_GAP_MS);
-      if (now < dueMs) { chainOk = false; break; }                              // not yet — wait
+      if (now < dueMs) {                                                        // not yet — wait
+        upcoming.push({ key, phoneE164: t1.phoneE164, leadId: t1.leadId, name: f.name, dueMs, wait: 'time' });
+        chainOk = false; break;
+      }
 
-      if (!enabledKeys.has(key)) { chainOk = false; break; }                    // step off — chain waits here
+      if (!enabledKeys.has(key)) {                                              // step off — chain waits here
+        // Only people the stop checks would still let through are "waiting".
+        const stopped = (f.lastInboundMs !== null && f.lastInboundMs > t1.sentAtMs)
+          || (f.lastTeamOutMs !== null && f.lastTeamOutMs > Math.max(t1.sentAtMs, activatedAtMs))
+          || (!!f.stage && HUMAN_STAGES.has(f.stage)) || f.suppressed || !!f.ecosystem?.stopped;
+        if (!stopped) upcoming.push({ key, phoneE164: t1.phoneE164, leadId: t1.leadId, name: f.name, dueMs, wait: 'off' });
+        chainOk = false; break;
+      }
 
       // ---- the stop checks, in the order a human would ask them ------------
       if (f.lastInboundMs !== null && f.lastInboundMs > t1.sentAtMs) {
@@ -286,6 +365,7 @@ export function planChase(input: ChasePlanInput): ChasePlan {
       }
       if (f.ecosystem?.pausedUntil && new Date(f.ecosystem.pausedUntil).getTime() > now) {
         skipped.push(`${f.name || t1.phoneE164}: ${key} waits — ecosystem pause until ${f.ecosystem.pausedUntil.slice(0, 10)}`);
+        upcoming.push({ key, phoneE164: t1.phoneE164, leadId: t1.leadId, name: f.name, dueMs: new Date(f.ecosystem.pausedUntil).getTime(), wait: 'ecosystem' });
         chainOk = false; break;
       }
 
@@ -303,5 +383,6 @@ export function planChase(input: ChasePlanInput): ChasePlan {
 
   // Longest-waiting first, so a backlog clears oldest-first under the caps.
   jobs.sort((a, b) => a.dueMs - b.dueMs);
-  return { jobs, settles, skipped };
+  upcoming.sort((a, b) => a.dueMs - b.dueMs);
+  return { jobs, settles, skipped, upcoming };
 }

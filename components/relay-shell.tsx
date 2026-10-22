@@ -569,6 +569,7 @@ export function RelayShell({
             live={live}
             theme={theme}
             onToggleTheme={toggleTheme}
+            onOpenChat={(key) => { setNav('chat'); setSelectedKey(key); }}
           />
         )}
       </div>

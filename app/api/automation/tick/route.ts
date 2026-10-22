@@ -16,10 +16,10 @@ import {
   type HistoryRow, type Job, type LeadRow,
 } from '@/lib/automation/first-message';
 import {
-  planChase, CHASE_KEYS, T1R_KEY, CHASE_HORIZON_DAYS, CHASE_MAX_ATTEMPTS,
-  type AnyChaseKey, type ChaseJob, type PersonFacts, type T1Done, type ChaseHistRow,
+  planChase, chaseCandidates, CHASE_MAX_ATTEMPTS,
+  type AnyChaseKey, type ChaseJob,
 } from '@/lib/automation/follow-up';
-import { ecosystemStatesByConv } from '@/lib/automation/ecosystem';
+import { loadChaseRules, loadChaseFacts } from '@/lib/automation/chase-data';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -498,24 +498,15 @@ async function runChase(
 
   // ---- the rules (one row per step). Off = inert; a dry run still reads them
   // so the trial can show the plan before anything is switched on.
-  let q = admin.from('relay_automations').select('*').in('key', [...CHASE_KEYS, T1R_KEY]);
-  if (workspaceId) q = q.eq('workspace_id', workspaceId);
-  const { data: ruleRows, error: ruleErr } = await q;
-  if (ruleErr) throw new Error(`chase rules: ${ruleErr.message}`);
-  const rules = (ruleRows || []) as Record<string, any>[];              // eslint-disable-line @typescript-eslint/no-explicit-any
-  if (!rules.length) return null;
-
-  const ws = rules[0].workspace_id as string;
+  const loaded = await loadChaseRules(admin, workspaceId, now);
+  if (!loaded) return null;
+  const { ws, ruleByKey, activatedAtMs } = loaded;
   const out: Record<string, unknown> = { workspace: ws, key: 'no_reply_chase', sent: 0, skipped: [] as string[] };
   const skipped = out.skipped as string[];
 
-  const enabledKeys = new Set<string>(rules.filter((r) => r.enabled).map((r) => r.key as string));
+  const enabledKeys = new Set(loaded.enabledKeys);
   if (!enabledKeys.size && !dryRun) { out.note = 'All chase steps are switched off.'; return out; }
-  const ruleByKey = new Map(rules.map((r) => [r.key as AnyChaseKey, r]));
-  if (dryRun) for (const r of rules) enabledKeys.add(r.key as string);
-
-  // The chase anchors at the EARLIEST activation among its steps.
-  const activatedAtMs = Math.min(...rules.map((r) => (r.activated_at ? new Date(r.activated_at).getTime() : now)));
+  if (dryRun) for (const r of loaded.rules) enabledKeys.add(r.key as string);
 
   // ---- sending hours: outside them the whole pass waits (a dry run reports on).
   const hour = istHour();
@@ -523,110 +514,14 @@ async function runChase(
   if (!inHours && !dryRun) { out.note = `Outside sending hours (${CHASE_START_HOUR}:00–${CHASE_END_HOUR}:00 IST) — follow-ups wait.`; return out; }
   if (!inHours && dryRun) out.hoursNote = 'outside sending hours — live runs would wait';
 
-  // ---- entry tickets: successful T1s, plus the hand-picked backfill ---------
-  const sinceIso = new Date(now - CHASE_HORIZON_DAYS * 86_400_000).toISOString();
-  const { data: bfRow } = await admin.from('relay_settings')
-    .select('value').eq('workspace_id', ws).eq('key', 'no_reply_chase_backfill').maybeSingle();
-  // relay_settings.value is a TEXT column: the list arrives as a JSON string.
-  let backfillPhones = new Set<string>();
-  try {
-    const parsed = typeof bfRow?.value === 'string' ? JSON.parse(bfRow.value) : bfRow?.value;
-    if (Array.isArray(parsed)) backfillPhones = new Set(parsed.filter((x): x is string => typeof x === 'string'));
-  } catch { /* unreadable list = empty list; the chase then covers new leads only */ }
-
-  const t1Cols = 'lead_id, phone_e164, sent_at, ok';
-  const [recentT1, ...bfParts] = await Promise.all([
-    admin.from('relay_automation_sent').select(t1Cols)
-      .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', true)
-      .gte('sent_at', sinceIso).limit(2000),
-    ...chunk([...backfillPhones], 100).map((ps) => admin.from('relay_automation_sent').select(t1Cols)
-      .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', true).in('phone_e164', ps)),
-  ]);
-  if (recentT1.error) throw new Error(`chase t1: ${recentT1.error.message}`);
-  const t1Rows = new Map<string, T1Done>();
-  for (const part of [recentT1, ...bfParts]) {
-    for (const r of (part.data || []) as { lead_id: string | null; phone_e164: string; sent_at: string }[]) {
-      if (!t1Rows.has(r.phone_e164)) t1Rows.set(r.phone_e164, { leadId: r.lead_id, phoneE164: r.phone_e164, sentAtMs: new Date(r.sent_at).getTime() });
-    }
-  }
+  // ---- the facts — the same loader the Automation screen uses ---------------
+  // Facts only for people who could be due on this run — see chaseCandidates.
+  const { backfillPhones, t1Rows, history, facts } = await loadChaseFacts(admin, {
+    ws, now, activatedAtMs, suppressed: opts.suppressed,
+    pick: (cheap) => chaseCandidates({ now, activatedAtMs, ...cheap, t1Done: [...cheap.t1Rows.values()] }),
+  });
+  out.examined = facts.size;
   if (!t1Rows.size) { out.note = 'Nobody in the chase window.'; return out; }
-
-  // ---- every chase row ever written (small; one person is at most 3 rows) ---
-  const { data: histData, error: histErr } = await admin.from('relay_automation_sent')
-    .select('id, automation_key, lead_id, phone_e164, ok, attempts, sent_at, error')
-    .eq('workspace_id', ws).in('automation_key', [...CHASE_KEYS, T1R_KEY]).limit(5000);
-  if (histErr) throw new Error(`chase history: ${histErr.message}`);
-  const history = (histData || []) as ChaseHistRow[];
-
-  // ---- the facts, batched ---------------------------------------------------
-  const phones = [...t1Rows.keys()];
-  const convs: { id: string; phone_e164: string; last_inbound_at: string | null; lead_id: string | null }[] = [];
-  for (const ps of chunk(phones, 100)) {
-    const { data, error } = await admin.from('relay_conversations')
-      .select('id, phone_e164, last_inbound_at, lead_id').eq('workspace_id', ws).in('phone_e164', ps);
-    if (error) throw new Error(`chase convs: ${error.message}`);
-    convs.push(...((data || []) as typeof convs));
-  }
-  const convByPhone = new Map(convs.map((c) => [c.phone_e164, c]));
-  const convIds = convs.map((c) => c.id);
-  const phoneByConv = new Map(convs.map((c) => [c.id, c.phone_e164]));
-
-  // Team (human) outbound since activation, and failed automated sends — both
-  // in the same chunked sweep over the conversations.
-  const lastTeamOut = new Map<string, number>();
-  const autoFails = new Map<string, { atMs: number; code: string | null }[]>();
-  const activatedIso = new Date(activatedAtMs).toISOString();
-  for (const ids of chunk(convIds, 100)) {
-    const [team, fails] = await Promise.all([
-      admin.from('relay_messages').select('conversation_id, created_at')
-        .in('conversation_id', ids).eq('direction', 'out').eq('is_internal', false)
-        .not('sent_by', 'is', null).neq('status', 'failed').gte('created_at', activatedIso).limit(2000),
-      admin.from('relay_messages').select('conversation_id, created_at, error_code')
-        .in('conversation_id', ids).eq('direction', 'out').is('sent_by', null)
-        .eq('status', 'failed').limit(2000),
-    ]);
-    if (team.error) throw new Error(`chase team: ${team.error.message}`);
-    if (fails.error) throw new Error(`chase fails: ${fails.error.message}`);
-    for (const m of (team.data || []) as { conversation_id: string; created_at: string }[]) {
-      const p = phoneByConv.get(m.conversation_id); if (!p) continue;
-      lastTeamOut.set(p, Math.max(lastTeamOut.get(p) ?? 0, new Date(m.created_at).getTime()));
-    }
-    for (const m of (fails.data || []) as { conversation_id: string; created_at: string; error_code: string | null }[]) {
-      const p = phoneByConv.get(m.conversation_id); if (!p) continue;
-      if (!autoFails.has(p)) autoFails.set(p, []);
-      autoFails.get(p)!.push({ atMs: new Date(m.created_at).getTime(), code: m.error_code });
-    }
-  }
-
-  const eco = await ecosystemStatesByConv(admin, convIds, now);
-
-  const leadIds = [...t1Rows.values()].map((t) => t.leadId).filter(Boolean) as string[];
-  const leadInfo = new Map<string, { full_name: string | null; visa_type: string | null; stage: string | null }>();
-  for (const ids of chunk(leadIds, 100)) {
-    const { data, error } = await admin.from('leads').select('id, full_name, visa_type, stage').in('id', ids);
-    if (error) throw new Error(`chase leads: ${error.message}`);
-    for (const l of (data || []) as { id: string; full_name: string | null; visa_type: string | null; stage: string | null }[]) {
-      leadInfo.set(l.id, l);
-    }
-  }
-
-  const suppressedSet = new Set(opts.suppressed.filter((x) => x.workspace_id === ws).map((x) => x.phone_e164));
-  const facts = new Map<string, PersonFacts>();
-  for (const t1 of t1Rows.values()) {
-    const conv = convByPhone.get(t1.phoneE164) ?? null;
-    const lead = t1.leadId ? leadInfo.get(t1.leadId) ?? null : null;
-    facts.set(t1.phoneE164, {
-      conversationId: conv?.id ?? null,
-      lastInboundMs: conv?.last_inbound_at ? new Date(conv.last_inbound_at).getTime() : null,
-      lastTeamOutMs: lastTeamOut.get(t1.phoneE164) ?? null,
-      failTimes: autoFails.get(t1.phoneE164) || [],
-      stage: lead?.stage ?? null,
-      name: lead?.full_name ?? null,
-      visaType: lead?.visa_type ?? null,
-      suppressed: suppressedSet.has(t1.phoneE164),
-      ecosystem: conv ? (eco.get(conv.id) ?? null) : null,
-    });
-  }
 
   // ---- the decision -----------------------------------------------------------
   const plan = planChase({

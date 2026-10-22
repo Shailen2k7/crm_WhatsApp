@@ -68,10 +68,11 @@ export async function ecosystemStatesByConv(
   const out = new Map<string, EcosystemState>();
   if (!convIds.length) return out;
   const times = new Map<string, number[]>();
-  for (const ids of chunk(convIds, 100)) {
-    const { data, error } = await admin.from('relay_messages')
-      .select('conversation_id, created_at').eq('direction', 'out')
-      .eq('error_code', ECOSYSTEM_CODE).in('conversation_id', ids).limit(2000);
+  // All chunks at once: these are small, indexed reads.
+  const parts = await Promise.all(chunk(convIds, 100).map((ids) => admin.from('relay_messages')
+    .select('conversation_id, created_at').eq('direction', 'out')
+    .eq('error_code', ECOSYSTEM_CODE).in('conversation_id', ids).limit(2000)));
+  for (const { data, error } of parts) {
     if (error) throw new Error(`ecosystem: ${error.message}`);
     for (const m of (data || []) as { conversation_id: string; created_at: string }[]) {
       if (!times.has(m.conversation_id)) times.set(m.conversation_id, []);
