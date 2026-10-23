@@ -175,10 +175,16 @@ async function post(path: string, body: unknown, limits?: CallLimits): Promise<S
         : json
           ? `body: ${JSON.stringify(json).slice(0, 200)}`
           : `Interakt returned ${res.status} with an empty body.`;
+    // A 5xx, or an HTML page instead of JSON, is Interakt's own server (or the
+    // gateway in front of it) having a moment — not a problem with the message
+    // or the number. Say so in a sentence; the full body stays in `raw`.
+    const serverHiccup = res.status >= 500 || !!j.nonJson;
     return {
       ok: false,
       code: `http_${res.status}`,
-      detail: j.message || j.detail || (typeof j.error === 'string' ? j.error : '') || fallback,
+      detail: serverHiccup
+        ? `Interakt's server had a temporary error (HTTP ${res.status}) — nothing was sent. Try again in a minute.`
+        : j.message || j.detail || (typeof j.error === 'string' ? j.error : '') || fallback,
       raw: json,
     };
   }

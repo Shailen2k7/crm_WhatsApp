@@ -7,11 +7,12 @@ import { uploadFile } from '@/lib/upload-file';
 import {
   Search, Star, PanelRight, Paperclip, Send, MessageSquare, ArrowLeft,
   AlertCircle, Loader2, RotateCw, Lock, FileText, Download, X, Trash2,
-  MoreHorizontal, Zap, Image as ImageIcon, Copy, ArrowLeftRight,
+  MoreHorizontal, Zap, Image as ImageIcon, Copy, ArrowLeftRight, Clock,
 } from 'lucide-react';
 import { initialsOf, avatarTint, formatPhone } from '@/lib/phone';
 import type { Contact } from '@/lib/contacts';
 import { windowState, formatWindow } from '@/lib/interakt';
+import { ecosystemStateFrom, ECOSYSTEM_CODE } from '@/lib/automation/ecosystem';
 import type { RelayMessage, QuickReply, RelayTemplate } from '@/lib/messages';
 import { LayoutTemplate } from 'lucide-react';
 
@@ -537,6 +538,32 @@ export function ChatPanel({
     if (!json.ok) setError(json.error || 'Could not delete.');
   }, [conversationId]);
 
+  // ---- "healthy ecosystem" refusals: say what happens next, don't offer Retry ----
+  // Retrying straight away only hits the same Meta limit again. The latest
+  // refusal in the thread carries the real next date (4-day pause, then
+  // 10-day, then stop), computed with the same rule the automation uses.
+  const metaNotes = useMemo(() => {
+    const notes = new Map<string, string>();
+    const refused = messages.filter((x) => x.direction === 'out' && x.status === 'failed' && x.error_code === ECOSYSTEM_CODE);
+    if (!refused.length) return notes;
+    const state = ecosystemStateFrom(refused.map((x) => new Date(x.created_at).getTime()));
+    const latest = refused[refused.length - 1];
+    const day = (iso: string) => new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short' }).format(new Date(iso));
+    for (const x of refused) {
+      if (x.id !== latest.id) { notes.set(x.id, 'Meta limit (healthy ecosystem) — not delivered'); continue; }
+      const auto = !x.sent_by;
+      const isChase = /^t[234]$/i.test(x.template_name || '');
+      notes.set(x.id, state.stopped
+        ? 'Meta limit, refused 3 times — automation has stopped for this person'
+        : !state.pausedUntil
+          ? 'Meta limit (healthy ecosystem) — WhatsApp may accept again now'
+          : auto
+            ? `Meta limit (healthy ecosystem) · ${isChase ? 'automation resumes' : 'automatic retry'} on ${day(state.pausedUntil)}`
+            : `Meta limit (healthy ecosystem) · WhatsApp should accept again from ${day(state.pausedUntil)}`);
+    }
+    return notes;
+  }, [messages]);
+
   if (!contact) return <EmptyState />;
 
   // Templates and quick replies are two different things to WhatsApp (a
@@ -671,6 +698,7 @@ export function ChatPanel({
 
         {!loading &&
           messages.map((m, i) => {
+            const metaNote = metaNotes.get(m.id) ?? null;
             const prev = messages[i - 1];
             const showDate = !prev || new Date(prev.created_at).toDateString() !== new Date(m.created_at).toDateString();
             return (
@@ -683,6 +711,7 @@ export function ChatPanel({
                   onDelete={deleteMessage}
                   onFlip={flipSide}
                   onRetry={retryMessage}
+                  metaNote={metaNote}
                 />
               </div>
             );
@@ -1010,13 +1039,15 @@ function DateSeparator({ iso }: { iso: string }) {
  * (status ticks, edited body). Without this, one 30-second timer re-rendered
  * every bubble in the thread — which is what made a long chat feel sticky.
  */
-const Bubble = memo(function Bubble({ message: m, isAdmin, animate, onDelete, onFlip, onRetry }: {
+const Bubble = memo(function Bubble({ message: m, isAdmin, animate, onDelete, onFlip, onRetry, metaNote }: {
   message: RelayMessage;
   isAdmin: boolean;
   animate: boolean;
   onDelete: (id: string) => void;
   onFlip: (m: RelayMessage) => void;
   onRetry: (m: RelayMessage) => void;
+  /** Set for a Meta "healthy ecosystem" refusal: what happens next, instead of Retry. */
+  metaNote?: string | null;
 }) {
   const out = m.direction === 'out';
   const failed = m.status === 'failed';
@@ -1151,14 +1182,21 @@ const Bubble = memo(function Bubble({ message: m, isAdmin, animate, onDelete, on
           </div>
         </div>
 
-        {failed && (
+        {failed && metaNote && (
+          // A Meta limit: Retry would only be refused again. Say when instead.
+          <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--amber)', marginTop: 3, marginLeft: 'auto', fontWeight: 600, textAlign: 'right' }}>
+            <Clock size={11} style={{ flex: 'none' }} />
+            {metaNote}
+          </div>
+        )}
+        {failed && !metaNote && (
           <button
             onClick={() => onRetry(m)}
-            style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--red)', marginTop: 3, marginLeft: 'auto', fontWeight: 600, background: 'transparent', border: 0, cursor: 'pointer' }}
+            style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--red)', marginTop: 3, marginLeft: 'auto', fontWeight: 600, background: 'transparent', border: 0, cursor: 'pointer', textAlign: 'right' }}
             title="Tap to retry"
           >
-            <RotateCw size={11} />
-            {m.error_detail || 'Not delivered'} · Retry
+            <RotateCw size={11} style={{ flex: 'none' }} />
+            {friendlyError(m)} · Retry
           </button>
         )}
       </div>
@@ -1276,3 +1314,12 @@ const composerBtn: React.CSSProperties = {
   color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'center',
   cursor: 'pointer', flex: 'none',
 };
+
+/** Older rows stored Interakt's raw HTML error page; show a sentence instead. */
+function friendlyError(m: RelayMessage): string {
+  const d = m.error_detail || '';
+  if (/^http_5/.test(m.error_code || '') || d.startsWith('Non-JSON body')) {
+    return "Interakt's server had a temporary error — nothing was sent";
+  }
+  return d || 'Not delivered';
+}

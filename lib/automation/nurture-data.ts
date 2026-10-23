@@ -120,7 +120,20 @@ export async function loadNurtureFacts(
     return { l, mine, best, phone };
   }).filter((x): x is typeof x & { phone: string } => !!x.phone);
 
-  const eco = await ecosystemStatesByConv(admin, pre.flatMap((x) => x.mine.map((c) => c.id)), now);
+  const allConvIds = pre.flatMap((x) => x.mine.map((c) => c.id));
+  // Ecosystem state and every refused automated message, side by side.
+  const failsByConv = new Map<string, { atMs: number; code: string | null }[]>();
+  const [eco] = await Promise.all([
+    ecosystemStatesByConv(admin, allConvIds, now),
+    Promise.all(chunk(allConvIds, 100).map(async (ids) => {
+      const { data } = await admin.from('relay_messages').select('conversation_id, created_at, error_code')
+        .in('conversation_id', ids).eq('direction', 'out').is('sent_by', null).eq('status', 'failed').limit(5000);
+      for (const m of (data || []) as { conversation_id: string; created_at: string; error_code: string | null }[]) {
+        if (!failsByConv.has(m.conversation_id)) failsByConv.set(m.conversation_id, []);
+        failsByConv.get(m.conversation_id)!.push({ atMs: new Date(m.created_at).getTime(), code: m.error_code });
+      }
+    })),
+  ]);
 
   const pausedPhones = new Set(history.filter((h) => h.automation_key === NURTURE_PAUSE_KEY && (h.error || '').startsWith('paused')).map((h) => h.phone_e164));
 
@@ -143,6 +156,7 @@ export async function loadNurtureFacts(
         pausedUntil: pausedUntilMs.length ? new Date(Math.max(...pausedUntilMs)).toISOString() : null,
       } : null,
       paused: pausedPhones.has(phone),
+      failTimes: mine.flatMap((c) => failsByConv.get(c.id) || []),
     };
   });
 

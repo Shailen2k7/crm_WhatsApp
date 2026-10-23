@@ -46,7 +46,13 @@ export const CADENCE_MS = 4 * DAY;       // between consecutive HS messages
 export const NURTURE_MAX_ATTEMPTS = 3;   // per step: first try plus two retries
 export const NURTURE_RETRY_BACKOFF_MS = [0, 30 * 60_000, 4 * 3_600_000];
 
+/** A failure this close to a step's record is that step's own message failing. */
+export const NURTURE_FAIL_MATCH_MS = 30 * 60_000;
+/** Codes that mean the number can never receive WhatsApp: no point retrying. */
+const UNREACHABLE_CODES = new Set(['131026', 'bad_phone']);
+
 export const NURTURE_SETTLE = {
+  unreachable: (code: string) => `stopped — their number cannot receive WhatsApp (Meta error ${code})`,
   stage: (s: string) => `stopped — a human set their stage to ${s}`,
   optedOut: 'stopped — opted out (STOP)',
   ecosystem: 'stopped — refused by Meta 3 times, after a 4-day and a 10-day pause',
@@ -81,6 +87,12 @@ export interface NurturePerson {
   suppressed: boolean;
   ecosystem: { stopped: boolean; pausedUntil: string | null } | null;
   paused: boolean;
+  /**
+   * Automated messages to this person that WhatsApp refused AFTER Interakt
+   * accepted them. Interakt saying "ok" is not delivery: a step whose own
+   * message was refused is not done.
+   */
+  failTimes?: { atMs: number; code: string | null }[];
 }
 
 export interface NurtureJob {
@@ -154,8 +166,24 @@ export function planNurture(input: {
     let prior: NurtureHistRow | null = null;
     let prevDoneMs: number | null = null;      // when the previous step went out
     let over = false;
+    let unreachable: string | null = null;
     for (const k of NURTURE_KEYS) {
       const row = hist.get(`${k}:${p.phoneE164}`) || null;
+      // ACCEPTED IS NOT DELIVERED. If WhatsApp refused this step's message
+      // after Interakt took it, the step is NOT done: the SAME HS is sent
+      // again — after the Meta pause for a "healthy ecosystem" refusal, after
+      // the normal back-off for a passing error — and the series never skips
+      // ahead past a message the person never saw. A number that cannot
+      // receive WhatsApp at all ends the series instead.
+      if (row?.ok) {
+        const at = new Date(row.sent_at).getTime();
+        const refused = (p.failTimes || []).filter((f) => Math.abs(f.atMs - at) <= NURTURE_FAIL_MATCH_MS)
+          .sort((a, b) => b.atMs - a.atMs)[0];
+        if (refused) {
+          if (UNREACHABLE_CODES.has(refused.code || '')) { unreachable = refused.code || 'unknown'; key = k; break; }
+          key = k; prior = row; break;
+        }
+      }
       if (row?.ok || (row && (row.error || '').startsWith('skipped'))) { prevDoneMs = new Date(row.sent_at).getTime(); continue; }
       if (row && (row.error || '').startsWith('stopped')) { over = true; break; }
       if (row && (row.attempts ?? 1) >= NURTURE_MAX_ATTEMPTS) { over = true; break; }
@@ -172,6 +200,7 @@ export function planNurture(input: {
     }
 
     // ---- the gates, in the order a human would ask them --------------------
+    if (unreachable) { settle(key, NURTURE_SETTLE.unreachable(unreachable)); continue; }
     if (OVER_STAGES.has(p.stage || '')) { settle(key, NURTURE_SETTLE.stage(p.stage || '')); continue; }
     if (p.stage !== 'hot' && !p.spotlight) continue;              // drifted out of the audience: hold silently
     if (p.suppressed) { settle(key, NURTURE_SETTLE.optedOut); continue; }
@@ -189,7 +218,7 @@ export function planNurture(input: {
     }
     if (now < dueMs) { wait(key, dueMs, dueMs === silenceReadyMs && silenceReadyMs > cadenceReadyMs ? 'silence' : 'time'); continue; }
     if (!enabled) { wait(key, dueMs, 'off'); continue; }
-    if (prior && !nurtureRetryDue(prior, now)) continue;          // in-flight back-off
+    if (prior && !prior.ok && !nurtureRetryDue(prior, now)) continue;   // in-flight back-off
 
     jobs.push({
       key, phoneE164: p.phoneE164, leadId: p.leadId, conversationId: p.conversationId,
