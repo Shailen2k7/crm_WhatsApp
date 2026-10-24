@@ -37,9 +37,12 @@
 //   * not due yet, or inside a healthy-ecosystem pause (4 then 10 days)
 //   * outside sending hours — the route holds the whole pass, 10:00–19:00 IST
 //
-// A follow-up also never tailgates the previous step: however late the
-// previous step went out (caps, pauses, downtime), the next one waits at least
-// MIN_GAP_MS after it. A backlog must stretch, never bunch.
+// THE GAP IS ALWAYS KEPT FROM THE LAST MESSAGE (Shailen, 24 Oct 2026). Each
+// step waits its full intended gap after the step before it actually went:
+//   T2 ≥ 1 day after T1 · T3 ≥ 2 days after T2 · T4 ≥ 4 days after T3
+// — the same spacing as day 1 / 3 / 7, however late the previous step was
+// (caps, Meta pauses, downtime). Before this, only 20 hours were kept, so a T2
+// sent late was followed by T3 the next day. A backlog must stretch, never bunch.
 // =============================================================================
 
 export const CHASE_KEYS = ['no_reply_t2', 'no_reply_t3', 'no_reply_t4'] as const;
@@ -71,8 +74,12 @@ export const CHASE_PREREQ: Record<ChaseKey, string> = {
   no_reply_t3: 'no_reply_t2',
   no_reply_t4: 'no_reply_t3',
 };
-/** A follow-up never goes out closer than this to the step before it. */
-export const MIN_GAP_MS = 20 * 3_600_000;
+/** The full gap each step keeps after the PREVIOUS message actually went. */
+export const STEP_GAP_MS: Record<ChaseKey, number> = {
+  no_reply_t2: CHASE_OFFSET_MS.no_reply_t2,                                   // 1 day after T1
+  no_reply_t3: CHASE_OFFSET_MS.no_reply_t3 - CHASE_OFFSET_MS.no_reply_t2,     // 2 days after T2
+  no_reply_t4: CHASE_OFFSET_MS.no_reply_t4 - CHASE_OFFSET_MS.no_reply_t3,     // 4 days after T3
+};
 /** T1s older than this are no longer scanned (the chase is long over for them). */
 export const CHASE_HORIZON_DAYS = 30;
 /** Attempts per step: the first try plus two retries, then the chain ends. */
@@ -331,7 +338,7 @@ export function planChase(input: ChasePlanInput): ChasePlan {
       if (row && (row.attempts ?? 1) >= CHASE_MAX_ATTEMPTS) { chainOk = false; break; }
 
       // This is the step to do. Is it due?
-      const dueMs = Math.max(anchorMs + CHASE_OFFSET_MS[key], prevSentMs + MIN_GAP_MS);
+      const dueMs = Math.max(anchorMs + CHASE_OFFSET_MS[key], prevSentMs + STEP_GAP_MS[key]);
       if (now < dueMs) {                                                        // not yet — wait
         upcoming.push({ key, phoneE164: t1.phoneE164, leadId: t1.leadId, name: f.name, dueMs, wait: 'time' });
         chainOk = false; break;

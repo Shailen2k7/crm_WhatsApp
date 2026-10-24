@@ -144,7 +144,10 @@ export async function POST(req: NextRequest) {
   // the main run below is T1 alone, so a fresh lead is never kept waiting.
   if (pass === 'chase') return runSoloPass('chase', { dryRun, workspaceId });
 
-  const ctx = createRunContext();
+  // T1 runs alone now (T2–T4 and the nurture have their own runs), so it gets
+  // the same long budget: on 24 Oct a single T1 run took 6.3 s on Netlify,
+  // right at the old 6 s edge — a burst of new leads would have waited.
+  const ctx = createRunContext(LONG_RUN);
   const admin = createAutomationAdminClient(ctx);
   // Releasing the lock must still work after the run's hard stop has fired.
   const lockAdmin = createAutomationAdminClient();

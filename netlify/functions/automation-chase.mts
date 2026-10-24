@@ -38,9 +38,16 @@ export default async (): Promise<Response> => {
       });
     } catch { /* not JSON: keep the raw start of the body */ }
     console.log(`[automation-chase] HTTP ${res.status} in ${Date.now() - started}ms ${summary}`);
-    // EARLY WARNING: a run creeping towards its budget is flagged long before it
-    // stops sending — search the logs for SLOW RUN.
-    try { const ms = JSON.parse(text).ms; if (typeof ms === 'number' && ms > 9000) console.warn(`[automation-chase] SLOW RUN ${ms}ms — budget is $14000ms; investigate before it starves`); } catch { /* not JSON */ }
+    // EARLY WARNING — the one pattern that means trouble: a run that is slow
+    // AND sent nothing while people were due (it spent its time reading, not
+    // sending). A slow run that IS sending is just busy, and is fine.
+    try {
+      const j = JSON.parse(text);
+      const r = (j.report || [])[0] || {}; const sent = r.sent ?? 0; const due = r.due ?? 0;
+      if (typeof j.ms === 'number' && j.ms > 9000 && due > 0 && sent === 0) {
+        console.warn(`[automation-chase] STARVING — ${j.ms}ms, ${due} due, 0 sent. Budget is 14000ms; investigate.`);
+      }
+    } catch { /* not JSON */ }
     return new Response(null, { status: res.ok ? 200 : 502 });
   } catch (e) {
     console.error(`[automation-chase] call failed after ${Date.now() - started}ms`, e);

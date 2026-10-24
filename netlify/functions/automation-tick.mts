@@ -27,7 +27,8 @@ export default async (): Promise<Response> => {
       method: 'POST',
       headers: { authorization: `Bearer ${secret}` },
       // The route stops itself by ~9s; this only guards against a platform hang.
-      signal: AbortSignal.timeout(20_000),
+      // The route stops itself by ~18 s; this only guards against a platform hang.
+      signal: AbortSignal.timeout(25_000),
     });
     const text = await res.text();
 
@@ -41,9 +42,16 @@ export default async (): Promise<Response> => {
     } catch { /* not JSON: keep the raw start of the body */ }
 
     console.log(`[automation-tick] HTTP ${res.status} in ${Date.now() - started}ms ${summary}`);
-    // EARLY WARNING: a run creeping towards its budget is flagged long before it
-    // stops sending — search the logs for SLOW RUN.
-    try { const ms = JSON.parse(text).ms; if (typeof ms === 'number' && ms > 4000) console.warn(`[automation-tick] SLOW RUN ${ms}ms — budget is $6000ms; investigate before it starves`); } catch { /* not JSON */ }
+    // EARLY WARNING — the one pattern that means trouble: a run that is slow
+    // AND sent nothing while people were due (it spent its time reading, not
+    // sending). A slow run that IS sending is just busy, and is fine.
+    try {
+      const j = JSON.parse(text);
+      const p = (j.report || []).find((r: { key?: string }) => r.key === 'new_lead_first') || {}; const sent = p.sent ?? 0; const due = p.waiting ?? 0;
+      if (typeof j.ms === 'number' && j.ms > 9000 && due > 0 && sent === 0) {
+        console.warn(`[automation-tick] STARVING — ${j.ms}ms, ${due} due, 0 sent. Budget is 14000ms; investigate.`);
+      }
+    } catch { /* not JSON */ }
     return new Response(null, { status: res.ok ? 200 : 502 });
   } catch (e) {
     console.error(`[automation-tick] call failed after ${Date.now() - started}ms`, e);
