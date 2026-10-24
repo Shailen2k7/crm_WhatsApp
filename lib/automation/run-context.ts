@@ -46,15 +46,27 @@ export interface RunContext {
   readonly cache: Map<string, unknown>;
 }
 
-export function createRunContext(): RunContext {
+/**
+ * The follow-up runs (T2–T4, and the HS nurture) each have a scheduled run of
+ * their own, so they can take longer than the T1 run. On Netlify (US) every
+ * database round trip to Singapore is slow; with the 6 s budget the T2–T4 run
+ * spent it all READING and reported "47 due, 0 sent" run after run (24 Oct
+ * 2026). The platform lets a run go past 20 s (seen in the logs), so these
+ * runs stop starting new work at 14 s and abort at 18 s — still inside it.
+ */
+export const LONG_RUN = { stopStartingAfterMs: 14_000, hardStopMs: 18_000 } as const;
+
+export function createRunContext(budget?: { stopStartingAfterMs: number; hardStopMs: number }): RunContext {
+  const stopStartingAfter = budget?.stopStartingAfterMs ?? STOP_STARTING_AFTER_MS;
+  const hardStopMs = budget?.hardStopMs ?? HARD_STOP_MS;
   const startedAt = Date.now();
   const controller = new AbortController();
   const hardStop = setTimeout(
-    () => controller.abort(new DOMException(`run exceeded ${HARD_STOP_MS}ms`, 'TimeoutError')),
-    HARD_STOP_MS,
+    () => controller.abort(new DOMException(`run exceeded ${hardStopMs}ms`, 'TimeoutError')),
+    hardStopMs,
   );
   let sends = MAX_SENDS_PER_RUN;
-  const hasTime = () => !controller.signal.aborted && Date.now() - startedAt < STOP_STARTING_AFTER_MS;
+  const hasTime = () => !controller.signal.aborted && Date.now() - startedAt < stopStartingAfter;
 
   return {
     startedAt,

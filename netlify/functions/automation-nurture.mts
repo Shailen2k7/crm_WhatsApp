@@ -24,7 +24,8 @@ export default async (): Promise<Response> => {
     const res = await fetch(`${base}/api/automation/tick?pass=nurture`, {
       method: 'POST',
       headers: { authorization: `Bearer ${secret}` },
-      signal: AbortSignal.timeout(20_000),
+      // The route stops itself by ~18 s; this only guards against a platform hang.
+      signal: AbortSignal.timeout(25_000),
     });
     const text = await res.text();
     let summary = text.slice(0, 400);
@@ -37,6 +38,9 @@ export default async (): Promise<Response> => {
       });
     } catch { /* not JSON: keep the raw start of the body */ }
     console.log(`[automation-nurture] HTTP ${res.status} in ${Date.now() - started}ms ${summary}`);
+    // EARLY WARNING: a run creeping towards its budget is flagged long before it
+    // stops sending — search the logs for SLOW RUN.
+    try { const ms = JSON.parse(text).ms; if (typeof ms === 'number' && ms > 9000) console.warn(`[automation-nurture] SLOW RUN ${ms}ms — budget is $14000ms; investigate before it starves`); } catch { /* not JSON */ }
     return new Response(null, { status: res.ok ? 200 : 502 });
   } catch (e) {
     console.error(`[automation-nurture] call failed after ${Date.now() - started}ms`, e);

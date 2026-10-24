@@ -97,6 +97,14 @@ export async function GET(req: Request) {
     const stopped = history.filter((h) => (h.error || '').startsWith('stopped'))
       .sort((a, b) => b.sent_at.localeCompare(a.sent_at))
       .map((h) => ({ phone: h.phone_e164, name: nameOf(h.phone_e164), key: h.automation_key, at: h.sent_at, reason: (h.error || '').replace(/^stopped — /, '') }));
+    // Stops the engine keeps re-deriving instead of writing down (it never
+    // overwrites the record of a message that went) — shown here all the same.
+    const listed = new Set(stopped.map((x) => x.phone));
+    for (const st of plan.settles) {
+      if (listed.has(st.phoneE164) || st.reason.startsWith('series complete')) continue;
+      stopped.push({ phone: st.phoneE164, name: nameOf(st.phoneE164), key: st.key, at: new Date(now).toISOString(), reason: st.reason.replace(/^stopped — /, '') });
+      listed.add(st.phoneE164);
+    }
 
     const stepStats = NURTURE_KEYS.map((k) => ({
       key: k,

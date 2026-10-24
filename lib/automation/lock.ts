@@ -26,6 +26,7 @@ const LOCK_KEY = 'automation_tick_lock';
  * skipped because of — the main T1/T2–T4 run, and vice versa.
  */
 export const NURTURE_LOCK_KEY = 'automation_nurture_lock';
+export const CHASE_LOCK_KEY = 'automation_chase_lock';
 const EPOCH = '1970-01-01T00:00:00.000Z';
 
 /** Longer than any run can live (the platform kills a function by ~27s). */

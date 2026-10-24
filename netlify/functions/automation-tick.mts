@@ -1,5 +1,5 @@
 // =============================================================================
-// NETLIFY SCHEDULED FUNCTION — T1 and the T2→T4 chase, every 5 minutes.
+// NETLIFY SCHEDULED FUNCTION — T1 (first message to new leads), every 5 minutes.
 // -----------------------------------------------------------------------------
 // The ONLY automation in the app (since 1 Oct 2026): the first message to each
 // fresh lead in the CRM. No follow-ups, no meeting messages, no campaigns —
@@ -41,6 +41,9 @@ export default async (): Promise<Response> => {
     } catch { /* not JSON: keep the raw start of the body */ }
 
     console.log(`[automation-tick] HTTP ${res.status} in ${Date.now() - started}ms ${summary}`);
+    // EARLY WARNING: a run creeping towards its budget is flagged long before it
+    // stops sending — search the logs for SLOW RUN.
+    try { const ms = JSON.parse(text).ms; if (typeof ms === 'number' && ms > 4000) console.warn(`[automation-tick] SLOW RUN ${ms}ms — budget is $6000ms; investigate before it starves`); } catch { /* not JSON */ }
     return new Response(null, { status: res.ok ? 200 : 502 });
   } catch (e) {
     console.error(`[automation-tick] call failed after ${Date.now() - started}ms`, e);

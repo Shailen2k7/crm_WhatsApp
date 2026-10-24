@@ -7,10 +7,10 @@ import { sendText, sendMedia, windowState, isConfigured, mediaTypeFrom } from '@
 import { toE164 } from '@/lib/phone';
 import { RELAY_BUCKET } from '@/lib/files';
 import {
-  CALL_TIMEOUT_MS, MAX_SENDS_PER_RUN, createAutomationAdminClient, createRunContext, forEachLimited, isTimeoutError,
+  CALL_TIMEOUT_MS, MAX_SENDS_PER_RUN, LONG_RUN, createAutomationAdminClient, createRunContext, forEachLimited, isTimeoutError,
   type RunContext,
 } from '@/lib/automation/run-context';
-import { acquireTickLock, releaseTickLock, NURTURE_LOCK_KEY } from '@/lib/automation/lock';
+import { acquireTickLock, releaseTickLock, NURTURE_LOCK_KEY, CHASE_LOCK_KEY } from '@/lib/automation/lock';
 import {
   planFirstMessages, RECENT_WINDOW_HOURS, MAX_ATTEMPTS,
   type HistoryRow, type Job, type LeadRow,
@@ -57,7 +57,7 @@ const IST = 'Asia/Kolkata';
 /** The chase sends only inside these IST hours (Shailen, 17 Oct 2026). */
 const CHASE_START_HOUR = 10;
 const CHASE_END_HOUR = 19;      // exclusive: last send window is 18:xx
-const CHASE_CONCURRENCY = 3;
+const CHASE_CONCURRENCY = 4;
 const NURTURE_CONCURRENCY = 5;
 const SEND_CONCURRENCY = 4;
 /** Marks a send whose outcome is unknown because the provider did not answer in time. */
@@ -138,9 +138,11 @@ export async function POST(req: NextRequest) {
   // lock and its own full budget. The 20-hour cross-engine lock is read fresh
   // from the database before every send, so the two runs still never double
   // a person.
-  if (req.nextUrl.searchParams.get('pass') === 'nurture') {
-    return runNurturePass({ dryRun, workspaceId });
-  }
+  const pass = req.nextUrl.searchParams.get('pass');
+  if (pass === 'nurture') return runSoloPass('nurture', { dryRun, workspaceId });
+  // T2–T4 likewise run on their own (netlify/functions/automation-chase.mts);
+  // the main run below is T1 alone, so a fresh lead is never kept waiting.
+  if (pass === 'chase') return runSoloPass('chase', { dryRun, workspaceId });
 
   const ctx = createRunContext();
   const admin = createAutomationAdminClient(ctx);
@@ -332,10 +334,7 @@ export async function POST(req: NextRequest) {
     // left. T1 always goes first: a fresh lead's first message is never starved
     // by the backlog of follow-ups (the exact failure of the old engine).
     // =========================================================================
-    if (ctx.hasTime()) {
-      const chase = await runChase(admin, lockAdmin, ctx, { dryRun, workspaceId, suppressed });
-      if (chase) report.push(chase);
-    }
+    // T2–T4 and the HS nurture run separately — see ?pass=chase / ?pass=nurture.
 
     // The Hot & Spotlight nurture runs separately — see ?pass=nurture above.
 
@@ -614,9 +613,14 @@ async function runChase(
   skipped.push(...plan.skipped);
 
   // People who are out for good: say it once, then never re-examine them.
-  if (plan.settles.length && !dryRun) {
+  // NEVER over a record of a message that went: that record is what the
+  // daily limit counts (24 Oct 2026: overwriting six of them let six extra
+  // messages past a limit). The planner re-derives those stops every run.
+  const sentRow = new Set(history.filter((h) => h.ok).map((h) => `${h.automation_key}:${h.phone_e164}`));
+  const chaseSettles = plan.settles.filter((st) => !sentRow.has(`${st.key}:${st.phoneE164}`));
+  if (chaseSettles.length && !dryRun) {
     await admin.from('relay_automation_sent').upsert(
-      plan.settles.map((st) => ({
+      chaseSettles.map((st) => ({
         workspace_id: ws, automation_key: st.key, lead_id: st.leadId, phone_e164: st.phoneE164,
         method: 'skipped', detail: null, ok: false, error: st.reason, attempts: CHASE_MAX_ATTEMPTS,
       })),
@@ -630,20 +634,29 @@ async function runChase(
   const byKey = new Map<AnyChaseKey, ChaseJob[]>();
   for (const j of jobs) { if (!byKey.has(j.key)) byKey.set(j.key, []); byKey.get(j.key)!.push(j); }
   const allowed: ChaseJob[] = [];
-  for (const [key, list] of byKey) {
-    const cap = Number(ruleByKey.get(key)?.daily_cap) || 0;
+  // Every step's count for today, and the 20-hour lock — one round trip wave.
+  const midnightIso = new Date(`${istDate()}T00:00:00+05:30`).toISOString();
+  const keys = [...byKey.keys()];
+  const [counts, recent] = await Promise.all([
+    Promise.all(keys.map(async (key) => {
+      const cap = Number(ruleByKey.get(key)?.daily_cap) || 0;
+      if (cap <= 0) return { key, cap, count: 0 };
+      const { count } = await admin.from('relay_automation_sent')
+        .select('id', { count: 'exact', head: true })
+        .eq('workspace_id', ws).eq('automation_key', key).eq('ok', true).gte('sent_at', midnightIso);
+      return { key, cap, count: count ?? 0 };
+    })),
+    jobs.length ? recentlyMessaged(admin, ws, now) : Promise.resolve({ phones: new Set<string>(), leads: new Set<string>() }),
+  ]);
+  for (const { key, cap, count } of counts) {
+    const list = byKey.get(key)!;
     if (cap <= 0) { allowed.push(...list); continue; }
-    const { count } = await admin.from('relay_automation_sent')
-      .select('id', { count: 'exact', head: true })
-      .eq('workspace_id', ws).eq('automation_key', key).eq('ok', true)
-      .gte('sent_at', new Date(`${istDate()}T00:00:00+05:30`).toISOString());
-    const left = Math.max(0, cap - (count ?? 0));
+    const left = Math.max(0, cap - count);
     if (left < list.length) skipped.push(`${key}: daily cap ${cap} — ${list.length - left} wait for tomorrow`);
     allowed.push(...list.slice(0, left));
   }
   jobs = allowed.sort((a, b) => a.dueMs - b.dueMs);
   {
-    const recent = await recentlyMessaged(admin, ws, now);
     const held = jobs.filter((j) => recent.phones.has(j.phoneE164) || (j.leadId && recent.leads.has(j.leadId)));
     if (held.length) {
       for (const j of held) skipped.push(`${j.name || j.phoneE164} ${j.key}: held — got an automated message in the last 20h`);
@@ -789,9 +802,12 @@ async function runNurture(
   const plan = planNurture({ now, enabled: rule.enabled || dryRun, people, history });
   skipped.push(...plan.skipped);
 
-  if (plan.settles.length && !dryRun) {
+  // Never over a record of a message that went — the daily limit counts those.
+  const sentRow = new Set(history.filter((h) => h.ok).map((h) => `${h.automation_key}:${h.phone_e164}`));
+  const nurtureSettles = plan.settles.filter((st) => !sentRow.has(`${st.key}:${st.phoneE164}`));
+  if (nurtureSettles.length && !dryRun) {
     await admin.from('relay_automation_sent').upsert(
-      plan.settles.map((st) => ({
+      nurtureSettles.map((st) => ({
         workspace_id: rule.ws, automation_key: st.key, lead_id: st.leadId, phone_e164: st.phoneE164,
         method: 'skipped', detail: null, ok: false, error: st.reason, attempts: NURTURE_MAX_ATTEMPTS,
       })),
@@ -848,10 +864,12 @@ async function runNurture(
 }
 
 // ---------------------------------------------------------------------------
-// ?pass=nurture — the nurture alone, with its own lock and its own budget.
+// ?pass=chase | ?pass=nurture — one engine alone: its own lock, its own long
+// budget, its own scheduled function. Nothing else can eat its time.
 // ---------------------------------------------------------------------------
-async function runNurturePass(opts: { dryRun: boolean; workspaceId: string | null }): Promise<NextResponse> {
-  const ctx = createRunContext();
+async function runSoloPass(kind: 'chase' | 'nurture', opts: { dryRun: boolean; workspaceId: string | null }): Promise<NextResponse> {
+  const lockKey = kind === 'chase' ? CHASE_LOCK_KEY : NURTURE_LOCK_KEY;
+  const ctx = createRunContext(LONG_RUN);
   const admin = createAutomationAdminClient(ctx);
   const lockAdmin = createAutomationAdminClient();
   if (!admin || !lockAdmin) {
@@ -864,30 +882,33 @@ async function runNurturePass(opts: { dryRun: boolean; workspaceId: string | nul
     let q = admin.from('relay_suppressions').select('workspace_id, phone_e164');
     if (opts.workspaceId) q = q.eq('workspace_id', opts.workspaceId);
     const [lock, { data: supp }] = await Promise.all([
-      opts.dryRun ? Promise.resolve({ acquired: true as const, token: '' }) : acquireTickLock(admin, NURTURE_LOCK_KEY),
+      opts.dryRun ? Promise.resolve({ acquired: true as const, token: '' }) : acquireTickLock(admin, lockKey),
       q,
     ]);
-    if (!lock.acquired) return NextResponse.json({ ok: true, pass: 'nurture', skipped: 'locked', reason: lock.reason, ms: ctx.elapsedMs() });
+    if (!lock.acquired) return NextResponse.json({ ok: true, pass: kind, skipped: 'locked', reason: lock.reason, ms: ctx.elapsedMs() });
     lockToken = lock.token || null;
-    const report = await runNurture(admin, lockAdmin, ctx, {
+    const runOpts = {
       dryRun: opts.dryRun, workspaceId: opts.workspaceId,
       suppressed: (supp || []) as { workspace_id: string; phone_e164: string }[],
-    });
+    };
+    const report = kind === 'chase'
+      ? await runChase(admin, lockAdmin, ctx, runOpts)
+      : await runNurture(admin, lockAdmin, ctx, runOpts);
     return NextResponse.json({
-      ok: true, pass: 'nurture', dryRun: opts.dryRun,
+      ok: true, pass: kind, dryRun: opts.dryRun,
       ms: ctx.elapsedMs(), sendsUsed: MAX_SENDS_PER_RUN - ctx.sendsLeft(),
       report: report ? [report] : [],
     });
   } catch (e) {
     const timedOut = isTimeoutError(e);
-    console.error('[nurture] run failed', e);
+    console.error(`[${kind}] run failed`, e);
     return NextResponse.json({
-      ok: false, pass: 'nurture',
+      ok: false, pass: kind,
       error: timedOut ? `A call exceeded its ${CALL_TIMEOUT_MS / 1000}s limit; the next run continues.` : (e instanceof Error ? e.message : String(e)),
       ms: ctx.elapsedMs(),
     }, { status: timedOut ? 200 : 500 });
   } finally {
     ctx.dispose();
-    if (lockToken) await releaseTickLock(lockAdmin, lockToken, NURTURE_LOCK_KEY).catch(() => {});
+    if (lockToken) await releaseTickLock(lockAdmin, lockToken, lockKey).catch(() => {});
   }
 }

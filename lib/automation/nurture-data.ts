@@ -55,35 +55,70 @@ export async function loadNurtureFacts(
     return d.length >= 10 ? d.slice(-10) : null;
   };
 
-  // ---- the audience, their chats, their history, the opt-outs — in parallel --
+  // ---- the audience, starred chats and opt-outs — in parallel ----------------
+  // EVERY read here is bounded by the AUDIENCE (Hot/Spotlight leads), never by
+  // all-time history: the number of conversations, sends and records can grow
+  // forever and this run stays the same size. (Until 24 Oct 2026 it read every
+  // conversation ever, capped at 5,000 — a ceiling that would one day have
+  // silently hidden someone's latest message.)
   type LeadRow = { id: string; full_name: string | null; phone: string | null; visa_type: string | null; stage: string | null; is_spotlight: boolean | null };
   type ConvRow = { id: string; phone_e164: string; lead_id: string | null; last_message_at: string | null; spotlight: boolean | null };
-  const [leadsRes, convsRes, histRes, suppRes] = await Promise.all([
-    admin.from('leads')
-      .select('id, full_name, phone, visa_type, stage, is_spotlight')
+  const convCols = 'id, phone_e164, lead_id, last_message_at, spotlight';
+  const leadCols = 'id, full_name, phone, visa_type, stage, is_spotlight';
+  const [leadsRes, starredRes, suppRes] = await Promise.all([
+    admin.from('leads').select(leadCols)
       .eq('workspace_id', ws).eq('is_sample', false)
-      .or('stage.eq.hot,is_spotlight.eq.true').limit(3000),
-    // Starred chats join the audience through their lead; every conversation is
-    // needed anyway to measure silence, so one whole read beats many lookups.
-    admin.from('relay_conversations')
-      .select('id, phone_e164, lead_id, last_message_at, spotlight')
-      .eq('workspace_id', ws).limit(5000),
-    admin.from('relay_automation_sent')
-      .select('id, automation_key, lead_id, phone_e164, ok, attempts, sent_at, error')
-      .eq('workspace_id', ws).in('automation_key', [...NURTURE_KEYS, NURTURE_PAUSE_KEY]).limit(5000),
+      .or('stage.eq.hot,is_spotlight.eq.true').limit(5000),
+    admin.from('relay_conversations').select(convCols)
+      .eq('workspace_id', ws).eq('spotlight', true).limit(2000),
     opts.suppressed
       ? Promise.resolve({ data: opts.suppressed, error: null })
       : admin.from('relay_suppressions').select('workspace_id, phone_e164').eq('workspace_id', ws),
   ]);
   if (leadsRes.error) throw new Error(`nurture leads: ${leadsRes.error.message}`);
-  if (convsRes.error) throw new Error(`nurture convs: ${convsRes.error.message}`);
-  if (histRes.error) throw new Error(`nurture history: ${histRes.error.message}`);
-
+  if (starredRes.error) throw new Error(`nurture starred: ${starredRes.error.message}`);
   const leads = (leadsRes.data || []) as LeadRow[];
-  const convs = (convsRes.data || []) as ConvRow[];
-  const history = (histRes.data || []) as NurtureHistRow[];
   const suppressed = new Set(((suppRes.data || []) as { workspace_id: string; phone_e164: string }[])
     .filter((s) => s.workspace_id === ws).map((s) => s.phone_e164));
+
+  // A starred chat whose lead is not Hot/Spotlight still counts (the team
+  // starred it for a reason) — bring that lead in.
+  const starred = (starredRes.data || []) as ConvRow[];
+  const haveLead = new Set(leads.map((l) => l.id));
+  const extraIds = [...new Set(starred.filter((c) => c.lead_id && !haveLead.has(c.lead_id)).map((c) => c.lead_id as string))];
+  if (extraIds.length) {
+    const parts = await Promise.all(chunk(extraIds, 100).map((ids) =>
+      admin.from('leads').select(leadCols).eq('workspace_id', ws).eq('is_sample', false).in('id', ids)));
+    for (const { data } of parts) leads.push(...((data || []) as LeadRow[]));
+  }
+
+  // ---- only the audience's own conversations: by lead link and by number ----
+  const leadIds = leads.map((l) => l.id);
+  const leadPhones = [...new Set(leads.map((l) => toE164(l.phone)).filter(Boolean) as string[])];
+  const [byLead, byPhone] = await Promise.all([
+    Promise.all(chunk(leadIds, 100).map((ids) =>
+      admin.from('relay_conversations').select(convCols).eq('workspace_id', ws).in('lead_id', ids).limit(2000))),
+    Promise.all(chunk(leadPhones, 100).map((ps) =>
+      admin.from('relay_conversations').select(convCols).eq('workspace_id', ws).in('phone_e164', ps).limit(2000))),
+  ]);
+  const convById = new Map<string, ConvRow>();
+  for (const part of [...byLead, ...byPhone, { data: starred, error: null }]) {
+    if (part.error) throw new Error(`nurture convs: ${part.error.message}`);
+    for (const c of (part.data || []) as ConvRow[]) convById.set(c.id, c);
+  }
+  const convs = [...convById.values()];
+
+  // ---- their nurture history: only these people's numbers -------------------
+  const histPhones = [...new Set([...convs.map((c) => c.phone_e164), ...leadPhones])];
+  const histParts = await Promise.all(chunk(histPhones, 100).map((ps) =>
+    admin.from('relay_automation_sent')
+      .select('id, automation_key, lead_id, phone_e164, ok, attempts, sent_at, error')
+      .eq('workspace_id', ws).in('automation_key', [...NURTURE_KEYS, NURTURE_PAUSE_KEY]).in('phone_e164', ps).limit(2000)));
+  const history: NurtureHistRow[] = [];
+  for (const part of histParts) {
+    if (part.error) throw new Error(`nurture history: ${part.error.message}`);
+    history.push(...((part.data || []) as NurtureHistRow[]));
+  }
 
   const convsByLead = new Map<string, ConvRow[]>();
   const convsBy10 = new Map<string, ConvRow[]>();
@@ -91,18 +126,6 @@ export async function loadNurtureFacts(
     if (c.lead_id) { if (!convsByLead.has(c.lead_id)) convsByLead.set(c.lead_id, []); convsByLead.get(c.lead_id)!.push(c); }
     const k = last10(c.phone_e164);
     if (k) { if (!convsBy10.has(k)) convsBy10.set(k, []); convsBy10.get(k)!.push(c); }
-  }
-
-  // A starred chat whose lead is not Hot/Spotlight still counts (the team
-  // starred it for a reason) — bring that lead in.
-  const starredLeadIds = new Set(convs.filter((c) => c.spotlight && c.lead_id).map((c) => c.lead_id as string));
-  const haveLead = new Set(leads.map((l) => l.id));
-  const extraIds = [...starredLeadIds].filter((id) => !haveLead.has(id));
-  for (const ids of chunk(extraIds, 100)) {
-    const { data } = await admin.from('leads')
-      .select('id, full_name, phone, visa_type, stage, is_spotlight')
-      .eq('workspace_id', ws).eq('is_sample', false).in('id', ids);
-    leads.push(...((data || []) as LeadRow[]));
   }
 
   // ---- one person = lead + every conversation that is theirs -----------------

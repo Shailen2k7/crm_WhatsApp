@@ -81,7 +81,7 @@ export async function loadChaseFacts(
   const [recentT1, ...bfParts] = await Promise.all([
     admin.from('relay_automation_sent').select(t1Cols)
       .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', true)
-      .gte('sent_at', sinceIso).limit(2000),
+      .gte('sent_at', sinceIso).limit(5000),               // a month of leads: ~750 today
     ...chunk([...backfillPhones], 100).map((ps) => admin.from('relay_automation_sent').select(t1Cols)
       .eq('workspace_id', ws).eq('automation_key', 'new_lead_first').eq('ok', true).in('phone_e164', ps)),
   ]);
@@ -93,12 +93,19 @@ export async function loadChaseFacts(
     }
   }
 
-  // ---- every chase row ever written (small; one person is at most 4 rows) ---
-  const { data: histData, error: histErr } = await admin.from('relay_automation_sent')
-    .select('id, automation_key, lead_id, phone_e164, ok, attempts, sent_at, error')
-    .eq('workspace_id', ws).in('automation_key', [...CHASE_KEYS, T1R_KEY]).limit(5000);
-  if (histErr) throw new Error(`chase history: ${histErr.message}`);
-  const history = (histData || []) as ChaseHistRow[];
+  // ---- the chase rows of THESE people only (at most 4 each) --------------------
+  // Bounded by who is in the window (≈ a month of leads + the backfill), never
+  // by all-time history: until 24 Oct 2026 this read every chase row ever,
+  // capped at 5,000 — a ceiling roughly six weeks away at the current pace.
+  const histParts = await Promise.all(chunk([...t1Rows.keys()], 100).map((ps) =>
+    admin.from('relay_automation_sent')
+      .select('id, automation_key, lead_id, phone_e164, ok, attempts, sent_at, error')
+      .eq('workspace_id', ws).in('automation_key', [...CHASE_KEYS, T1R_KEY]).in('phone_e164', ps).limit(1000)));
+  const history: ChaseHistRow[] = [];
+  for (const part of histParts) {
+    if (part.error) throw new Error(`chase history: ${part.error.message}`);
+    history.push(...((part.data || []) as ChaseHistRow[]));
+  }
 
   const facts = new Map<string, PersonFacts>();
   if (!t1Rows.size) return { backfillPhones, t1Rows, history, facts };
