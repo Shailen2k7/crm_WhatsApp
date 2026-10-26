@@ -85,8 +85,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: 'Message is too long (max 4096 characters).' }, { status: 400 });
   }
 
-  const phoneE164 = toE164(body.phone);
-  if (!phoneE164) return NextResponse.json({ ok: false, error: 'That contact has no usable phone number.' }, { status: 400 });
+  const requestedPhone = toE164(body.phone);
+  if (!requestedPhone) return NextResponse.json({ ok: false, error: 'That contact has no usable phone number.' }, { status: 400 });
+  let phoneE164: string = requestedPhone;
 
   const admin = createAdminClient();
   if (!admin) return NextResponse.json({ ok: false, error: 'Server is not configured.' }, { status: 500 });
@@ -104,12 +105,19 @@ export async function POST(req: Request) {
 
   const { data: conv } = await admin
     .from('relay_conversations')
-    .select('id, workspace_id, last_inbound_at')
+    .select('id, workspace_id, last_inbound_at, phone_e164')
     .eq('id', conversationId)
     .maybeSingle();
   if (!conv || conv.workspace_id !== workspaceId) {
     return NextResponse.json({ ok: false, error: 'Conversation not found.' }, { status: 404 });
   }
+
+  // THE CHAT'S OWN NUMBER IS THE ADDRESS. A chat linked to a lead from another
+  // number (the ad form held one phone, they WhatsApp from another) shows the
+  // lead's details on screen — but a reply typed into that chat must go to the
+  // number that chat is with. Sending to the lead's phone instead reached
+  // nobody: "Customer is not available for the organization" (26 Oct 2026).
+  if (conv.phone_e164) phoneE164 = conv.phone_e164;
 
   // ---- INTERNAL NOTE: store and stop. Never touches WhatsApp. --------------
   if (isInternal) {
