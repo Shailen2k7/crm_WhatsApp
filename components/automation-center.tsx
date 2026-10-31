@@ -2,13 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Loader2, RefreshCw, RotateCw, MessageSquare, FileText, Snowflake, Flame } from 'lucide-react';
-import { createClient } from '@/lib/supabase/client';
 
 /**
  * SETTINGS → AUTOMATION. One tab per AUTOMATION ENGINE — the CV & LinkedIn
- * chase today; the Cold and Hot lead chases next (shown as design previews,
- * with no engine and no live switches, until they are built). Inside each tab
- * the engine's steps sit on a timeline; pick a step to manage it.
+ * chase, the Cold lead chase (CC1→CC8) and the Hot & Spotlight nurture, all
+ * live. Inside each tab the engine's steps sit on a timeline; pick a step to
+ * manage it.
  *
  * Step management (unchanged):
  *
@@ -494,7 +493,7 @@ type Engine = 'cv' | 'cold' | 'hot';
 
 const ENGINES: { id: Engine; label: string; icon: React.ReactNode; live: boolean; blurb: string }[] = [
   { id: 'cv', label: 'CV & LinkedIn chase', icon: <FileText size={14} />, live: true, blurb: 'New leads: ask for the CV and LinkedIn, then follow up until they reply.' },
-  { id: 'cold', label: 'Cold lead chase', icon: <Snowflake size={14} />, live: false, blurb: 'Leads marked Cold in the CRM: slow, spaced nudges over months.' },
+  { id: 'cold', label: 'Cold lead chase', icon: <Snowflake size={14} />, live: true, blurb: 'Cold leads who went quiet: one message a week (CC1→CC8), p1 → p2 → p3, until they speak — then it stops for good.' },
   { id: 'hot', label: 'Hot & Spotlight', icon: <Flame size={14} />, live: true, blurb: 'Hot and Spotlight leads who have gone quiet: one value message (HS1→HS8) every 4 days until they reply.' },
 ];
 
@@ -505,6 +504,7 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
   const setEngine = (e: Engine) => { selectedEngine = e; setEngineState(e); };
   const [cvOn, setCvOn] = useState<number | null>(() => (switchCache ? Object.values(switchCache).filter(Boolean).length : null));
   const [nurtureOn, setNurtureOn] = useState<boolean | null>(null);
+  const [coldOn, setColdOn] = useState<boolean | null>(null);
 
   useEffect(() => {
     fetch('/api/automation/switch', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
@@ -512,6 +512,9 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
     }).catch(() => {});
     fetch('/api/automation/nurture', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
       if (j.ok) setNurtureOn(!!j.rule?.enabled);
+    }).catch(() => {});
+    fetch('/api/automation/cold', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
+      if (j.ok) setColdOn(!!j.rule?.enabled);
     }).catch(() => {});
   }, [engine]);
 
@@ -543,6 +546,7 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
           const status = !e.live ? 'Coming next'
             : e.id === 'cv' ? (cvOn === null ? '' : cvOn > 0 ? 'On' : 'Off')
             : e.id === 'hot' ? (nurtureOn === null ? '' : nurtureOn ? 'On' : 'Off')
+            : e.id === 'cold' ? (coldOn === null ? '' : coldOn ? 'On' : 'Off')
             : '';
           return (
             <button
@@ -574,80 +578,150 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
       <p style={{ fontSize: 12.5, color: 'var(--muted)', margin: '6px 0 16px', lineHeight: 1.5 }}>{current.blurb}</p>
 
       {engine === 'cv' && <CvChase onOpenChat={onOpenChat} />}
-      {engine === 'cold' && (
-        <PreviewEngine
-          name="Cold lead chase"
-          audience="Leads whose stage is Cold in the CRM (2,124 today)"
-          hours="10am–7pm IST"
-          steps={[
-            { tpl: 'c1', after: 'Start' }, { tpl: 'c2', after: '+3 days' }, { tpl: 'c3', after: '+7 days' }, { tpl: 'c4', after: '+14 days' },
-            { tpl: 'c5', after: '+21 days' }, { tpl: 'c6', after: '+40 days' }, { tpl: 'c7', after: '+70 days' }, { tpl: 'c8', after: '+90 days' },
-          ]}
-        />
-      )}
+      {engine === 'cold' && <ColdEngine />}
       {engine === 'hot' && <NurtureEngine />}
     </div>
   );
 }
 
-/**
- * A DESIGN PREVIEW of an engine that is not built yet: the steps, timing and
- * exact approved wording, so the shape can be agreed before any code that can
- * send exists. Every control here is disabled on purpose.
- */
-const templateBodyCache: Record<string, string> = {};
+// =============================================================================
+// COLD LEAD CHASE — the live tab. One switch, one paced daily cap, the CC1→CC8
+// timeline with real wording, and the Next up / Sent / Stopped lists. The
+// switch and cap act through /api/automation/cold, the same code the engine
+// reads, so the tab and the sender can never disagree. No pause and no skip:
+// the cold chase stops for good the moment anyone speaks.
+// =============================================================================
+interface ColdOverview {
+  isAdmin: boolean;
+  rule: { enabled: boolean; dailyCap: number; startCap: number };
+  audience: { total: number; p1: number; p2: number; p3: number; inSeries: number; finishedOrStopped: number };
+  sentToday: number;
+  startsToday: number;
+  finished: number;
+  steps: { key: string; template: string; body: string | null; sent: number }[];
+  next: { phone: string; name: string | null; key: string; priority: 1 | 2 | 3; at: string; state: string }[];
+  sent: { phone: string; name: string | null; key: string; at: string }[];
+  stopped: { phone: string; name: string | null; key: string; at: string; reason: string }[];
+}
 
-function PreviewEngine({ name, audience, hours, steps }: {
-  name: string; audience: string; hours: string; steps: { tpl: string; after: string }[];
-}) {
-  const [bodies, setBodies] = useState<Record<string, string>>(() => ({ ...templateBodyCache }));
-  const [open, setOpen] = useState<string | null>(steps[0]?.tpl ?? null);
+let coldCache: ColdOverview | null = null;
 
-  // Keyed on the template NAMES, not the array: the parent builds a fresh
-  // array every render, and depending on it would refetch forever.
-  const names = steps.map((x) => x.tpl).join(',');
+function ColdEngine() {
+  const [ov, setOv] = useState<ColdOverview | null>(coldCache);
+  const [openStep, setOpenStep] = useState<string>('cold_cc1');
+  const [list, setList] = useState('next');
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [capDraft, setCapDraft] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async (quiet = false) => {
+    try {
+      const res = await fetch('/api/automation/cold', { cache: 'no-store' });
+      const json = await res.json();
+      if (!json.ok) { if (!quiet) setError(json.error || 'Could not load.'); return; }
+      coldCache = json as ColdOverview;
+      setOv(coldCache);
+      setError(null);
+    } catch { if (!quiet) setError('Could not load — check your connection.'); }
+  }, []);
   useEffect(() => {
-    const supabase = createClient();
-    supabase.from('relay_templates').select('name, body').in('name', names.split(',')).then(({ data }) => {
-      for (const t of (data || []) as { name: string; body: string }[]) templateBodyCache[t.name] = t.body;
-      setBodies({ ...templateBodyCache });
-    });
-  }, [names]);
+    load(!!coldCache);
+    const t = setInterval(() => load(true), 60_000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  async function post(body: Record<string, unknown>, busyKey: string) {
+    setBusy(busyKey); setMsg(null);
+    try {
+      const res = await fetch('/api/automation/cold', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const json = await res.json();
+      if (!json.ok) { setMsg({ ok: false, text: json.error || 'Could not save.' }); return false; }
+      await load(true);
+      return true;
+    } catch { setMsg({ ok: false, text: 'Network error — nothing was changed.' }); return false; }
+    finally { setBusy(null); }
+  }
+
+  if (!ov) {
+    return error
+      ? <Card><div style={{ color: 'var(--red)', fontSize: 12.5 }}>{error}</div></Card>
+      : <Card><div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--muted)', fontSize: 13, padding: '6px 0' }}><Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> Loading…</div></Card>;
+  }
+
+  const stepMeta = (k: string) => ({ n: Number(k.replace('cold_cc', '')), tpl: k.replace('cold_', '') });
+  const fmtAt = (iso: string) => new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(iso));
+  const pTag = (p: 1 | 2 | 3) => `p${p}`;
+  const open = ov.steps.find((s) => s.key === openStep) ?? ov.steps[0];
+  const lists = [
+    { id: 'next', label: 'Next up', count: ov.next.length },
+    { id: 'sent', label: 'Sent', count: ov.sent.length },
+    { id: 'stopped', label: 'Stopped', count: ov.stopped.length },
+  ];
+
+  function toggleEngine() {
+    const on = !ov!.rule.enabled;
+    const text = on
+      ? `Switch ON the Cold lead chase?\n\nIt starts on the next run (within 5 minutes), 10am–7pm IST: at most ${ov!.rule.startCap} people begin CC1 per day (p1 first, newest first), up to ${ov!.rule.dailyCap || 'unlimited'} cold messages a day in total, spread evenly through the day. ${ov!.audience.total} people are in the audience; only those properly quiet (no reply in 14 days, nothing from us in 7) get anything.`
+      : 'Switch OFF the Cold lead chase?\n\nNothing is lost: everyone continues from their next message when you switch it back on.';
+    if (confirm(text)) post({ enabled: on }, 'switch');
+  }
 
   return (
     <>
-      <div style={{ background: 'var(--amber-bg)', color: 'var(--amber)', padding: '10px 13px', borderRadius: 11, fontSize: 12.5, fontWeight: 600, marginBottom: 14, lineHeight: 1.5 }}>
-        Design preview — {name} is not built yet. Nothing here can send; the switches are disabled.
-      </div>
-
       <Card>
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 16, fontWeight: 700 }}>{name}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 16, fontWeight: 700 }}>Cold lead chase</span>
+              <span style={{ fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 99, background: ov.rule.enabled ? 'var(--teal-bg)' : 'var(--surface-3)', color: ov.rule.enabled ? 'var(--teal-ink)' : 'var(--muted)' }}>
+                {ov.rule.enabled ? 'ON' : 'OFF'}
+              </span>
+            </div>
             <div style={{ fontSize: 12.5, color: 'var(--muted)', marginTop: 4, lineHeight: 1.55 }}>
-              <strong style={{ color: 'var(--ink-2)' }}>Who:</strong> {audience}<br />
-              <strong style={{ color: 'var(--ink-2)' }}>When:</strong> {hours}, one message per person per day at most<br />
-              <strong style={{ color: 'var(--ink-2)' }}>Stops:</strong> the moment they reply, the team messages them, their stage changes, or they say STOP
+              CC1 → CC8, one a week per person, 10am–7pm IST, spread evenly through the day. Up to {ov.rule.startCap} people
+              begin per day — p1 first, then p2, then p3, newest first. New cold leads join by themselves once the T chase
+              finishes and they stay quiet. A reply, a team message, STOP, a stage change or 3 Meta refusals stops it for
+              good; Hot or Spotlight hands them to the HS nurture.
             </div>
           </div>
-          <Switch on={false} disabled onClick={() => {}} label={name} />
+          <Switch on={ov.rule.enabled} disabled={!ov.isAdmin || busy === 'switch'} onClick={toggleEngine} label="Cold lead chase" />
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--line-2)', fontSize: 12.5, color: 'var(--muted)' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Max per day
+            <input
+              inputMode="numeric"
+              disabled={!ov.isAdmin || busy === 'switch'}
+              value={capDraft ?? String(ov.rule.dailyCap)}
+              onChange={(e) => setCapDraft(e.target.value.replace(/[^\d]/g, ''))}
+              onBlur={() => { if (capDraft !== null && capDraft !== String(ov.rule.dailyCap)) { const n = Number(capDraft); if (Number.isInteger(n) && n >= 0) post({ dailyCap: n }, 'switch'); } setCapDraft(null); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+              style={{ width: 54, padding: '4px 6px', borderRadius: 7, border: '1px solid var(--line)', background: 'var(--surface-2)', fontSize: 12.5, textAlign: 'center', outline: 'none' }}
+            />
+          </label>
+          <span>Audience <strong style={{ color: 'var(--ink-2)' }}>{ov.audience.total}</strong> · p1 {ov.audience.p1} · p2 {ov.audience.p2} · p3 {ov.audience.p3}</span>
+          <span>In series <strong style={{ color: 'var(--ink-2)' }}>{ov.audience.inSeries}</strong> · finished {ov.finished}</span>
+          <span>Sent today <strong style={{ color: 'var(--ink-2)' }}>{ov.sentToday}</strong> · new starts {ov.startsToday}/{ov.rule.startCap}</span>
+          {!ov.isAdmin && <span>Only an admin can change these.</span>}
         </div>
       </Card>
 
+      {/* the series */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 0, overflowX: 'auto', scrollbarWidth: 'none', marginBottom: 14, paddingBottom: 2 }}>
-        {steps.map((st, i) => (
-          <div key={st.tpl} style={{ display: 'flex', alignItems: 'center', flex: 'none' }}>
+        {ov.steps.map((st, i) => (
+          <div key={st.key} style={{ display: 'flex', alignItems: 'center', flex: 'none' }}>
             {i > 0 && <ChevronRight size={14} style={{ color: 'var(--muted)', margin: '0 2px' }} />}
             <button
-              onClick={() => setOpen(st.tpl)}
+              onClick={() => setOpenStep(st.key)}
               style={{
-                textAlign: 'left', padding: '8px 12px', borderRadius: 11, cursor: 'pointer', minWidth: 74,
-                border: '1px solid ' + (open === st.tpl ? 'var(--ink-2)' : 'var(--line)'),
-                background: open === st.tpl ? 'var(--surface-3)' : 'var(--surface)',
+                textAlign: 'left', padding: '8px 12px', borderRadius: 11, cursor: 'pointer', minWidth: 72,
+                border: '1px solid ' + (openStep === st.key ? 'var(--teal)' : 'var(--line)'),
+                background: openStep === st.key ? 'var(--teal-bg)' : 'var(--surface)',
               }}
             >
-              <div style={{ fontSize: 13, fontWeight: 700 }}>{st.tpl.toUpperCase()}</div>
-              <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2, whiteSpace: 'nowrap' }}>{st.after}</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: openStep === st.key ? 'var(--teal-ink)' : 'var(--ink)' }}>CC{stepMeta(st.key).n}</div>
+              <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2, whiteSpace: 'nowrap' }}>{i === 0 ? 'once quiet' : '+7 days'} · {st.sent} sent</div>
             </button>
           </div>
         ))}
@@ -655,25 +729,46 @@ function PreviewEngine({ name, audience, hours, steps }: {
 
       {open && (
         <Card>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-            <span style={{ fontSize: 14, fontWeight: 700 }}>{open.toUpperCase()}</span>
-            <span style={{ fontSize: 12, color: 'var(--muted)' }}>{steps.find((x) => x.tpl === open)?.after} · template <code>{open}</code></span>
-            <span style={{ marginLeft: 'auto' }}><Switch on={false} disabled onClick={() => {}} label={open} /></span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, fontSize: 12.5, color: 'var(--muted)' }}>
+            <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--ink)' }}>CC{stepMeta(open.key).n}</span>
+            template <code>{open.template}</code> · sent to {open.sent} people so far
           </div>
           <div style={{ padding: '11px 13px', borderRadius: 10, background: 'var(--surface-2)', fontSize: 13, lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
-            {(bodies[open] || 'Loading wording…').replace(/\{\{\s*1\s*\}\}/g, 'Name')}
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(96px, 1fr))', gap: 8, marginTop: 12, opacity: 0.55 }}>
-            <Tile label="Sent today" value={0} />
-            <Tile label="Last 7 days" value={0} />
-            <Tile label="Delivered" value={0} />
-            <Tile label="Replied" value={0} />
-          </div>
-          <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 10 }}>
-            Once built, this step gets the same lists as the CV chase: Next up, Sent and Stopped.
+            {open.body || 'Wording not registered.'}
           </div>
         </Card>
       )}
+
+      {msg && <div style={{ background: msg.ok ? 'var(--teal-bg)' : 'var(--red-bg)', color: msg.ok ? 'var(--teal-ink)' : 'var(--red)', padding: '9px 12px', borderRadius: 10, fontSize: 12.5, marginBottom: 12 }}>{msg.text}</div>}
+
+      <Card>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+          {lists.map((l) => (
+            <button key={l.id} onClick={() => setList(l.id)}
+              style={{ padding: '5px 11px', borderRadius: 99, fontSize: 12, fontWeight: 600, cursor: 'pointer', border: '1px solid ' + (list === l.id ? 'transparent' : 'var(--line)'), background: list === l.id ? 'var(--ink)' : 'transparent', color: list === l.id ? 'var(--surface)' : 'var(--ink-2)' }}>
+              {l.label} <span style={{ opacity: 0.7 }}>{l.count}</span>
+            </button>
+          ))}
+        </div>
+        <div style={{ maxHeight: 440, overflowY: 'auto', overscrollBehavior: 'contain' }}>
+          {list === 'next' && (ov.next.length === 0 ? <Empty text="Nobody is waiting right now." /> : ov.next.map((n) => (
+            <Line key={n.phone + n.key} name={`${n.name || n.phone} · ${pTag(n.priority)}`} phone={n.phone}
+              sub={n.state === 'due' ? `CC${stepMeta(n.key).n} — goes out on the next run (within the daily pace)`
+                : n.state === 'off' ? `CC${stepMeta(n.key).n} — due, waiting for the switch`
+                : n.state === 'ecosystem' ? `CC${stepMeta(n.key).n} — Meta pause, earliest ${fmtAt(n.at)}`
+                : n.state === 'quiet' ? `CC${stepMeta(n.key).n} — waiting for them to be properly quiet (earliest ${fmtAt(n.at)})`
+                : `CC${stepMeta(n.key).n} — scheduled ${fmtAt(n.at)}`}
+              right={n.state === 'due' ? <Chip tone="teal">Due</Chip> : <Chip tone="grey">Waiting</Chip>}
+            />
+          )))}
+          {list === 'sent' && (ov.sent.length === 0 ? <Empty text="Nothing sent yet." /> : ov.sent.map((x) => (
+            <Line key={x.phone + x.key} name={x.name || x.phone} phone={x.phone} sub={`CC${stepMeta(x.key).n} · ${fmtAt(x.at)}`} right={<Chip tone="teal">Sent</Chip>} />
+          )))}
+          {list === 'stopped' && (ov.stopped.length === 0 ? <Empty text="Nobody has been stopped." /> : ov.stopped.map((x) => (
+            <Line key={x.phone + x.key} name={x.name || x.phone} phone={x.phone} sub={`${x.reason} · ${fmtAt(x.at)}`} right={<Chip tone="grey">Stopped</Chip>} />
+          )))}
+        </div>
+      </Card>
     </>
   );
 }

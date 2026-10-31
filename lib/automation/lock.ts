@@ -27,6 +27,7 @@ const LOCK_KEY = 'automation_tick_lock';
  */
 export const NURTURE_LOCK_KEY = 'automation_nurture_lock';
 export const CHASE_LOCK_KEY = 'automation_chase_lock';
+export const COLD_LOCK_KEY = 'automation_cold_lock';
 const EPOCH = '1970-01-01T00:00:00.000Z';
 
 /** Longer than any run can live (the platform kills a function by ~27s). */

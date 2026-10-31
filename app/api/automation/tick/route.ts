@@ -10,7 +10,7 @@ import {
   CALL_TIMEOUT_MS, MAX_SENDS_PER_RUN, LONG_RUN, createAutomationAdminClient, createRunContext, forEachLimited, isTimeoutError,
   type RunContext,
 } from '@/lib/automation/run-context';
-import { acquireTickLock, releaseTickLock, NURTURE_LOCK_KEY, CHASE_LOCK_KEY } from '@/lib/automation/lock';
+import { acquireTickLock, releaseTickLock, NURTURE_LOCK_KEY, CHASE_LOCK_KEY, COLD_LOCK_KEY } from '@/lib/automation/lock';
 import {
   planFirstMessages, RECENT_WINDOW_HOURS, MAX_ATTEMPTS,
   type HistoryRow, type Job, type LeadRow,
@@ -22,6 +22,11 @@ import {
 import { loadChaseRules, loadChaseFacts } from '@/lib/automation/chase-data';
 import { planNurture, templateOfStep, NURTURE_KEYS, NURTURE_MAX_ATTEMPTS } from '@/lib/automation/nurture';
 import { loadNurtureRule, loadNurtureFacts } from '@/lib/automation/nurture-data';
+import {
+  planCold, templateOfColdStep, coldPaceAllowance,
+  COLD_KEYS, COLD_MAX_ATTEMPTS, COLD_START_CAP,
+} from '@/lib/automation/cold';
+import { loadColdRule, loadColdFacts } from '@/lib/automation/cold-data';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -59,6 +64,7 @@ const CHASE_START_HOUR = 10;
 const CHASE_END_HOUR = 19;      // exclusive: last send window is 18:xx
 const CHASE_CONCURRENCY = 4;
 const NURTURE_CONCURRENCY = 5;
+const COLD_CONCURRENCY = 4;
 const SEND_CONCURRENCY = 4;
 /** Marks a send whose outcome is unknown because the provider did not answer in time. */
 const TIMEOUT_NOTE = 'timeout — delivery unknown';
@@ -72,6 +78,13 @@ function istDate(d = new Date()): string {
 }
 function istHour(d = new Date()): number {
   return Number(new Intl.DateTimeFormat('en-GB', { timeZone: IST, hour: 'numeric', hour12: false }).format(d)) % 24;
+}
+/** Minutes elapsed since the given IST hour (for pacing a cap through the day). */
+function istMinutesSince(hour: number, d = new Date()): number {
+  const parts = new Intl.DateTimeFormat('en-GB', { timeZone: IST, hour: 'numeric', minute: 'numeric', hour12: false }).formatToParts(d);
+  const h = Number(parts.find((p) => p.type === 'hour')?.value ?? 0) % 24;
+  const m = Number(parts.find((p) => p.type === 'minute')?.value ?? 0);
+  return (h - hour) * 60 + m;
 }
 function firstNameOf(fullName: string | null | undefined): string {
   const n = (fullName || '').trim().split(/\s+/)[0];
@@ -143,6 +156,8 @@ export async function POST(req: NextRequest) {
   // T2–T4 likewise run on their own (netlify/functions/automation-chase.mts);
   // the main run below is T1 alone, so a fresh lead is never kept waiting.
   if (pass === 'chase') return runSoloPass('chase', { dryRun, workspaceId });
+  // The cold lead chase (CC1→CC8) too (netlify/functions/automation-cold.mts).
+  if (pass === 'cold') return runSoloPass('cold', { dryRun, workspaceId });
 
   // T1 runs alone now (T2–T4 and the nurture have their own runs), so it gets
   // the same long budget: on 24 Oct a single T1 run took 6.3 s on Netlify,
@@ -866,12 +881,130 @@ async function runNurture(
   return out;
 }
 
+// =============================================================================
+// THE COLD PASS. Same bones as the nurture: load (bounded by candidates), ask
+// the pure planner, record the people who are out, send under the caps — with
+// two extras the others do not have: a separate cap on how many people may
+// BEGIN the series each day, and even pacing of the daily cap through the
+// 10am–7pm window instead of one burst.
+// =============================================================================
+async function runCold(
+  admin: Admin, durable: Admin, ctx: RunContext,
+  opts: { dryRun: boolean; workspaceId: string | null; suppressed: { workspace_id: string; phone_e164: string }[] },
+): Promise<Record<string, unknown> | null> {
+  const { dryRun, workspaceId } = opts;
+  const now = Date.now();
+
+  const rule = await loadColdRule(admin, workspaceId, now);
+  if (!rule) return null;                           // not set up in this workspace
+  const out: Record<string, unknown> = { workspace: rule.ws, key: 'cold_cc', sent: 0, skipped: [] as string[] };
+  const skipped = out.skipped as string[];
+  if (!rule.enabled && !dryRun) { out.note = 'The cold chase is switched off.'; return out; }
+
+  const hour = istHour();
+  const inHours = hour >= CHASE_START_HOUR && hour < CHASE_END_HOUR;
+  if (!inHours && !dryRun) { out.note = `Outside sending hours (${CHASE_START_HOUR}:00–${CHASE_END_HOUR}:00 IST) — the cold chase waits.`; return out; }
+  if (!inHours && dryRun) out.hoursNote = 'outside sending hours — live runs would wait';
+
+  // Facts only for people who could be due on this run — see coldSeriesCandidates.
+  const { people, history, audience } = await loadColdFacts(admin, {
+    ws: rule.ws, now, suppressed: opts.suppressed,
+    starterSlice: COLD_START_CAP * 3, mode: 'tick',
+  });
+  out.audience = audience.total;
+  out.examined = people.length;
+
+  const plan = planCold({ now, enabled: rule.enabled || dryRun, activatedAtMs: rule.activatedAtMs, people, history });
+  skipped.push(...plan.skipped);
+
+  // People who are out for good: say it once, then never re-examine them.
+  // NEVER over a record of a message that went — the daily limit counts those.
+  const sentRow = new Set(history.filter((h) => h.ok).map((h) => `${h.automation_key}:${h.phone_e164}`));
+  const coldSettles = plan.settles.filter((st) => !sentRow.has(`${st.key}:${st.phoneE164}`));
+  if (coldSettles.length && !dryRun) {
+    await admin.from('relay_automation_sent').upsert(
+      coldSettles.map((st) => ({
+        workspace_id: rule.ws, automation_key: st.key, lead_id: st.leadId, phone_e164: st.phoneE164,
+        method: 'skipped', detail: null, ok: false, error: st.reason, attempts: COLD_MAX_ATTEMPTS,
+      })),
+      { onConflict: 'workspace_id,automation_key,phone_e164' },
+    );
+  }
+  for (const st of plan.settles) if (!st.reason.startsWith('series complete')) skipped.push(`${st.phoneE164} ${st.key}: ${st.reason}`);
+
+  // ---- the cross-engine lock and today's counts, read side by side ------------
+  let jobs = plan.jobs;
+  const midnightIso = new Date(`${istDate()}T00:00:00+05:30`).toISOString();
+  const [recent, sentTodayRes, startsTodayRes] = jobs.length
+    ? await Promise.all([
+      recentlyMessaged(admin, rule.ws, now),
+      admin.from('relay_automation_sent')
+        .select('id', { count: 'exact', head: true })
+        .eq('workspace_id', rule.ws).in('automation_key', COLD_KEYS).eq('ok', true)
+        .gte('sent_at', midnightIso),
+      admin.from('relay_automation_sent')
+        .select('id', { count: 'exact', head: true })
+        .eq('workspace_id', rule.ws).eq('automation_key', COLD_KEYS[0]).eq('ok', true)
+        .gte('sent_at', midnightIso),
+    ])
+    : [{ phones: new Set<string>(), leads: new Set<string>() }, { count: 0 }, { count: 0 }];
+  {
+    // Nobody gets two automated messages in 20 hours, from any engine.
+    const held = jobs.filter((j) => recent.phones.has(j.phoneE164) || recent.leads.has(j.leadId));
+    if (held.length) {
+      for (const j of held) skipped.push(`${j.name || j.phoneE164} ${j.key}: held — got an automated message in the last 20h`);
+      jobs = jobs.filter((j) => !held.includes(j));
+    }
+  }
+
+  // ---- the caps: continues first, then new starts (p1 → p2 → p3) --------------
+  // 1. At most COLD_START_CAP people may BEGIN the series per day.
+  const startsToday = (startsTodayRes as { count: number | null }).count ?? 0;
+  {
+    const startsLeft = Math.max(0, COLD_START_CAP - startsToday);
+    const starts = jobs.filter((j) => j.start);
+    if (starts.length > startsLeft) {
+      skipped.push(`cold: start cap ${COLD_START_CAP} — ${starts.length - startsLeft} begin on a later day`);
+      const keep = new Set(starts.slice(0, startsLeft));
+      jobs = jobs.filter((j) => !j.start || keep.has(j));
+    }
+  }
+  // 2. The daily cap, paced evenly through the sending window: by hh:mm only a
+  //    proportional share may have gone. A burst at 10am is exactly what Meta's
+  //    per-user marketing limits punish — see coldPaceAllowance.
+  const sentToday = (sentTodayRes as { count: number | null }).count ?? 0;
+  if (rule.dailyCap > 0 && jobs.length) {
+    const allowedByNow = coldPaceAllowance(rule.dailyCap, istMinutesSince(CHASE_START_HOUR));
+    const left = Math.max(0, Math.min(allowedByNow, rule.dailyCap) - sentToday);
+    if (left < jobs.length) skipped.push(`cold: pace ${allowedByNow}/${rule.dailyCap} by now, ${sentToday} sent — ${jobs.length - left} wait for a later run`);
+    jobs = jobs.slice(0, left);                     // continues-first order is already set
+  }
+  out.due = jobs.length;
+  out.sentToday = sentToday;
+  if (!jobs.length) { if (!out.note) out.note = 'Nobody is due a cold message.'; return out; }
+
+  if (dryRun) {
+    for (const j of jobs) skipped.push(`DRY RUN — would send ${templateOfColdStep(j.key)} to ${j.name || j.phoneE164} (${j.phoneE164}) [p${j.priority}${j.start ? ', starts the series' : ''}]`);
+    return out;
+  }
+
+  await forEachLimited(jobs, COLD_CONCURRENCY, () => ctx.hasTime() && ctx.sendsLeft() > 0, async (job) => {
+    const stepRule = { key: job.key, template_name: templateOfColdStep(job.key), template_language: 'en' };
+    const outcome = await sendChaseMessage(admin, durable, ctx, rule.ws, stepRule, job);
+    if (outcome === 'sent') out.sent = (out.sent as number) + 1;
+    else if (outcome !== 'skip') skipped.push(`${job.name || job.phoneE164} ${job.key}: ${outcome}`);
+  });
+  const left = jobs.length - (out.sent as number);
+  if (left > 0 && !ctx.hasTime()) out.note = `${left} continue on the next run.`;
+  return out;
+}
+
 // ---------------------------------------------------------------------------
-// ?pass=chase | ?pass=nurture — one engine alone: its own lock, its own long
-// budget, its own scheduled function. Nothing else can eat its time.
+// ?pass=chase | ?pass=nurture | ?pass=cold — one engine alone: its own lock,
+// its own long budget, its own scheduled function. Nothing else can eat its time.
 // ---------------------------------------------------------------------------
-async function runSoloPass(kind: 'chase' | 'nurture', opts: { dryRun: boolean; workspaceId: string | null }): Promise<NextResponse> {
-  const lockKey = kind === 'chase' ? CHASE_LOCK_KEY : NURTURE_LOCK_KEY;
+async function runSoloPass(kind: 'chase' | 'nurture' | 'cold', opts: { dryRun: boolean; workspaceId: string | null }): Promise<NextResponse> {
+  const lockKey = kind === 'chase' ? CHASE_LOCK_KEY : kind === 'cold' ? COLD_LOCK_KEY : NURTURE_LOCK_KEY;
   const ctx = createRunContext(LONG_RUN);
   const admin = createAutomationAdminClient(ctx);
   const lockAdmin = createAutomationAdminClient();
@@ -896,7 +1029,9 @@ async function runSoloPass(kind: 'chase' | 'nurture', opts: { dryRun: boolean; w
     };
     const report = kind === 'chase'
       ? await runChase(admin, lockAdmin, ctx, runOpts)
-      : await runNurture(admin, lockAdmin, ctx, runOpts);
+      : kind === 'cold'
+        ? await runCold(admin, lockAdmin, ctx, runOpts)
+        : await runNurture(admin, lockAdmin, ctx, runOpts);
     return NextResponse.json({
       ok: true, pass: kind, dryRun: opts.dryRun,
       ms: ctx.elapsedMs(), sendsUsed: MAX_SENDS_PER_RUN - ctx.sendsLeft(),
