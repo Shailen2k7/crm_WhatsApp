@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ChevronDown, ChevronRight, Loader2, RefreshCw, RotateCw, MessageSquare, FileText, Snowflake, Flame } from 'lucide-react';
+import { ChevronDown, ChevronRight, Loader2, RefreshCw, RotateCw, MessageSquare, FileText, Snowflake, Flame, Megaphone } from 'lucide-react';
 
 /**
  * SETTINGS → AUTOMATION. One tab per AUTOMATION ENGINE — the CV & LinkedIn
@@ -489,12 +489,13 @@ function Empty({ text }: { text: string }) {
 // =============================================================================
 // THE ENGINE TABS
 // =============================================================================
-type Engine = 'cv' | 'cold' | 'hot';
+type Engine = 'cv' | 'cold' | 'hot' | 'community';
 
 const ENGINES: { id: Engine; label: string; icon: React.ReactNode; live: boolean; blurb: string }[] = [
   { id: 'cv', label: 'CV & LinkedIn chase', icon: <FileText size={14} />, live: true, blurb: 'New leads: ask for the CV and LinkedIn, then follow up until they reply.' },
   { id: 'cold', label: 'Cold lead chase', icon: <Snowflake size={14} />, live: true, blurb: 'Cold leads who went quiet: one message a week (CC1→CC8), p1 → p2 → p3, until they speak — then it stops for good.' },
   { id: 'hot', label: 'Hot & Spotlight', icon: <Flame size={14} />, live: true, blurb: 'Hot and Spotlight leads who have gone quiet: one value message (HS1→HS8) every 4 days until they reply.' },
+  { id: 'community', label: 'Community invite', icon: <Megaphone size={14} />, live: true, blurb: 'After a real conversation ends (3 quiet hours, window still open): one free WhatsApp Channel invite — once per person, ever.' },
 ];
 
 let selectedEngine: Engine = 'cv';
@@ -505,6 +506,7 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
   const [cvOn, setCvOn] = useState<number | null>(() => (switchCache ? Object.values(switchCache).filter(Boolean).length : null));
   const [nurtureOn, setNurtureOn] = useState<boolean | null>(null);
   const [coldOn, setColdOn] = useState<boolean | null>(null);
+  const [communityOn, setCommunityOn] = useState<boolean | null>(null);
 
   useEffect(() => {
     fetch('/api/automation/switch', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
@@ -515,6 +517,9 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
     }).catch(() => {});
     fetch('/api/automation/cold', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
       if (j.ok) setColdOn(!!j.rule?.enabled);
+    }).catch(() => {});
+    fetch('/api/automation/community', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
+      if (j.ok) setCommunityOn(!!j.rule?.enabled);
     }).catch(() => {});
   }, [engine]);
 
@@ -547,6 +552,7 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
             : e.id === 'cv' ? (cvOn === null ? '' : cvOn > 0 ? 'On' : 'Off')
             : e.id === 'hot' ? (nurtureOn === null ? '' : nurtureOn ? 'On' : 'Off')
             : e.id === 'cold' ? (coldOn === null ? '' : coldOn ? 'On' : 'Off')
+            : e.id === 'community' ? (communityOn === null ? '' : communityOn ? 'On' : 'Off')
             : '';
           return (
             <button
@@ -580,7 +586,159 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
       {engine === 'cv' && <CvChase onOpenChat={onOpenChat} />}
       {engine === 'cold' && <ColdEngine />}
       {engine === 'hot' && <NurtureEngine />}
+      {engine === 'community' && <CommunityEngine />}
     </div>
+  );
+}
+
+// =============================================================================
+// COMMUNITY INVITE — the live tab. One switch, one cap, the exact message, and
+// the Next up / Invited lists. Acts through /api/automation/community, the same
+// code the engine reads.
+// =============================================================================
+interface CommunityOverview {
+  isAdmin: boolean;
+  rule: { enabled: boolean; dailyCap: number; shortcut: string | null };
+  body: string | null;
+  talkersNow: number;
+  sentToday: number;
+  sentTotal: number;
+  next: { phone: string; name: string | null; at: string; state: string }[];
+  sent: { phone: string; name: string | null; at: string }[];
+  waitingNotes: string[];
+}
+
+let communityCache: CommunityOverview | null = null;
+
+function CommunityEngine() {
+  const [ov, setOv] = useState<CommunityOverview | null>(communityCache);
+  const [list, setList] = useState('next');
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [capDraft, setCapDraft] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async (quiet = false) => {
+    try {
+      const res = await fetch('/api/automation/community', { cache: 'no-store' });
+      const json = await res.json();
+      if (!json.ok) { if (!quiet) setError(json.error || 'Could not load.'); return; }
+      communityCache = json as CommunityOverview;
+      setOv(communityCache);
+      setError(null);
+    } catch { if (!quiet) setError('Could not load — check your connection.'); }
+  }, []);
+  useEffect(() => {
+    load(!!communityCache);
+    const t = setInterval(() => load(true), 60_000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  async function post(body: Record<string, unknown>, busyKey: string) {
+    setBusy(busyKey); setMsg(null);
+    try {
+      const res = await fetch('/api/automation/community', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const json = await res.json();
+      if (!json.ok) { setMsg({ ok: false, text: json.error || 'Could not save.' }); return false; }
+      await load(true);
+      return true;
+    } catch { setMsg({ ok: false, text: 'Network error — nothing was changed.' }); return false; }
+    finally { setBusy(null); }
+  }
+
+  if (!ov) {
+    return error
+      ? <Card><div style={{ color: 'var(--red)', fontSize: 12.5 }}>{error}</div></Card>
+      : <Card><div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--muted)', fontSize: 13, padding: '6px 0' }}><Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> Loading…</div></Card>;
+  }
+
+  const fmtAt = (iso: string) => new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(iso));
+  const lists = [
+    { id: 'next', label: 'Next up', count: ov.next.length },
+    { id: 'sent', label: 'Invited', count: ov.sent.length },
+  ];
+
+  function toggleEngine() {
+    const on = !ov!.rule.enabled;
+    const text = on
+      ? `Switch ON the community invite?\n\nAfter a real conversation (team replied) goes quiet for 3 hours, the person gets ONE WhatsApp Channel invite as a free message inside their open 24h window — once per person, ever. Up to ${ov!.rule.dailyCap || 'unlimited'} a day, 10am–7pm IST.`
+      : 'Switch OFF the community invite?\n\nNothing is lost: it continues with new conversations when you switch it back on.';
+    if (confirm(text)) post({ enabled: on }, 'switch');
+  }
+
+  return (
+    <>
+      <Card>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 16, fontWeight: 700 }}>Community invite</span>
+              <span style={{ fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 99, background: ov.rule.enabled ? 'var(--teal-bg)' : 'var(--surface-3)', color: ov.rule.enabled ? 'var(--teal-ink)' : 'var(--muted)' }}>
+                {ov.rule.enabled ? 'ON' : 'OFF'}
+              </span>
+            </div>
+            <div style={{ fontSize: 12.5, color: 'var(--muted)', marginTop: 4, lineHeight: 1.55 }}>
+              A real conversation (they wrote, the team replied) goes quiet for 3 hours → one free Channel invite inside
+              their open 24-hour window, 10am–7pm IST. Once per person, ever. STOP, Junk and Lost never get it; nobody
+              gets it within 20 hours of another automated message. Past talkers qualify the next time they chat.
+            </div>
+          </div>
+          <Switch on={ov.rule.enabled} disabled={!ov.isAdmin || busy === 'switch'} onClick={toggleEngine} label="Community invite" />
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--line-2)', fontSize: 12.5, color: 'var(--muted)' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Max per day
+            <input
+              inputMode="numeric"
+              disabled={!ov.isAdmin || busy === 'switch'}
+              value={capDraft ?? String(ov.rule.dailyCap)}
+              onChange={(e) => setCapDraft(e.target.value.replace(/[^\d]/g, ''))}
+              onBlur={() => { if (capDraft !== null && capDraft !== String(ov.rule.dailyCap)) { const n = Number(capDraft); if (Number.isInteger(n) && n >= 0) post({ dailyCap: n }, 'switch'); } setCapDraft(null); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+              style={{ width: 54, padding: '4px 6px', borderRadius: 7, border: '1px solid var(--line)', background: 'var(--surface-2)', fontSize: 12.5, textAlign: 'center', outline: 'none' }}
+            />
+          </label>
+          <span>Talking now <strong style={{ color: 'var(--ink-2)' }}>{ov.talkersNow}</strong></span>
+          <span>Invited today <strong style={{ color: 'var(--ink-2)' }}>{ov.sentToday}</strong> · all time <strong style={{ color: 'var(--ink-2)' }}>{ov.sentTotal}</strong></span>
+          {!ov.isAdmin && <span>Only an admin can change these.</span>}
+        </div>
+      </Card>
+
+      <Card>
+        <div style={{ fontSize: 12.5, color: 'var(--muted)', marginBottom: 8 }}>
+          The message (quick reply <code>{ov.rule.shortcut || '—'}</code> — edit it under Quick Replies; <code>{'{{name}}'}</code> becomes their first name):
+        </div>
+        <div style={{ padding: '11px 13px', borderRadius: 10, background: 'var(--surface-2)', fontSize: 13, lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
+          {ov.body || 'The quick reply is missing — create it under Quick Replies.'}
+        </div>
+      </Card>
+
+      {msg && <div style={{ background: msg.ok ? 'var(--teal-bg)' : 'var(--red-bg)', color: msg.ok ? 'var(--teal-ink)' : 'var(--red)', padding: '9px 12px', borderRadius: 10, fontSize: 12.5, marginBottom: 12 }}>{msg.text}</div>}
+
+      <Card>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+          {lists.map((l) => (
+            <button key={l.id} onClick={() => setList(l.id)}
+              style={{ padding: '5px 11px', borderRadius: 99, fontSize: 12, fontWeight: 600, cursor: 'pointer', border: '1px solid ' + (list === l.id ? 'transparent' : 'var(--line)'), background: list === l.id ? 'var(--ink)' : 'transparent', color: list === l.id ? 'var(--surface)' : 'var(--ink-2)' }}>
+              {l.label} <span style={{ opacity: 0.7 }}>{l.count}</span>
+            </button>
+          ))}
+        </div>
+        <div style={{ maxHeight: 440, overflowY: 'auto', overscrollBehavior: 'contain' }}>
+          {list === 'next' && (ov.next.length === 0 ? <Empty text="Nobody is waiting right now — invites appear here while conversations wind down." /> : ov.next.map((n, i) => (
+            <Line key={n.phone + i} name={n.name || n.phone} phone={n.phone}
+              sub={n.state === 'due' ? 'goes out on the next run'
+                : n.state === 'off' ? 'ready — waiting for the switch'
+                : `conversation winding down — earliest ${fmtAt(n.at)}`}
+              right={n.state === 'due' ? <Chip tone="teal">Due</Chip> : <Chip tone="grey">Waiting</Chip>}
+            />
+          )))}
+          {list === 'sent' && (ov.sent.length === 0 ? <Empty text="Nobody invited yet." /> : ov.sent.map((x, i) => (
+            <Line key={x.phone + i} name={x.name || x.phone} phone={x.phone} sub={`invited · ${fmtAt(x.at)}`} right={<Chip tone="teal">Sent</Chip>} />
+          )))}
+        </div>
+      </Card>
+    </>
   );
 }
 

@@ -10,7 +10,7 @@ import {
   CALL_TIMEOUT_MS, MAX_SENDS_PER_RUN, LONG_RUN, createAutomationAdminClient, createRunContext, forEachLimited, isTimeoutError,
   type RunContext,
 } from '@/lib/automation/run-context';
-import { acquireTickLock, releaseTickLock, NURTURE_LOCK_KEY, CHASE_LOCK_KEY, COLD_LOCK_KEY } from '@/lib/automation/lock';
+import { acquireTickLock, releaseTickLock, NURTURE_LOCK_KEY, CHASE_LOCK_KEY, COLD_LOCK_KEY, COMMUNITY_LOCK_KEY } from '@/lib/automation/lock';
 import {
   planFirstMessages, RECENT_WINDOW_HOURS, MAX_ATTEMPTS,
   type HistoryRow, type Job, type LeadRow,
@@ -27,6 +27,8 @@ import {
   COLD_KEYS, COLD_MAX_ATTEMPTS, COLD_START_CAP,
 } from '@/lib/automation/cold';
 import { loadColdRule, loadColdFacts } from '@/lib/automation/cold-data';
+import { planCommunity, COMMUNITY_KEY, COMMUNITY_MAX_ATTEMPTS, type CommunityJob } from '@/lib/automation/community';
+import { loadCommunityRule, loadCommunityPeople } from '@/lib/automation/community-data';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -158,6 +160,8 @@ export async function POST(req: NextRequest) {
   if (pass === 'chase') return runSoloPass('chase', { dryRun, workspaceId });
   // The cold lead chase (CC1→CC8) too (netlify/functions/automation-cold.mts).
   if (pass === 'cold') return runSoloPass('cold', { dryRun, workspaceId });
+  // And the community invite (netlify/functions/automation-community.mts).
+  if (pass === 'community') return runSoloPass('community', { dryRun, workspaceId });
 
   // T1 runs alone now (T2–T4 and the nurture have their own runs), so it gets
   // the same long budget: on 24 Oct a single T1 run took 6.3 s on Netlify,
@@ -999,12 +1003,157 @@ async function runCold(
   return out;
 }
 
+// =============================================================================
+// THE COMMUNITY PASS. One free message after a real conversation ends, inviting
+// the person to the WhatsApp Channel — once per person ever. Rides the open
+// 24-hour window, so it goes as a quick reply, never a paid template.
+// =============================================================================
+async function runCommunity(
+  admin: Admin, durable: Admin, ctx: RunContext,
+  opts: { dryRun: boolean; workspaceId: string | null; suppressed: { workspace_id: string; phone_e164: string }[] },
+): Promise<Record<string, unknown> | null> {
+  const { dryRun, workspaceId } = opts;
+  const now = Date.now();
+
+  const rule = await loadCommunityRule(admin, workspaceId);
+  if (!rule) return null;                           // not set up in this workspace
+  const out: Record<string, unknown> = { workspace: rule.ws, key: COMMUNITY_KEY, sent: 0, skipped: [] as string[] };
+  const skipped = out.skipped as string[];
+  if (!rule.enabled && !dryRun) { out.note = 'The community invite is switched off.'; return out; }
+  if (!rule.quickReplyShortcut) { out.note = 'No quick reply chosen for the invite.'; return out; }
+
+  const hour = istHour();
+  const inHours = hour >= CHASE_START_HOUR && hour < CHASE_END_HOUR;
+  if (!inHours && !dryRun) { out.note = `Outside sending hours (${CHASE_START_HOUR}:00–${CHASE_END_HOUR}:00 IST) — invites wait.`; return out; }
+  if (!inHours && dryRun) out.hoursNote = 'outside sending hours — live runs would wait';
+
+  const people = await loadCommunityPeople(admin, { ws: rule.ws, now, suppressed: opts.suppressed });
+  out.examined = people.length;
+
+  const plan = planCommunity({ now, enabled: rule.enabled || dryRun, people });
+  skipped.push(...plan.skipped);
+
+  // Opt-outs and never-invite stages: say it once, never re-examine. NEVER over
+  // a record of a message that went.
+  const okRow = new Set(people.filter((p) => p.prior?.ok).map((p) => p.phoneE164));
+  const comSettles = plan.settles.filter((st) => !okRow.has(st.phoneE164));
+  if (comSettles.length && !dryRun) {
+    await admin.from('relay_automation_sent').upsert(
+      comSettles.map((st) => ({
+        workspace_id: rule.ws, automation_key: st.key, lead_id: st.leadId, phone_e164: st.phoneE164,
+        method: 'skipped', detail: null, ok: false, error: st.reason, attempts: COMMUNITY_MAX_ATTEMPTS,
+      })),
+      { onConflict: 'workspace_id,automation_key,phone_e164' },
+    );
+  }
+  for (const st of plan.settles) skipped.push(`${st.phoneE164}: ${st.reason}`);
+
+  // ---- the cross-engine lock and today's count, read side by side -------------
+  let jobs = plan.jobs;
+  const [recent, sentTodayRes] = jobs.length
+    ? await Promise.all([
+      recentlyMessaged(admin, rule.ws, now),
+      admin.from('relay_automation_sent')
+        .select('id', { count: 'exact', head: true })
+        .eq('workspace_id', rule.ws).eq('automation_key', COMMUNITY_KEY).eq('ok', true)
+        .gte('sent_at', new Date(`${istDate()}T00:00:00+05:30`).toISOString()),
+    ])
+    : [{ phones: new Set<string>(), leads: new Set<string>() }, { count: 0 }];
+  {
+    const held = jobs.filter((j) => recent.phones.has(j.phoneE164) || (j.leadId && recent.leads.has(j.leadId)));
+    if (held.length) {
+      for (const j of held) skipped.push(`${j.name || j.phoneE164}: held — got an automated message in the last 20h`);
+      jobs = jobs.filter((j) => !held.includes(j));
+    }
+  }
+  if (rule.dailyCap > 0 && jobs.length) {
+    const count = (sentTodayRes as { count: number | null }).count;
+    const left = Math.max(0, rule.dailyCap - (count ?? 0));
+    if (left < jobs.length) skipped.push(`community: daily cap ${rule.dailyCap} — ${jobs.length - left} wait for tomorrow`);
+    jobs = jobs.slice(0, left);
+  }
+  out.due = jobs.length;
+  if (!jobs.length) { if (!out.note) out.note = 'Nobody is due an invite.'; return out; }
+
+  if (dryRun) {
+    for (const j of jobs) skipped.push(`DRY RUN — would invite ${j.name || j.phoneE164} (${j.phoneE164})`);
+    return out;
+  }
+
+  await forEachLimited(jobs, SEND_CONCURRENCY, () => ctx.hasTime() && ctx.sendsLeft() > 0, async (job) => {
+    const outcome = await sendCommunityInvite(admin, durable, ctx, rule.ws, rule.quickReplyShortcut!, job);
+    if (outcome === 'sent') out.sent = (out.sent as number) + 1;
+    else if (outcome !== 'skip') skipped.push(`${job.name || job.phoneE164}: ${outcome}`);
+  });
+  const left = jobs.length - (out.sent as number);
+  if (left > 0 && !ctx.hasTime()) out.note = `${left} continue on the next run.`;
+  return out;
+}
+
 // ---------------------------------------------------------------------------
-// ?pass=chase | ?pass=nurture | ?pass=cold — one engine alone: its own lock,
-// its own long budget, its own scheduled function. Nothing else can eat its time.
+// One invite: claim, re-check the free window at the last moment, send the
+// quick reply, record. Same claim discipline as T1 — the write IS the lock,
+// and the unique indexes make a second invite impossible, ever.
 // ---------------------------------------------------------------------------
-async function runSoloPass(kind: 'chase' | 'nurture' | 'cold', opts: { dryRun: boolean; workspaceId: string | null }): Promise<NextResponse> {
-  const lockKey = kind === 'chase' ? CHASE_LOCK_KEY : kind === 'cold' ? COLD_LOCK_KEY : NURTURE_LOCK_KEY;
+async function sendCommunityInvite(
+  admin: Admin, durable: Admin, ctx: RunContext, ws: string,
+  shortcut: string, job: CommunityJob,
+): Promise<string> {
+  if (!ctx.takeSend()) return 'skip';
+  let spent = false;
+  try {
+    // THE WINDOW, RE-CHECKED AT THE LAST MOMENT from the live row: planning
+    // data can be minutes old, and a free text outside the 24h window is
+    // simply dropped by WhatsApp.
+    const { data: conv } = await admin.from('relay_conversations')
+      .select('id, last_inbound_at, last_message_at').eq('id', job.conversationId).maybeSingle();
+    if (!conv) return 'conversation not found';
+    if (!windowState(conv.last_inbound_at).open) return 'window closed — waits for their next conversation';
+    // Did they (or we) write again since planning? Then the talk is not over.
+    const lastMsgMs = conv.last_message_at ? new Date(conv.last_message_at).getTime() : 0;
+    if (Date.now() - lastMsgMs < 3 * 3_600_000) return 'skip';     // next run re-plans
+
+    const IN_FLIGHT = `in flight — ${TIMEOUT_NOTE}`;
+    const attemptNo = job.prior ? (job.prior.attempts ?? 1) + 1 : 1;
+    let claimId: string | null = null;
+    if (job.prior) {
+      const { data } = await admin.from('relay_automation_sent')
+        .update({ method: 'quick_reply', detail: shortcut, ok: false, error: IN_FLIGHT, attempts: attemptNo, sent_at: new Date().toISOString() })
+        .eq('id', job.prior.id).eq('ok', false).select('id');
+      claimId = data?.[0]?.id ?? null;
+    } else {
+      const { data, error } = await admin.from('relay_automation_sent')
+        .insert({ workspace_id: ws, automation_key: COMMUNITY_KEY, lead_id: job.leadId, phone_e164: job.phoneE164, method: 'quick_reply', detail: shortcut, ok: false, error: IN_FLIGHT, attempts: 1 })
+        .select('id').single();
+      claimId = error ? null : data?.id ?? null;
+    }
+    if (!claimId) return 'skip';
+    spent = true;
+
+    let ok = false;
+    let errText: string | null = null;
+    try {
+      const r = await sendQuickReply(admin, ctx, ws, job.conversationId, job.phoneE164, shortcut, { full_name: job.name, visa_type: job.visaType });
+      ok = r.ok;
+      errText = r.ok ? null : r.timedOut ? TIMEOUT_NOTE : 'quick reply failed (see message row)';
+    } catch (e) {
+      errText = isTimeoutError(e) ? TIMEOUT_NOTE : e instanceof Error ? e.message : String(e);
+    }
+
+    await durable.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claimId);
+    return ok ? 'sent' : errText || 'send failed';
+  } finally {
+    if (!spent) ctx.giveBackSend();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ?pass=chase | ?pass=nurture | ?pass=cold | ?pass=community — one engine
+// alone: its own lock, its own long budget, its own scheduled function.
+// Nothing else can eat its time.
+// ---------------------------------------------------------------------------
+async function runSoloPass(kind: 'chase' | 'nurture' | 'cold' | 'community', opts: { dryRun: boolean; workspaceId: string | null }): Promise<NextResponse> {
+  const lockKey = kind === 'chase' ? CHASE_LOCK_KEY : kind === 'cold' ? COLD_LOCK_KEY : kind === 'community' ? COMMUNITY_LOCK_KEY : NURTURE_LOCK_KEY;
   const ctx = createRunContext(LONG_RUN);
   const admin = createAutomationAdminClient(ctx);
   const lockAdmin = createAutomationAdminClient();
@@ -1031,7 +1180,9 @@ async function runSoloPass(kind: 'chase' | 'nurture' | 'cold', opts: { dryRun: b
       ? await runChase(admin, lockAdmin, ctx, runOpts)
       : kind === 'cold'
         ? await runCold(admin, lockAdmin, ctx, runOpts)
-        : await runNurture(admin, lockAdmin, ctx, runOpts);
+        : kind === 'community'
+          ? await runCommunity(admin, lockAdmin, ctx, runOpts)
+          : await runNurture(admin, lockAdmin, ctx, runOpts);
     return NextResponse.json({
       ok: true, pass: kind, dryRun: opts.dryRun,
       ms: ctx.elapsedMs(), sendsUsed: MAX_SENDS_PER_RUN - ctx.sendsLeft(),
