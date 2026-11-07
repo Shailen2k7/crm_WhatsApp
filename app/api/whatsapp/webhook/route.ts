@@ -42,6 +42,8 @@ function verify(rawBody: string, signature: string | null, queryKey: string | nu
   const secret = process.env.INTERAKT_WEBHOOK_SECRET;
   if (!secret) return { ok: false, how: 'no_secret_configured' };
 
+  if (queryKey && safeEqual(queryKey, secret)) return { ok: true, how: 'query_key' };
+
   if (signature) {
     const expected = 'sha256=' + createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex');
     if (safeEqual(signature.trim(), expected)) return { ok: true, how: 'signature' };
@@ -49,7 +51,6 @@ function verify(rawBody: string, signature: string | null, queryKey: string | nu
     if (safeEqual(signature.trim(), bare)) return { ok: true, how: 'signature_bare' };
     return { ok: false, how: 'signature_mismatch' };
   }
-  if (queryKey && safeEqual(queryKey, secret)) return { ok: true, how: 'query_key' };
   return { ok: false, how: 'no_signature' };
 }
 
