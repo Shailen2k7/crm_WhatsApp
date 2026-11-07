@@ -31,7 +31,7 @@ Interakt → Developer Settings → Webhook URL.
 See "Testing" below. Once Relay is reachable, the URL is:
 
 ```
-https://chat.migrizo.com/api/whatsapp/webhook?key=7197f6cc-2f9e-431c-a82a-d040a1c7f531
+https://chat.migrizo.com/api/whatsapp/webhook?key=<your-webhook-secret>
 ```
 
 The endpoint answers `GET` with 200 when the key is right, so Interakt's "test"
@@ -64,7 +64,7 @@ cloudflared tunnel --url http://localhost:3100
 ```
 
 It prints a public `https://something.trycloudflare.com` URL. Put
-`<that-url>/api/whatsapp/webhook?key=7197f6cc-2f9e-431c-a82a-d040a1c7f531` into
+`<that-url>/api/whatsapp/webhook?key=<your-webhook-secret>` into
 Interakt, then WhatsApp your business number from your phone. The message
 appears in Relay, the window opens, and you can reply.
 
