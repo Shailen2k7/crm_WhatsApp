@@ -26,8 +26,13 @@
 // every five minutes forever.
 // =============================================================================
 import { toE164 } from '@/lib/phone';
+import { getVisaMeta } from '@/lib/types';
 
 export const RECENT_WINDOW_HOURS = 72;
+export const T1_KEY = 'new_lead_first';
+/** IFV leads have their own first message and never get the GTV T1 (Shailen, 12 Nov 2026). */
+export const T1_IFV_KEY = 'new_lead_first_ifv';
+export const T1_KEYS = [T1_KEY, T1_IFV_KEY];
 export const MAX_ATTEMPTS = 3;
 /** How long to wait after attempt N (1-based) before attempt N+1. */
 export const RETRY_BACKOFF_MS = [0, 15 * 60_000, 2 * 3_600_000];
@@ -58,6 +63,7 @@ export interface HistoryRow {
   attempts: number | null;
   sent_at: string;
   error: string | null;
+  automation_key?: string;
 }
 
 export interface Job {
@@ -93,6 +99,29 @@ export interface Plan {
 }
 
 const last10 = (p: string | null | undefined) => String(p || '').replace(/\D/g, '').slice(-10);
+
+export function isIfvLead(visaType: string | null | undefined): boolean {
+  return getVisaMeta(visaType)?.short === 'IFV';
+}
+
+/**
+ * The leads one T1 rule may message: its own visa group, minus anyone the
+ * other T1 rule has already claimed — so nobody ever gets both first messages,
+ * even if their visa type is changed afterwards.
+ */
+export function leadsForT1Rule<L extends LeadRow>(ruleKey: string, leads: L[], history: HistoryRow[]): L[] {
+  const wantIfv = ruleKey === T1_IFV_KEY;
+  // Only a T1 that went, or may have, counts; a failed one leaves them free for the right message.
+  const elsewhere = history.filter((h) => h.automation_key && h.automation_key !== ruleKey
+    && (h.ok || /delivery unknown/.test(h.error || '')));
+  const ids = new Set(elsewhere.map((h) => h.lead_id).filter(Boolean) as string[]);
+  const phones = new Set(elsewhere.map((h) => h.phone_e164));
+  return leads.filter((l) => {
+    if (isIfvLead(l.visa_type) !== wantIfv || ids.has(l.id)) return false;
+    const phone = toE164(l.phone);
+    return !(phone && phones.has(phone));
+  });
+}
 
 export function isEnquiry(body: string | null | undefined): boolean {
   const b = body || '';

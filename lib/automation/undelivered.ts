@@ -20,6 +20,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { ecosystemStateFrom, ECOSYSTEM_CODE } from './ecosystem';
 import { chunk, inParallel } from './parallel';
+import { isIfvLead } from './first-message';
 const HUMAN_STAGES = new Set(['hot', 'won', 'junk', 'lost', 'retired']);
 
 export interface UndeliveredT1 {
@@ -150,7 +151,7 @@ export async function findUndeliveredT1(
   const reached = new Set<string>();
   const teamed = new Set<string>();
   const leadIds = candidates.map((r) => r.lead_id).filter(Boolean) as string[];
-  const leads = new Map<string, { full_name: string | null; stage: string | null }>();
+  const leads = new Map<string, { full_name: string | null; stage: string | null; visa_type: string | null }>();
   const suppressed = new Set<string>();
   await Promise.all([
     inParallel(chunk(candConvIds, 100), async (ids) => {
@@ -167,8 +168,8 @@ export async function findUndeliveredT1(
     for (const m of (team.data || []) as { conversation_id: string }[]) teamed.add(m.conversation_id);
     }),
     inParallel(chunk(leadIds, 100), async (ids) => {
-      const { data } = await admin.from('leads').select('id, full_name, stage').in('id', ids);
-      for (const l of (data || []) as { id: string; full_name: string | null; stage: string | null }[]) leads.set(l.id, l);
+      const { data } = await admin.from('leads').select('id, full_name, stage, visa_type').in('id', ids);
+      for (const l of (data || []) as { id: string; full_name: string | null; stage: string | null; visa_type: string | null }[]) leads.set(l.id, l);
     }),
     (async () => {
       const { data: supp } = await admin.from('relay_suppressions').select('phone_e164').eq('workspace_id', ws);
@@ -201,6 +202,7 @@ export async function findUndeliveredT1(
       else if (state.pausedUntil) note = `Meta pause — can resend from ${state.pausedUntil.slice(0, 10)}`;
       else canResend = true;
     }
+    if (isIfvLead(lead?.visa_type)) { canResend = false; note = 'IFV lead — gets the IFV first message, never the GTV T1'; }
     out.push({
       rowId: r.id, rowSentAt: r.sent_at, leadId: r.lead_id, phoneE164: r.phone_e164,
       name: lead?.full_name ?? null, t1At: r.sent_at, reason, code: lastFail?.code ?? null, canResend, note,

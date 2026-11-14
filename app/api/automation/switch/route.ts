@@ -7,7 +7,7 @@
 //        on the server: the table's own row-level security lets any member
 //        write, so the button being hidden in the UI is not enough.
 //
-// Only the five keys below can be touched from here. Meeting messages,
+// Only the keys below can be touched from here. Meeting messages,
 // campaigns and sequences were removed on 30 Sep 2026 and stay removed — this
 // route cannot switch them back on.
 // =============================================================================
@@ -18,7 +18,7 @@ import { createAdminClient } from '@/lib/supabase/admin';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const SWITCH_KEYS = ['new_lead_first', 'no_reply_t1r', 'no_reply_t2', 'no_reply_t3', 'no_reply_t4'] as const;
+const SWITCH_KEYS = ['new_lead_first', 'new_lead_first_ifv', 'no_reply_t1r', 'no_reply_t2', 'no_reply_t3', 'no_reply_t4'] as const;
 type SwitchKey = (typeof SWITCH_KEYS)[number];
 const MAX_CAP = 500;
 
@@ -91,6 +91,14 @@ export async function POST(req: Request) {
 
   const admin = createAdminClient();
   if (!admin) return NextResponse.json({ ok: false, error: 'Server is not configured.' }, { status: 500 });
+  if (patch.enabled === true) {
+    // On without a message would only burn every new lead's attempts.
+    const { data: cur } = await admin.from('relay_automations')
+      .select('template_name, quick_reply_shortcut').eq('workspace_id', who.workspaceId).eq('key', key).maybeSingle();
+    if (cur && !cur.template_name && !cur.quick_reply_shortcut) {
+      return NextResponse.json({ ok: false, error: 'Choose its WhatsApp template first.' }, { status: 400 });
+    }
+  }
   const { data, error } = await admin.from('relay_automations')
     .update(patch).eq('workspace_id', who.workspaceId).eq('key', key)
     .select('key, enabled, template_name, daily_cap, updated_at').maybeSingle();

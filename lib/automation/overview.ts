@@ -19,8 +19,9 @@ import { loadChaseRules, loadChaseFacts } from './chase-data';
 import { planChase, chaseCandidates } from './follow-up';
 import { findUndeliveredT1, type UndeliveredT1 } from './undelivered';
 import { chunk, inParallel } from './parallel';
+import { T1_KEY, T1_KEYS } from './first-message';
 
-export const OVERVIEW_KEYS = ['new_lead_first', 'no_reply_t1r', 'no_reply_t2', 'no_reply_t3', 'no_reply_t4'];
+export const OVERVIEW_KEYS = ['new_lead_first', 'new_lead_first_ifv', 'no_reply_t1r', 'no_reply_t2', 'no_reply_t3', 'no_reply_t4'];
 const SEND_START_HOUR = 10;
 const SEND_END_HOUR = 19;
 
@@ -74,7 +75,7 @@ async function stoppedFor(admin: SupabaseClient, ws: string, key: string): Promi
       .select('lead_id, phone_e164, error, sent_at').eq('workspace_id', ws).eq('automation_key', key)
       .eq('ok', false).like('error', '%stopped%').order('sent_at', { ascending: false }).limit(200),
     // T1's own "the team had already messaged this person" skips.
-    key === 'new_lead_first'
+    T1_KEYS.includes(key)
       ? admin.from('relay_automation_sent')
         .select('lead_id, phone_e164, error, sent_at').eq('workspace_id', ws).eq('automation_key', key)
         .eq('method', 'skipped').order('sent_at', { ascending: false }).limit(200)
@@ -99,8 +100,8 @@ export async function buildOverview(admin: SupabaseClient, ws: string, key: stri
       .select('lead_id, phone_e164, sent_at').eq('workspace_id', ws).eq('automation_key', key)
       .eq('ok', true).gte('sent_at', since30).order('sent_at', { ascending: false }).limit(1000),
     stoppedFor(admin, ws, key),
-    key === 'new_lead_first' ? Promise.resolve([] as NextItem[]) : nextFor(admin, ws, key, now),
-    key === 'new_lead_first' ? findUndeliveredT1(admin, ws, now) : Promise.resolve([] as UndeliveredT1[]),
+    T1_KEYS.includes(key) ? Promise.resolve([] as NextItem[]) : nextFor(admin, ws, key, now),
+    key === T1_KEY ? findUndeliveredT1(admin, ws, now) : Promise.resolve([] as UndeliveredT1[]),
   ]);
   const rule = ruleRes.data as { key: string; enabled: boolean; template_name: string | null; daily_cap: number | null } | null;
   if (!rule) return null;

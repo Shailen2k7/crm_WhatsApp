@@ -22,14 +22,15 @@ import { ChevronDown, ChevronRight, Loader2, RefreshCw, RotateCw, MessageSquare,
  * the engine will not do. Only admins can change anything; the server checks.
  */
 
-type Key = 'new_lead_first' | 'no_reply_t1r' | 'no_reply_t2' | 'no_reply_t3' | 'no_reply_t4';
+type Key = 'new_lead_first' | 'no_reply_t1r' | 'no_reply_t2' | 'no_reply_t3' | 'no_reply_t4' | 'new_lead_first_ifv';
 
 const TABS: { key: Key; label: string; title: string; when: string }[] = [
-  { key: 'new_lead_first', label: 'T1', title: 'T1 — first message', when: 'Goes to every new lead within minutes, at any hour.' },
+  { key: 'new_lead_first', label: 'T1', title: 'T1 — first message', when: 'Goes to every new lead except IFV leads, within minutes, at any hour.' },
   { key: 'no_reply_t1r', label: 'T1 retry', title: 'T1 retry', when: 'If Meta refused T1 (“healthy ecosystem”): sent again after 4 days, then after 10 days, then never.' },
   { key: 'no_reply_t2', label: 'T2', title: 'T2 — follow-up', when: '1 day after T1 arrived, if they have not replied. 10am–7pm IST.' },
   { key: 'no_reply_t3', label: 'T3', title: 'T3 — follow-up', when: '3 days after T1, if still no reply. 10am–7pm IST.' },
   { key: 'no_reply_t4', label: 'T4', title: 'T4 — last follow-up', when: '7 days after T1, if still no reply. The final message. 10am–7pm IST.' },
+  { key: 'new_lead_first_ifv', label: 'IFV T1', title: 'IFV T1 — first message', when: 'Goes to every new IFV lead within minutes, at any hour, instead of the GTV T1. IFV leads get no T2–T4.' },
 ];
 
 const STEP_DAY: Record<Key, string> = {
@@ -38,6 +39,7 @@ const STEP_DAY: Record<Key, string> = {
   no_reply_t2: 'Day 1',
   no_reply_t3: 'Day 3',
   no_reply_t4: 'Day 7',
+  new_lead_first_ifv: 'Day 0 · IFV',
 };
 
 interface Overview {
@@ -151,7 +153,9 @@ function CvChase({ onOpenChat }: { onOpenChat?: (key: string) => void }) {
           const on = onMap[t.key];
           return (
             <div key={t.key} style={{ display: 'flex', alignItems: 'center', flex: 'none' }}>
-              {i > 0 && <ChevronRight size={14} style={{ color: 'var(--muted)', margin: '0 2px', flex: 'none' }} />}
+              {i > 0 && (t.key === 'new_lead_first_ifv'
+                ? <div style={{ width: 1, alignSelf: 'stretch', background: 'var(--line)', margin: '4px 10px', flex: 'none' }} />
+                : <ChevronRight size={14} style={{ color: 'var(--muted)', margin: '0 2px', flex: 'none' }} />)}
               <button
                 role="tab"
                 aria-selected={active}
@@ -198,10 +202,10 @@ function TabBody({
   k: Key; meta: (typeof TABS)[number]; ov: Overview; loading: boolean;
   onReload: () => void; onOpenChat?: (key: string) => void;
 }) {
-  const isT1 = k === 'new_lead_first';
+  const isT1 = k === 'new_lead_first' || k === 'new_lead_first_ifv';
   const lists = useMemo(() => (isT1
     ? [
-      { id: 'undelivered', label: 'Never arrived', count: ov.undelivered.length },
+      ...(k === 'new_lead_first' ? [{ id: 'undelivered', label: 'Never arrived', count: ov.undelivered.length }] : []),
       { id: 'sent', label: 'Sent', count: ov.sent.length },
       { id: 'stopped', label: 'Skipped', count: ov.stopped.length },
     ]
@@ -209,7 +213,7 @@ function TabBody({
       { id: 'next', label: 'Next up', count: ov.next.length },
       { id: 'sent', label: 'Sent', count: ov.sent.length },
       { id: 'stopped', label: 'Stopped', count: ov.stopped.length },
-    ]), [isT1, ov]);
+    ]), [isT1, k, ov]);
   const [list, setList] = useState(lists[0].id);
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);

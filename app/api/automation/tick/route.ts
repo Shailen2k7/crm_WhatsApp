@@ -12,7 +12,7 @@ import {
 } from '@/lib/automation/run-context';
 import { acquireTickLock, releaseTickLock, NURTURE_LOCK_KEY, CHASE_LOCK_KEY, COLD_LOCK_KEY, COMMUNITY_LOCK_KEY } from '@/lib/automation/lock';
 import {
-  planFirstMessages, RECENT_WINDOW_HOURS, MAX_ATTEMPTS,
+  planFirstMessages, RECENT_WINDOW_HOURS, MAX_ATTEMPTS, T1_KEY, T1_KEYS, isIfvLead, leadsForT1Rule,
   type HistoryRow, type Job, type LeadRow,
 } from '@/lib/automation/first-message';
 import {
@@ -187,7 +187,7 @@ export async function POST(req: NextRequest) {
     // ---- round 1: the lock, the rule, recent leads, opt-outs — in parallel ---
     const lockPromise = dryRun ? Promise.resolve({ acquired: true as const, token: '' }) : acquireTickLock(admin);
     const readsPromise = Promise.all([
-      scope(admin.from('relay_automations').select('*').eq('key', 'new_lead_first').eq('enabled', true)),
+      scope(admin.from('relay_automations').select('*').in('key', T1_KEYS).eq('enabled', true)),
       scope(admin.from('leads')
         .select('id, workspace_id, full_name, phone, visa_type, created_at, is_sample')
         .gte('created_at', sinceIso).order('created_at', { ascending: false }).limit(1000)),
@@ -213,12 +213,12 @@ export async function POST(req: NextRequest) {
     // ---- round 2: T1 history for exactly these people -----------------------
     const leadIds = recentLeads.map((l) => l.id);
     const phones = [...new Set(recentLeads.map((l) => toE164(l.phone)).filter(Boolean) as string[])];
-    const histCols = 'id, workspace_id, lead_id, phone_e164, ok, attempts, sent_at, error';
+    const histCols = 'id, workspace_id, automation_key, lead_id, phone_e164, ok, attempts, sent_at, error';
     const histParts = await Promise.all([
       ...chunk(leadIds, 100).map((ids) => admin.from('relay_automation_sent').select(histCols)
-        .eq('automation_key', 'new_lead_first').in('lead_id', ids)),
+        .in('automation_key', T1_KEYS).in('lead_id', ids)),
       ...chunk(phones, 100).map((ps) => admin.from('relay_automation_sent').select(histCols)
-        .eq('automation_key', 'new_lead_first').in('phone_e164', ps)),
+        .in('automation_key', T1_KEYS).in('phone_e164', ps)),
     ]);
     const historyById = new Map<string, HistoryRow & { workspace_id: string }>();
     for (const part of histParts) {
@@ -234,6 +234,14 @@ export async function POST(req: NextRequest) {
 
       if (!rule.activated_at) { out.note = 'Rule has no activation time — switch it off and on once.'; continue; }
       if (!isConfigured() && !dryRun) { out.note = 'INTERAKT_API_KEY is not set.'; continue; }
+      if (!rule.template_name && !rule.quick_reply_shortcut) { out.note = 'No message chosen for this rule.'; continue; }
+
+      const wsLeads = recentLeads.filter((l) => l.workspace_id === ws);
+      const wsHistory = [...historyById.values()].filter((h) => h.workspace_id === ws);
+      if (rule.key === T1_KEY) {
+        const ifvHeld = wsLeads.filter((l) => isIfvLead(l.visa_type)).length;
+        if (ifvHeld) out.ifvLeadsLeftToIfvRule = ifvHeld;
+      }
 
       // Leads only. People who WhatsApp us from a number with no lead are left
       // to the team — this rule is for leads in the CRM and nothing else, so
@@ -241,9 +249,9 @@ export async function POST(req: NextRequest) {
       const plan = planFirstMessages({
         now,
         rule: { activated_at: rule.activated_at, delay_seconds: rule.delay_seconds },
-        leads: recentLeads.filter((l) => l.workspace_id === ws),
+        leads: leadsForT1Rule(rule.key, wsLeads, wsHistory),
         convs: [],
-        history: [...historyById.values()].filter((h) => h.workspace_id === ws),
+        history: wsHistory.filter((h) => h.automation_key === rule.key),
         suppressedPhones: new Set(suppressed.filter((s) => s.workspace_id === ws).map((s) => s.phone_e164)),
         knownLeadDigits: new Set(),
       });
@@ -423,7 +431,8 @@ async function sendFirstMessage(
     // message, so the "newlead" quick reply goes; otherwise the approved t1
     // template — the only thing WhatsApp permits to a person who has not
     // written first.
-    const open = windowState(lastInbound).open;
+    // A rule without a quick reply (IFV) always sends its template.
+    const open = windowState(lastInbound).open && !!rule.quick_reply_shortcut;
     const method = open ? 'quick_reply' : 'template';
     const detail = open ? rule.quick_reply_shortcut : rule.template_name;
 

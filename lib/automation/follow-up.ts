@@ -45,6 +45,8 @@
 // sent late was followed by T3 the next day. A backlog must stretch, never bunch.
 // =============================================================================
 
+import { isIfvLead } from './first-message';
+
 export const CHASE_KEYS = ['no_reply_t2', 'no_reply_t3', 'no_reply_t4'] as const;
 export type ChaseKey = (typeof CHASE_KEYS)[number];
 /**
@@ -94,6 +96,7 @@ export const SETTLE = {
   stage: (s: string) => `stopped — a human set their stage to ${s}`,
   spotlight: 'stopped — starred Spotlight: the Hot & Spotlight nurture looks after them now',
   optedOut: 'stopped — opted out (STOP)',
+  ifv: 'stopped — IFV lead: the GTV T1 is never sent to IFV leads',
   t1Failed: (code: string) => `stopped — T1 was never delivered (Meta error ${code}), nothing to follow up`,
   ecosystem: 'stopped — refused by Meta 3 times, after a 4-day and a 10-day pause',
 } as const;
@@ -296,6 +299,7 @@ export function planChase(input: ChasePlanInput): ChasePlan {
       if (f.stage && HUMAN_STAGES.has(f.stage)) { settle(key, SETTLE.stage(f.stage)); continue; }
       if (f.spotlight) { settle(key, SETTLE.spotlight); continue; }
       if (f.suppressed) { settle(key, SETTLE.optedOut); continue; }
+      if (isIfvLead(f.visaType)) { settle(key, SETTLE.ifv); continue; }
       if (lastAttemptFail.code !== '131049') {
         // Undeliverable number, experiment group, etc. — trying again cannot
         // help; the chat shows the red failure for the team to act on.
