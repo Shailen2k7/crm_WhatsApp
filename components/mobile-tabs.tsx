@@ -13,7 +13,7 @@
 // =============================================================================
 import { useState } from 'react';
 import {
-  MessageSquare, Users, FileText, Zap, Menu, X, LayoutTemplate, Settings,
+  MessageSquare, Users, FileText, Zap, Menu, X, LayoutTemplate, Megaphone, Settings,
 } from 'lucide-react';
 import type { RailKey } from './rail';
 
@@ -30,6 +30,7 @@ const TABS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
 // desktop rail: Spotlight is a chip inside the chat list, the rest were unused.
 const MENU_ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare; hint: string }[] = [
   { key: 'templates', label: 'Templates', Icon: LayoutTemplate, hint: 'Approved messages' },
+  { key: 'broadcast', label: 'Broadcast', Icon: Megaphone, hint: 'One message to many' },
   { key: 'settings', label: 'Settings', Icon: Settings, hint: 'Account & notifications' },
 ];
 
@@ -37,13 +38,17 @@ export function MobileTabs({
   active,
   onSelect,
   unread,
+  showBroadcast,
 }: {
   active: RailKey;
   onSelect: (k: RailKey) => void;
   unread: number;
+  /** Broadcasts are for admins; everyone else does not see the item. */
+  showBroadcast?: boolean;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
-  const menuActive = MENU_ITEMS.some((m) => m.key === active);
+  const menuItems = MENU_ITEMS.filter((m) => m.key !== 'broadcast' || showBroadcast);
+  const menuActive = menuItems.some((m) => m.key === active);
 
   return (
     <>
@@ -78,7 +83,7 @@ export function MobileTabs({
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            {MENU_ITEMS.map(({ key, label, Icon, hint }) => {
+            {menuItems.map(({ key, label, Icon, hint }) => {
               const on = active === key;
               return (
                 <button

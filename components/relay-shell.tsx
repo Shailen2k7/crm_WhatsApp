@@ -17,6 +17,7 @@ import { SettingsPanel } from './settings-panel';
 import { QuickRepliesManager } from './quick-replies';
 import { TemplatesPanel } from './templates-panel';
 import { FilesPanel } from './files-panel';
+import { BroadcastPanel } from './broadcast-panel';
 import { MobileTabs, MobileHeader } from './mobile-tabs';
 import { BellRing, X } from 'lucide-react';
 
@@ -516,6 +517,7 @@ export function RelayShell({
               isMobile={false}
               onHoverChange={setRailHover}
               hovering={railHover}
+              showBroadcast={role === 'admin'}
             />
           </div>
         )}
@@ -560,6 +562,8 @@ export function RelayShell({
           <TemplatesPanel workspaceId={workspace.id} />
         ) : nav === 'files' ? (
           <FilesPanel workspaceId={workspace.id} contacts={contacts} isAdmin={role === 'admin'} onOpenChat={(key) => { setNav('chat'); setSelectedKey(key); }} />
+        ) : nav === 'broadcast' ? (
+          <BroadcastPanel isMobile={isMobile} isAdmin={role === 'admin'} onOpenChat={(leadId) => { setNav('chat'); setSelectedKey(leadId); }} />
         ) : (
           <SettingsPanel
             user={user}
@@ -577,7 +581,7 @@ export function RelayShell({
         {/* Bottom tabs: thumb-reachable, and hidden while a chat is open so the
             conversation owns the whole screen. */}
         {isMobile && !selected && (
-          <MobileTabs active={nav} onSelect={(k) => { setNav(k); setSelectedKey(null); }} unread={totalUnread} />
+          <MobileTabs active={nav} onSelect={(k) => { setNav(k); setSelectedKey(null); }} unread={totalUnread} showBroadcast={role === 'admin'} />
         )}
       </div>
     </div>
@@ -590,5 +594,6 @@ const NAV_TITLES: Partial<Record<RailKey, string>> = {
   files: 'Files',
   quickreplies: 'Quick replies',
   templates: 'Templates',
+  broadcast: 'Broadcast',
   settings: 'Settings',
 };

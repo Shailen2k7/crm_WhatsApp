@@ -1,6 +1,6 @@
 'use client';
 
-import { MessageSquare, Users, FileText, Zap, LayoutTemplate, Settings, Moon, Sun } from 'lucide-react';
+import { MessageSquare, Users, FileText, Zap, LayoutTemplate, Megaphone, Settings, Moon, Sun } from 'lucide-react';
 import { initialsOf, avatarTint } from '@/lib/phone';
 
 // The menu holds only what the team actually opens. Removed on request:
@@ -10,7 +10,9 @@ import { initialsOf, avatarTint } from '@/lib/phone';
 //  - 'team': the page never existed (it was a placeholder).
 //  - the pin ("Keep open") and "Open CRM" rows: never used. The rail widens on
 //    hover, and the logo up top still reaches the CRM.
-export type RailKey = 'chat' | 'contacts' | 'files' | 'quickreplies' | 'templates' | 'settings';
+// Added 14 Nov 2026: 'broadcast' — a manual one-off send to a picked group
+// (admins only). It is not the automation that was removed above.
+export type RailKey = 'chat' | 'contacts' | 'files' | 'quickreplies' | 'templates' | 'broadcast' | 'settings';
 
 const ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
   { key: 'chat', label: 'Chats', Icon: MessageSquare },
@@ -18,6 +20,7 @@ const ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
   { key: 'files', label: 'Files', Icon: FileText },
   { key: 'quickreplies', label: 'Quick replies', Icon: Zap },
   { key: 'templates', label: 'Templates', Icon: LayoutTemplate },
+  { key: 'broadcast', label: 'Broadcast', Icon: Megaphone },
 ];
 
 const CRM_URL = 'https://crm.migrizo.com';
@@ -32,6 +35,7 @@ export function Rail({
   isMobile,
   onHoverChange,
   hovering,
+  showBroadcast,
 }: {
   active: RailKey;
   onSelect: (k: RailKey) => void;
@@ -42,6 +46,8 @@ export function Rail({
   isMobile: boolean;
   onHoverChange: (v: boolean) => void;
   hovering: boolean;
+  /** Broadcasts are for admins; everyone else does not see the item. */
+  showBroadcast?: boolean;
 }) {
   // Wide while the cursor is over it; icon-only otherwise. On a phone there is
   // no cursor and no room, so it stays icon-only there.
@@ -135,7 +141,7 @@ export function Rail({
         {wide && <span style={{ color: 'var(--rail-fg-on)', fontWeight: 800, fontSize: 15, letterSpacing: '-0.01em' }}>Migrizo</span>}
       </div>
 
-      {ITEMS.map(({ key, label, Icon }) => item(key, label, Icon))}
+      {ITEMS.filter((i) => i.key !== 'broadcast' || showBroadcast).map(({ key, label, Icon }) => item(key, label, Icon))}
 
       <div style={{ flex: 1 }} />
 
