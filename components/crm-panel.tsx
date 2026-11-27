@@ -34,15 +34,22 @@ export function CrmPanel({
   const [fetched, setFetched] = useState<Lead | null>(null);
   const [looking, setLooking] = useState(false);
 
+  // Leads that arrived through the background pages carry only the handful of
+  // columns the chat list needs — pulling the rest for thousands of rows was
+  // blocking the main thread mid-scroll. `email` is absent (not null) on such
+  // a row, which is how we tell a light row from a complete one, and that is
+  // the cue to fetch the full record for just this one person.
+  const isLightRow = !!contact.lead && !('email' in (contact.lead as object));
+  // The contact object is rebuilt whenever ANY chat in the list changes. Look
+  // the person up again only when it is a different person, or their lead
+  // changed: otherwise the add-lead box reloads and loses what was being typed.
+  const leadKey = contact.lead?.id ?? '';
+  const convLeadKey = contact.conversation?.lead_id ?? '';
+  const phoneKey = contact.phoneE164 ?? '';
+
   useEffect(() => {
     setFetched(null);
-
-    // Leads that arrived through the background pages carry only the handful of
-    // columns the chat list needs — pulling the rest for thousands of rows was
-    // blocking the main thread mid-scroll. `email` is absent (not null) on such
-    // a row, which is how we tell a light row from a complete one, and that is
-    // the cue to fetch the full record for just this one person.
-    const isLightRow = !!contact.lead && !('email' in (contact.lead as object));
+    setLooking(false);
     if ((contact.lead && !isLightRow) || !contact.phoneE164) return;
 
     let cancelled = false;
@@ -68,7 +75,8 @@ export function CrmPanel({
       if (!cancelled) { setFetched(row); setLooking(false); }
     })();
     return () => { cancelled = true; };
-  }, [supabase, contact]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supabase, leadKey, convLeadKey, phoneKey, isLightRow]);
 
   // The fetched row is the complete one; prefer it over a light list row.
   const lead = fetched ?? contact.lead;
