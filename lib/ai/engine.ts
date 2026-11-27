@@ -60,6 +60,8 @@ const CROSS_ENGINE_GAP_MS = 20 * 3_600_000;
 /** Stages the assistant never writes to: the team's own clients. */
 const CLIENT_STAGES = new Set(['won', 'invoice_sent']);
 const CLOSED_STAGES = new Set(['won', 'invoice_sent', 'junk', 'lost']);
+/** Stages a not-eligible verdict moves to Junk. */
+const JUNK_FROM = new Set(['cold', 'not_responding', '']);
 
 /** The saved replies each verdict sends, in order. The team's own wording and brochures. */
 const VERDICT_REPLIES: Record<Verdict, string[]> = {
@@ -476,6 +478,16 @@ async function carryOut(
         const isIfvLead = /ifv|innovator/i.test(lead.visa_type || '');
         const eligibility = v === 'gtv_high' ? 'highly_eligible' : v === 'gtv' || (v === 'ifv' && isIfvLead) ? 'eligible' : 'not_eligible';
         await durable.from('leads').update({ eligibility, eligibility_at: at, eligibility_source: 'ai' }).eq('id', lead.id);
+        // Not eligible for GTV: the team moves these leads to Junk (the IFV offer has gone).
+        // Only from the early stages; a lead the team is working (hot, won, lost…) keeps its stage.
+        if (v === 'not' && JUNK_FROM.has(lead.stage || '')) {
+          const { error: stErr } = await durable.from('leads').update({ stage: 'junk' }).eq('id', lead.id).eq('stage', lead.stage || '');
+          if (!stErr) {
+            await durable.from('activity').insert({
+              workspace_id: ws, user_id: run.aiUser, lead_id: lead.id, action: 'moved_stage', meta: { from: lead.stage || null, to: 'junk' },
+            });
+          }
+        }
       }
       // The strongest profiles are starred, so the Hot & Spotlight series keeps educating them.
       if (v === 'gtv_high') await durable.from('relay_conversations').update({ spotlight: true }).eq('id', conv.id);
