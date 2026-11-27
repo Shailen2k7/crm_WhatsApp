@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Bot, Hand, MessageSquare, RefreshCw } from 'lucide-react';
 import { api, Btn, Note, SectionCard, fmtWhen, num } from './broadcast-ui';
+import { AiBot, ThinkingDots } from './ai-bot';
 
 interface Hold { conversationId: string; openKey: string; at: string; reason: string; name: string; phone: string }
 interface Activity { at: string; conversationId: string; openKey: string; name: string; kind: string; note: string }
@@ -232,9 +233,11 @@ export function AiChatPill({ conversationId, compact }: { conversationId: string
   return (
     <button
       type="button" disabled={busy} onClick={() => act(look.next)} title={look.title} aria-label={look.title}
-      style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 26, padding: '0 9px', borderRadius: 99, border: 0, background: look.bg, color: look.fg, fontSize: 11, fontWeight: 750, cursor: busy ? 'default' : 'pointer', flex: 'none', whiteSpace: 'nowrap', fontFamily: 'inherit', opacity: busy ? 0.6 : 1 }}
+      style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 32, padding: '0 12px 0 6px', borderRadius: 99, border: 0, background: look.bg, color: look.fg, fontSize: 11.5, fontWeight: 750, cursor: busy ? 'default' : 'pointer', flex: 'none', whiteSpace: 'nowrap', fontFamily: 'inherit', opacity: busy ? 0.6 : 1 }}
     >
-      <Bot size={13} /> {look.text}
+      <AiBot size={26} awake={st.status === 'active'} />
+      <span>{look.text}</span>
+      {st.status === 'active' && <ThinkingDots />}
     </button>
   );
 }
