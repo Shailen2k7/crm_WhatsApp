@@ -13,7 +13,7 @@
 // =============================================================================
 import { useState } from 'react';
 import {
-  MessageSquare, Users, FileText, Zap, Menu, X, LayoutTemplate, Megaphone, Settings,
+  MessageSquare, Users, FileText, Zap, Menu, X, LayoutTemplate, Megaphone, Bot, Settings,
 } from 'lucide-react';
 import type { RailKey } from './rail';
 
@@ -31,6 +31,7 @@ const TABS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
 const MENU_ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare; hint: string }[] = [
   { key: 'templates', label: 'Templates', Icon: LayoutTemplate, hint: 'Approved messages' },
   { key: 'broadcast', label: 'Broadcast', Icon: Megaphone, hint: 'One message to many' },
+  { key: 'assistant', label: 'Assistant', Icon: Bot, hint: 'Replies and books calls by itself' },
   { key: 'settings', label: 'Settings', Icon: Settings, hint: 'Account & notifications' },
 ];
 

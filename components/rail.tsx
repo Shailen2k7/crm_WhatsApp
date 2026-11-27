@@ -1,6 +1,6 @@
 'use client';
 
-import { MessageSquare, Users, FileText, Zap, LayoutTemplate, Megaphone, Settings, Moon, Sun } from 'lucide-react';
+import { MessageSquare, Users, FileText, Zap, LayoutTemplate, Megaphone, Bot, Settings, Moon, Sun } from 'lucide-react';
 import { initialsOf, avatarTint } from '@/lib/phone';
 
 // The menu holds only what the team actually opens. Removed on request:
@@ -12,7 +12,7 @@ import { initialsOf, avatarTint } from '@/lib/phone';
 //    hover, and the logo up top still reaches the CRM.
 // Added 14 Nov 2026: 'broadcast' — a manual one-off send to a picked group
 // (admins only). It is not the automation that was removed above.
-export type RailKey = 'chat' | 'contacts' | 'files' | 'quickreplies' | 'templates' | 'broadcast' | 'settings';
+export type RailKey = 'chat' | 'contacts' | 'files' | 'quickreplies' | 'templates' | 'broadcast' | 'assistant' | 'settings';
 
 const ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
   { key: 'chat', label: 'Chats', Icon: MessageSquare },
@@ -21,6 +21,7 @@ const ITEMS: { key: RailKey; label: string; Icon: typeof MessageSquare }[] = [
   { key: 'quickreplies', label: 'Quick replies', Icon: Zap },
   { key: 'templates', label: 'Templates', Icon: LayoutTemplate },
   { key: 'broadcast', label: 'Broadcast', Icon: Megaphone },
+  { key: 'assistant', label: 'Assistant', Icon: Bot },
 ];
 
 const CRM_URL = 'https://crm.migrizo.com';

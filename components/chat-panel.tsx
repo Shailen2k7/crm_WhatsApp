@@ -9,6 +9,7 @@ import {
   AlertCircle, Loader2, RotateCw, Lock, FileText, Download, X, Trash2,
   MoreHorizontal, Zap, Image as ImageIcon, Copy, ArrowLeftRight, Clock,
 } from 'lucide-react';
+import { AiChatPill } from './ai-panel';
 import { initialsOf, avatarTint, formatPhone } from '@/lib/phone';
 import type { Contact } from '@/lib/contacts';
 import { windowState, formatWindow } from '@/lib/interakt';
@@ -621,6 +622,7 @@ export function ChatPanel({
           <div style={{ fontSize: 11.5, color: 'var(--muted)', marginTop: 1 }}>{formatPhone(contact.phoneE164)}</div>
         </div>
 
+        <AiChatPill conversationId={conversationId} compact={isMobile} />
         {!isMobile && <button aria-label="Search in conversation" style={iconBtn}><Search size={17} /></button>}
         <button
           onClick={toggleSpotlight}

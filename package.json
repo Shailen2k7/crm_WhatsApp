@@ -10,6 +10,7 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.14.0",
     "@supabase/ssr": "^0.5.2",
     "@supabase/supabase-js": "^2.116.0",
     "@tanstack/react-virtual": "^3.14.12",
