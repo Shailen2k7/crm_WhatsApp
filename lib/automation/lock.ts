@@ -29,6 +29,7 @@ export const NURTURE_LOCK_KEY = 'automation_nurture_lock';
 export const CHASE_LOCK_KEY = 'automation_chase_lock';
 export const COLD_LOCK_KEY = 'automation_cold_lock';
 export const COMMUNITY_LOCK_KEY = 'automation_community_lock';
+export const MEETINGS_LOCK_KEY = 'automation_meetings_lock';
 const EPOCH = '1970-01-01T00:00:00.000Z';
 
 /** Longer than any run can live (the platform kills a function by ~27s). */

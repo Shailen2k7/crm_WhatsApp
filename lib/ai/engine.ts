@@ -48,6 +48,8 @@ const DEBOUNCE_MS = 45_000;
 const HUMAN_ACTIVE_MS = 10 * 60_000;
 const WINDOW_SAFE_MS = 23.5 * 3_600_000;
 const NEW_LEAD_WAIT_MS = 10 * 60_000;
+/** A booking the page did not answer is tried this many more times before a human is called. */
+const BOOK_RETRIES = 1;
 const MAX_ATTEMPTS = 3;
 const MAX_DECISIONS_PER_RUN = 3;
 const START_DECISIONS_BEFORE_MS = 5_000;
@@ -445,6 +447,14 @@ async function carryOut(
         const after = await meetingsFor(admin, ws, { leadId: conv.lead_id, phoneE164: conv.phone_e164, email: step.email }).catch(() => []);
         const landed = after.find((m) => m.status === 'upcoming' && ms(m.starts_at) === ms(step.slot));
         if (landed) r = { ok: true, reason: null, meetLink: landed.meet_link };
+        // Nothing landed: the booking page was slow or unreachable for a moment.
+        // Try once more on the next run before calling a human (28 Nov 2026).
+        else if ((step.tries ?? 0) < BOOK_RETRIES) {
+          step.tries = (step.tries ?? 0) + 1;
+          step.status = 'todo';
+          record(idx, state, { conversationId: conv.id, name, kind: 'booking retry', note: `The booking page did not answer (${r.reason}); trying ${describeSlot(step.slot, conv.phone_e164)} again on the next run.` }, at);
+          return save();
+        }
       }
       if (!r.ok) {
         step.status = 'failed';

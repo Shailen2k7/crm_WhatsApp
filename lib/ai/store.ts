@@ -34,7 +34,7 @@ export type Verdict = 'gtv' | 'gtv_high' | 'not' | 'ifv';
 export type PlanStep =
   | { kind: 'text'; body: string; status: StepStatus; messageId?: string }
   | { kind: 'media'; path: string; name: string; mime: string; size: number; status: StepStatus; messageId?: string }
-  | { kind: 'book'; slot: string; email: string; reschedule: boolean; thenTexts: string[]; status: StepStatus }
+  | { kind: 'book'; slot: string; email: string; reschedule: boolean; thenTexts: string[]; status: StepStatus; /** Slow-page retries so far. */ tries?: number }
   | { kind: 'lead'; verdict: Verdict; reason: string; status: StepStatus }
   | { kind: 'note'; body: string; status: StepStatus };
 export type StepStatus = 'todo' | 'doing' | 'done' | 'failed' | 'unknown';

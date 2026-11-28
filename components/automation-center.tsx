@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ChevronDown, ChevronRight, Loader2, RefreshCw, RotateCw, MessageSquare, FileText, Snowflake, Flame, Megaphone } from 'lucide-react';
+import { ChevronDown, ChevronRight, Loader2, RefreshCw, RotateCw, MessageSquare, FileText, Snowflake, Flame, Megaphone, CalendarCheck } from 'lucide-react';
 
 /**
  * SETTINGS → AUTOMATION. One tab per AUTOMATION ENGINE — the CV & LinkedIn
@@ -493,13 +493,14 @@ function Empty({ text }: { text: string }) {
 // =============================================================================
 // THE ENGINE TABS
 // =============================================================================
-type Engine = 'cv' | 'cold' | 'hot' | 'community';
+type Engine = 'cv' | 'cold' | 'hot' | 'community' | 'calls';
 
 const ENGINES: { id: Engine; label: string; icon: React.ReactNode; live: boolean; blurb: string }[] = [
   { id: 'cv', label: 'CV & LinkedIn chase', icon: <FileText size={14} />, live: true, blurb: 'New leads: ask for the CV and LinkedIn, then follow up until they reply.' },
   { id: 'cold', label: 'Cold lead chase', icon: <Snowflake size={14} />, live: true, blurb: 'Cold leads who went quiet: one message a week (CC1→CC8), p1 → p2 → p3, until they speak — then it stops for good.' },
   { id: 'hot', label: 'Hot & Spotlight', icon: <Flame size={14} />, live: true, blurb: 'Hot and Spotlight leads who have gone quiet: one value message (HS1→HS8) every 4 days until they reply.' },
   { id: 'community', label: 'Community invite', icon: <Megaphone size={14} />, live: true, blurb: 'After a real conversation ends (3 quiet hours, window still open): one free WhatsApp Channel invite — once per person, ever.' },
+  { id: 'calls', label: 'Call messages', icon: <CalendarCheck size={14} />, live: true, blurb: 'PC1 when a call is booked in the CRM, PC2 when the call is marked completed. Once per call.' },
 ];
 
 let selectedEngine: Engine = 'cv';
@@ -511,6 +512,7 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
   const [nurtureOn, setNurtureOn] = useState<boolean | null>(null);
   const [coldOn, setColdOn] = useState<boolean | null>(null);
   const [communityOn, setCommunityOn] = useState<boolean | null>(null);
+  const [callsOn, setCallsOn] = useState<number | null>(null);
 
   useEffect(() => {
     fetch('/api/automation/switch', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
@@ -524,6 +526,9 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
     }).catch(() => {});
     fetch('/api/automation/community', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
       if (j.ok) setCommunityOn(!!j.rule?.enabled);
+    }).catch(() => {});
+    fetch('/api/automation/meetings', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
+      if (j.ok) setCallsOn((j.rules as { enabled: boolean }[]).filter((x) => x.enabled).length);
     }).catch(() => {});
   }, [engine]);
 
@@ -557,6 +562,7 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
             : e.id === 'hot' ? (nurtureOn === null ? '' : nurtureOn ? 'On' : 'Off')
             : e.id === 'cold' ? (coldOn === null ? '' : coldOn ? 'On' : 'Off')
             : e.id === 'community' ? (communityOn === null ? '' : communityOn ? 'On' : 'Off')
+            : e.id === 'calls' ? (callsOn === null ? '' : callsOn > 0 ? 'On' : 'Off')
             : '';
           return (
             <button
@@ -591,6 +597,7 @@ export function AutomationCenter({ onOpenChat }: { onOpenChat?: (key: string) =>
       {engine === 'cold' && <ColdEngine />}
       {engine === 'hot' && <NurtureEngine />}
       {engine === 'community' && <CommunityEngine />}
+      {engine === 'calls' && <CallsEngine />}
     </div>
   );
 }
@@ -740,6 +747,117 @@ function CommunityEngine() {
           {list === 'sent' && (ov.sent.length === 0 ? <Empty text="Nobody invited yet." /> : ov.sent.map((x, i) => (
             <Line key={x.phone + i} name={x.name || x.phone} phone={x.phone} sub={`invited · ${fmtAt(x.at)}`} right={<Chip tone="teal">Sent</Chip>} />
           )))}
+        </div>
+      </Card>
+    </>
+  );
+}
+
+// =============================================================================
+// CALL MESSAGES — PC1 when a call is booked, PC2 when it is marked completed.
+// Two switches, the exact template wording, who is waiting, and what went.
+// Acts through /api/automation/meetings, the same code the sender reads.
+// =============================================================================
+type CallRuleKey = 'meeting_booked' | 'meeting_completed';
+interface CallsOverview {
+  isAdmin: boolean;
+  rules: { key: CallRuleKey; enabled: boolean; template: string | null; body: string | null }[];
+  due: { rule: CallRuleKey; name: string | null; phone: string }[];
+  waiting: { rule: CallRuleKey; name: string | null; why: string }[];
+  sent: { rule: CallRuleKey; name: string | null; phone: string; at: string }[];
+}
+const CALL_RULE_TEXT: Record<CallRuleKey, { title: string; when: string }> = {
+  meeting_booked: { title: 'PC1 — call booked', when: 'Goes shortly after a call is booked in the CRM (booking page, the WhatsApp assistant or the team), while the call is still ahead. Not for cancelled calls.' },
+  meeting_completed: { title: 'PC2 — call completed', when: 'Goes when the call is marked “completed” in the CRM.' },
+};
+let callsCache: CallsOverview | null = null;
+
+function CallsEngine() {
+  const [ov, setOv] = useState<CallsOverview | null>(callsCache);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async (quiet = false) => {
+    try {
+      const res = await fetch('/api/automation/meetings', { cache: 'no-store' });
+      const json = await res.json();
+      if (!json.ok) { if (!quiet) setError(json.error || 'Could not load.'); return; }
+      callsCache = json as CallsOverview;
+      setOv(callsCache);
+      setError(null);
+    } catch { if (!quiet) setError('Could not load — check your connection.'); }
+  }, []);
+  useEffect(() => {
+    load(!!callsCache);
+    const t = setInterval(() => load(true), 60_000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  async function toggle(key: CallRuleKey, on: boolean) {
+    const t = CALL_RULE_TEXT[key];
+    const text = on
+      ? `Switch ON ${t.title}?\n\n${t.when} Once per call. Only calls from this moment on — nothing is sent for older calls. Quiet hours 9pm–9am IST (it waits until morning).`
+      : `Switch OFF ${t.title}?`;
+    if (!confirm(text)) return;
+    setBusy(key); setMsg(null);
+    try {
+      const res = await fetch('/api/automation/meetings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key, enabled: on }) });
+      const json = await res.json();
+      if (!json.ok) setMsg({ ok: false, text: json.error || 'Could not save.' });
+      else await load(true);
+    } catch { setMsg({ ok: false, text: 'Network error — nothing was changed.' }); }
+    finally { setBusy(null); }
+  }
+
+  if (!ov) {
+    return error
+      ? <Card><div style={{ color: 'var(--red)', fontSize: 12.5 }}>{error}</div></Card>
+      : <Card><div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--muted)', fontSize: 13, padding: '6px 0' }}><Loader2 size={14} style={{ animation: 'spin .8s linear infinite' }} /> Loading…</div></Card>;
+  }
+  const fmtAt = (iso: string) => new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(iso));
+  const short = (k: CallRuleKey) => (k === 'meeting_booked' ? 'PC1' : 'PC2');
+
+  return (
+    <>
+      {ov.rules.map((r) => (
+        <Card key={r.key}>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 16, fontWeight: 700 }}>{CALL_RULE_TEXT[r.key].title}</span>
+                <span style={{ fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 99, background: r.enabled ? 'var(--teal-bg)' : 'var(--surface-3)', color: r.enabled ? 'var(--teal-ink)' : 'var(--muted)' }}>
+                  {r.enabled ? 'ON' : 'OFF'}
+                </span>
+              </div>
+              <div style={{ fontSize: 12.5, color: 'var(--muted)', marginTop: 4, lineHeight: 1.55 }}>
+                {CALL_RULE_TEXT[r.key].when} Once per call; STOP never gets it.
+              </div>
+            </div>
+            <Switch on={r.enabled} disabled={!ov.isAdmin || busy === r.key} onClick={() => toggle(r.key, !r.enabled)} label={CALL_RULE_TEXT[r.key].title} />
+          </div>
+          <div style={{ marginTop: 12, padding: '11px 13px', borderRadius: 10, background: 'var(--surface-2)', fontSize: 13, lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
+            {r.body ? r.body.replace(/\{\{\s*1\s*\}\}/g, '{first name}') : `Template “${r.template || '—'}” not found.`}
+          </div>
+        </Card>
+      ))}
+      {!ov.isAdmin && <div style={{ fontSize: 12.5, color: 'var(--muted)', marginBottom: 12 }}>Only an admin can switch these.</div>}
+      {msg && <div style={{ background: msg.ok ? 'var(--teal-bg)' : 'var(--red-bg)', color: msg.ok ? 'var(--teal-ink)' : 'var(--red)', padding: '9px 12px', borderRadius: 10, fontSize: 12.5, marginBottom: 12 }}>{msg.text}</div>}
+      <Card>
+        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>Waiting</div>
+        {ov.due.length + ov.waiting.length === 0 ? <Empty text="Nothing waiting." /> : (
+          <>
+            {ov.due.map((d, i) => <Line key={'d' + i} name={d.name || d.phone} phone={d.phone} sub={`${short(d.rule)} — goes on the next run`} right={<Chip tone="teal">Due</Chip>} />)}
+            {ov.waiting.map((w, i) => <Line key={'w' + i} name={w.name} phone="" sub={`${short(w.rule)} — ${w.why}`} right={<Chip tone="grey">Waiting</Chip>} />)}
+          </>
+        )}
+      </Card>
+      <Card>
+        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>Sent</div>
+        <div style={{ maxHeight: 360, overflowY: 'auto', overscrollBehavior: 'contain' }}>
+          {ov.sent.length === 0 ? <Empty text="Nothing sent yet." /> : ov.sent.map((x, i) => (
+            <Line key={x.phone + i} name={x.name || x.phone} phone={x.phone} sub={`${short(x.rule)} · ${fmtAt(x.at)}`} right={<Chip tone="teal">Sent</Chip>} />
+          ))}
         </div>
       </Card>
     </>

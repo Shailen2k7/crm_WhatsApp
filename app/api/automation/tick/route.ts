@@ -10,7 +10,7 @@ import {
   CALL_TIMEOUT_MS, MAX_SENDS_PER_RUN, LONG_RUN, createAutomationAdminClient, createRunContext, forEachLimited, isTimeoutError,
   type RunContext,
 } from '@/lib/automation/run-context';
-import { acquireTickLock, releaseTickLock, NURTURE_LOCK_KEY, CHASE_LOCK_KEY, COLD_LOCK_KEY, COMMUNITY_LOCK_KEY } from '@/lib/automation/lock';
+import { acquireTickLock, releaseTickLock, NURTURE_LOCK_KEY, CHASE_LOCK_KEY, COLD_LOCK_KEY, COMMUNITY_LOCK_KEY, MEETINGS_LOCK_KEY } from '@/lib/automation/lock';
 import {
   planFirstMessages, RECENT_WINDOW_HOURS, MAX_ATTEMPTS, T1_KEY, T1_KEYS, isIfvLead, leadsForT1Rule,
   type HistoryRow, type Job, type LeadRow,
@@ -29,6 +29,8 @@ import {
 import { loadColdRule, loadColdFacts } from '@/lib/automation/cold-data';
 import { planCommunity, COMMUNITY_KEY, COMMUNITY_MAX_ATTEMPTS, type CommunityJob } from '@/lib/automation/community';
 import { loadCommunityRule, loadCommunityPeople } from '@/lib/automation/community-data';
+import { planMeetingMessages, MEETING_MAX_ATTEMPTS, type MeetingJob } from '@/lib/automation/meetings';
+import { loadMeetingRules, loadMeetingFacts } from '@/lib/automation/meetings-data';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -162,6 +164,8 @@ export async function POST(req: NextRequest) {
   if (pass === 'cold') return runSoloPass('cold', { dryRun, workspaceId });
   // And the community invite (netlify/functions/automation-community.mts).
   if (pass === 'community') return runSoloPass('community', { dryRun, workspaceId });
+  // And the call messages, PC1 / PC2 (netlify/functions/automation-meetings.mts).
+  if (pass === 'meetings') return runSoloPass('meetings', { dryRun, workspaceId });
 
   // T1 runs alone now (T2–T4 and the nurture have their own runs), so it gets
   // the same long budget: on 24 Oct a single T1 run took 6.3 s on Netlify,
@@ -1156,13 +1160,134 @@ async function sendCommunityInvite(
   }
 }
 
+// =============================================================================
+// CALL MESSAGES — PC1 after a call is booked, PC2 once it is marked completed.
+// The rules are in lib/automation/meetings.ts. Transactional, so the 20-hour
+// cross-engine hold does not apply: a booked call is acknowledged right away.
+// =============================================================================
+async function runMeetings(
+  admin: Admin, durable: Admin, ctx: RunContext,
+  opts: { dryRun: boolean; workspaceId: string | null; suppressed: { workspace_id: string; phone_e164: string }[] },
+): Promise<Record<string, unknown> | null> {
+  const { dryRun, workspaceId } = opts;
+  const now = Date.now();
+  const loaded = await loadMeetingRules(admin, workspaceId);
+  if (!loaded) return null;
+  const out: Record<string, unknown> = { workspace: loaded.ws, key: 'meetings', sent: 0, skipped: [] as string[] };
+  const skipped = out.skipped as string[];
+  if (!loaded.rules.some((r) => r.enabled) && !dryRun) { out.note = 'PC1 and PC2 are switched off.'; return out; }
+  if (!isConfigured() && !dryRun) { out.note = 'INTERAKT_API_KEY is not set.'; return out; }
+
+  const facts = await loadMeetingFacts(admin, { ws: loaded.ws, now, suppressed: opts.suppressed, templates: loaded.rules.map((r) => r.templateName).filter(Boolean) as string[] });
+  out.examined = facts.meetings.length;
+  const plan = planMeetingMessages({ now, rules: loaded.rules, meetings: facts.meetings, history: facts.history, ignoreSwitch: dryRun });
+  skipped.push(...plan.skipped);
+
+  // Settled meetings are written once, so they are never looked at again —
+  // and never over a row recording a message that went.
+  const settles = plan.settles.filter((st) => !facts.history.get(st.sentKey)?.ok);
+  if (settles.length && !dryRun) {
+    for (const st of settles) {
+      await admin.from('relay_automation_sent').insert({
+        workspace_id: loaded.ws, automation_key: st.sentKey, lead_id: st.leadId, phone_e164: st.phoneE164,
+        meeting_id: st.meetingId, method: 'skipped', ok: false, error: st.reason, attempts: MEETING_MAX_ATTEMPTS,
+      });
+    }
+  }
+  out.due = plan.jobs.length;
+  if (!plan.jobs.length) { out.note = 'No call messages due.'; return out; }
+  if (dryRun) {
+    for (const j of plan.jobs) skipped.push(`DRY RUN — would send ${j.templateName} to ${j.name || j.phoneE164} (${j.phoneE164})`);
+    return out;
+  }
+
+  await forEachLimited(plan.jobs, SEND_CONCURRENCY, () => ctx.hasTime() && ctx.sendsLeft() > 0, async (job) => {
+    const outcome = await sendMeetingMessage(admin, durable, ctx, loaded.ws, job);
+    if (outcome === 'sent') out.sent = (out.sent as number) + 1;
+    else if (outcome !== 'skip') skipped.push(`${job.name || job.phoneE164}: ${outcome}`);
+  });
+  const left = plan.jobs.length - (out.sent as number);
+  if (left > 0 && !ctx.hasTime()) out.note = `${left} continue on the next run.`;
+  return out;
+}
+
 // ---------------------------------------------------------------------------
-// ?pass=chase | ?pass=nurture | ?pass=cold | ?pass=community — one engine
+// One call message: re-check the meeting, claim, send the template, record.
+// Same claim discipline as T1 — the write IS the lock, and the unique index on
+// (automation_key, meeting_id) makes a second PC1/PC2 for a meeting impossible.
+// ---------------------------------------------------------------------------
+async function sendMeetingMessage(admin: Admin, durable: Admin, ctx: RunContext, ws: string, job: MeetingJob): Promise<string> {
+  if (!ctx.takeSend()) return 'skip';
+  let spent = false;
+  try {
+    // THE MEETING, RE-READ AT THE LAST MOMENT: cancelled since planning?
+    const { data: live } = await admin.from('meetings').select('status, starts_at').eq('id', job.meetingId).maybeSingle();
+    if (!live) return 'meeting not found';
+    if (job.rule === 'meeting_booked' && (live.status !== 'upcoming' || new Date(live.starts_at).getTime() <= Date.now())) return 'skip';
+    if (job.rule === 'meeting_completed' && live.status !== 'completed') return 'skip';
+
+    let conversationId = job.conversationId;
+    if (!conversationId) {
+      const { data } = await admin.rpc('relay_get_or_create_conversation', { p_workspace_id: ws, p_phone_e164: job.phoneE164 });
+      conversationId = (data as string) || null;
+    }
+    if (!conversationId) return 'could not open a conversation';
+
+    // A retry after a TIMEOUT: did the first try arrive after all?
+    if (job.prior?.error?.includes('delivery unknown')) {
+      const since = new Date(new Date(job.prior.sent_at).getTime() - 60_000).toISOString();
+      const { data: arrived } = await admin.from('relay_messages').select('id')
+        .eq('conversation_id', conversationId).eq('direction', 'out').eq('template_name', job.templateName)
+        .in('status', ['sent', 'delivered', 'read']).gte('created_at', since).limit(1);
+      if (arrived?.length) {
+        await admin.from('relay_automation_sent').update({ ok: true, error: null }).eq('id', job.prior.id);
+        return 'skip';
+      }
+    }
+
+    const IN_FLIGHT = `in flight — ${TIMEOUT_NOTE}`;
+    let claimId: string | null = null;
+    if (job.prior) {
+      const { data } = await admin.from('relay_automation_sent')
+        .update({ method: 'template', detail: job.templateName, ok: false, error: IN_FLIGHT, attempts: (job.prior.attempts ?? 1) + 1, sent_at: new Date().toISOString() })
+        .eq('id', job.prior.id).eq('ok', false).select('id');
+      claimId = data?.[0]?.id ?? null;
+    } else {
+      const { data, error } = await admin.from('relay_automation_sent')
+        .insert({ workspace_id: ws, automation_key: job.sentKey, lead_id: job.leadId, phone_e164: job.phoneE164, meeting_id: job.meetingId, method: 'template', detail: job.templateName, ok: false, error: IN_FLIGHT, attempts: 1 })
+        .select('id').single();
+      claimId = error ? null : data?.id ?? null;
+    }
+    if (!claimId) return 'skip';
+    spent = true;
+
+    let ok = false;
+    let errText: string | null = null;
+    try {
+      const r = await sendTemplateToLead(admin, {
+        workspaceId: ws, conversationId, phoneE164: job.phoneE164,
+        templateName: job.templateName, language: job.templateLanguage,
+        lead: { full_name: job.name, visa_type: job.visaType },
+      }, ctx);
+      ok = r.ok;
+      errText = r.ok ? null : r.timedOut ? TIMEOUT_NOTE : r.error;
+    } catch (e) {
+      errText = isTimeoutError(e) ? TIMEOUT_NOTE : e instanceof Error ? e.message : String(e);
+    }
+    await durable.from('relay_automation_sent').update({ ok, error: errText }).eq('id', claimId);
+    return ok ? 'sent' : errText || 'send failed';
+  } finally {
+    if (!spent) ctx.giveBackSend();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ?pass=chase | ?pass=nurture | ?pass=cold | ?pass=community | ?pass=meetings — one engine
 // alone: its own lock, its own long budget, its own scheduled function.
 // Nothing else can eat its time.
 // ---------------------------------------------------------------------------
-async function runSoloPass(kind: 'chase' | 'nurture' | 'cold' | 'community', opts: { dryRun: boolean; workspaceId: string | null }): Promise<NextResponse> {
-  const lockKey = kind === 'chase' ? CHASE_LOCK_KEY : kind === 'cold' ? COLD_LOCK_KEY : kind === 'community' ? COMMUNITY_LOCK_KEY : NURTURE_LOCK_KEY;
+async function runSoloPass(kind: 'chase' | 'nurture' | 'cold' | 'community' | 'meetings', opts: { dryRun: boolean; workspaceId: string | null }): Promise<NextResponse> {
+  const lockKey = kind === 'chase' ? CHASE_LOCK_KEY : kind === 'cold' ? COLD_LOCK_KEY : kind === 'community' ? COMMUNITY_LOCK_KEY : kind === 'meetings' ? MEETINGS_LOCK_KEY : NURTURE_LOCK_KEY;
   const ctx = createRunContext(LONG_RUN);
   const admin = createAutomationAdminClient(ctx);
   const lockAdmin = createAutomationAdminClient();
@@ -1191,7 +1316,9 @@ async function runSoloPass(kind: 'chase' | 'nurture' | 'cold' | 'community', opt
         ? await runCold(admin, lockAdmin, ctx, runOpts)
         : kind === 'community'
           ? await runCommunity(admin, lockAdmin, ctx, runOpts)
-          : await runNurture(admin, lockAdmin, ctx, runOpts);
+          : kind === 'meetings'
+            ? await runMeetings(admin, lockAdmin, ctx, runOpts)
+            : await runNurture(admin, lockAdmin, ctx, runOpts);
     return NextResponse.json({
       ok: true, pass: kind, dryRun: opts.dryRun,
       ms: ctx.elapsedMs(), sendsUsed: MAX_SENDS_PER_RUN - ctx.sendsLeft(),
