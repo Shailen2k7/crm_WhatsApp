@@ -831,7 +831,7 @@ function CallsEngine() {
                 </span>
               </div>
               <div style={{ fontSize: 12.5, color: 'var(--muted)', marginTop: 4, lineHeight: 1.55 }}>
-                {CALL_RULE_TEXT[r.key].when} Once per call; STOP never gets it.
+                {CALL_RULE_TEXT[r.key].when} Global Talent Visa calls only (not Innovator Founder Visa or not-eligible leads). Once per call; STOP never gets it.
               </div>
             </div>
             <Switch on={r.enabled} disabled={!ov.isAdmin || busy === r.key} onClick={() => toggle(r.key, !r.enabled)} label={CALL_RULE_TEXT[r.key].title} />

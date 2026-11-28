@@ -62,15 +62,15 @@ export async function loadMeetingFacts(
 
   const ids = [...raw.keys()];
   const leadIds = [...new Set([...raw.values()].map((m) => m.lead_id).filter(Boolean) as string[])];
-  const leads = new Map<string, { full_name: string | null; visa_type: string | null; phone: string | null }>();
+  const leads = new Map<string, { full_name: string | null; visa_type: string | null; phone: string | null; eligibility: string | null }>();
   const chatByLead = new Map<string, { id: string; phone_e164: string; last_inbound_at: string | null }>();
   const history = new Map<string, MeetingHistRow>();
 
   const [, , , suppRows] = await Promise.all([
     inParallel(chunk(leadIds, 100), async (ls) => {
-      const { data, error } = await admin.from('leads').select('id, full_name, visa_type, phone').in('id', ls);
+      const { data, error } = await admin.from('leads').select('id, full_name, visa_type, phone, eligibility').in('id', ls);
       if (error) throw new Error(`meeting leads: ${error.message}`);
-      for (const l of (data || []) as { id: string; full_name: string | null; visa_type: string | null; phone: string | null }[]) leads.set(l.id, l);
+      for (const l of (data || []) as { id: string; full_name: string | null; visa_type: string | null; phone: string | null; eligibility: string | null }[]) leads.set(l.id, l);
     }),
     inParallel(chunk(leadIds, 100), async (ls) => {
       // The chat they actually write from wins over the phone typed on a form.
@@ -133,6 +133,7 @@ export async function loadMeetingFacts(
       starts_at: m.starts_at, created_at: m.created_at, completed_at: m.completed_at,
       phoneE164: phone, conversationId: conv?.id ?? null,
       name: lead?.full_name || m.client_name, visaType: lead?.visa_type ?? null,
+      eligibility: lead?.eligibility ?? null,
       suppressed: !!phone && suppressed.has(phone),
       templateSentMs: conv ? sentByConv.get(conv.id) ?? {} : {},
     };

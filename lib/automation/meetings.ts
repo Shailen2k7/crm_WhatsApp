@@ -16,6 +16,9 @@
 //   ONLY  meetings booked (PC1) or completed (PC2) after the rule was switched
 //         on, and at most 48 hours ago — switching on never reaches back into
 //         the old calls.
+//   GTV   only Global Talent Visa calls (Shailen, 28 Nov): the wording is about
+//         the GTV. Innovator Founder Visa leads, people found not eligible for
+//         the GTV, and bookings with no lead in the CRM get nothing.
 //   NEVER anyone who said STOP; a PC1 for a call that was cancelled or has
 //         already started; anything inside the rule's quiet hours (it waits).
 //
@@ -77,6 +80,8 @@ export interface MeetingRow {
   conversationId: string | null;
   name: string | null;
   visaType: string | null;
+  /** The lead's eligibility (eligible / highly_eligible / not_eligible / others), if any. */
+  eligibility: string | null;
   suppressed: boolean;
   /** When each call template (pc1 / pc2) last went to this chat, by anyone — the team sends them by hand too. */
   templateSentMs: Record<string, number>;
@@ -112,10 +117,19 @@ export const MEETING_SETTLE = {
   cancelled: 'stopped — the call was cancelled before PC1 went',
   started: 'stopped — the call had already started before PC1 could go',
   already: 'stopped — this message already went to them (by the team or for another call)',
+  notGtv: 'stopped — not a Global Talent Visa call (PC messages are for GTV only)',
 } as const;
 
 /** The same template to the same person within this long counts as already sent. */
 export const MEETING_SAME_MESSAGE_GAP_MS = 24 * HOUR;
+
+/** PC1 / PC2 talk about the Global Talent Visa, so only GTV calls get them. */
+export function isGtvCall(m: Pick<MeetingRow, 'lead_id' | 'visaType' | 'eligibility'>): boolean {
+  if (!m.lead_id) return false;                                   // unknown person: leave it to the team
+  const v = (m.visaType || '').toLowerCase();
+  if (v.includes('ifv') || v.includes('innovator')) return false;
+  return m.eligibility !== 'not_eligible';                        // offered the IFV instead
+}
 
 /** The IST hour, 0–23. */
 export function istHourOf(ms: number): number {
@@ -184,6 +198,7 @@ export function planMeetingMessages(input: {
       };
       if (!m.phoneE164) { skipped.push(`${who}: ${MEETING_SETTLE.noPhone}`); continue; }
       if (m.suppressed) { settle(MEETING_SETTLE.optedOut); continue; }
+      if (!isGtvCall(m)) { settle(MEETING_SETTLE.notGtv); continue; }
       if (rule.key === MEETING_BOOKED_KEY) {
         if (m.status === 'cancelled') { settle(MEETING_SETTLE.cancelled); continue; }
         if (m.status !== 'upcoming') continue;   // completed / no-show: PC2 territory, not PC1
